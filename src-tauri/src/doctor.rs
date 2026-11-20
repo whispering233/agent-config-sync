@@ -355,7 +355,7 @@ fi"#,
 }
 
 /// 单引号包裹并转义，避免 provider id 里的字符逃出引号。
-fn sh_quote(value: &str) -> String {
+pub(crate) fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
