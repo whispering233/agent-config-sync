@@ -2,6 +2,7 @@ mod commands;
 mod config;
 mod conflicts;
 mod doctor;
+mod installer;
 mod plan;
 mod scope;
 mod secrets;
@@ -15,6 +16,8 @@ fn main() {
             commands::validate_app_config,
             commands::save_app_config,
             doctor::run_check,
+            installer::preview_install,
+            installer::install_or_upgrade,
             snapshot::export_snapshot,
             plan::verify_and_plan,
             conflicts::scan_conflicts,

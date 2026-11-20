@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   CircleAlert,
   CircleCheck,
@@ -37,8 +37,57 @@ type RunState =
   | { kind: 'ready'; report: DoctorReport }
   | { kind: 'failed'; message: string };
 
+type InstallKind = 'managed' | 'npm' | 'unknown';
+type InstallAction = 'install' | 'upgrade';
+type InstallStatus = 'succeeded' | 'failed' | 'timeout' | 'unavailable';
+
+/** 与 Rust 侧 `installer::InstallCommand` 一一对应。 */
+type InstallCommand = { action: InstallAction; argv: string[] };
+
+/** 与 Rust 侧 `installer::InstallPreview` 一一对应。 */
+type InstallPreview = {
+  nodeVersion: string | null;
+  npmVersion: string | null;
+  piPath: string | null;
+  piVersion: string | null;
+  installKind: InstallKind | null;
+  command: InstallCommand | null;
+  blocking: string[];
+};
+
+/** 与 Rust 侧 `installer::InstallResult` 一一对应；输出已脱敏。 */
+type InstallResult = {
+  action: InstallAction;
+  status: InstallStatus;
+  exitCode: number | null;
+  output: string;
+  truncated: boolean;
+  elapsedMs: number;
+};
+
+type PreviewState =
+  | { kind: 'loading' }
+  | { kind: 'browser' }
+  | { kind: 'ready'; preview: InstallPreview }
+  | { kind: 'failed'; message: string };
+
+type InstallRunState =
+  | { kind: 'idle' }
+  | { kind: 'confirming'; command: InstallCommand }
+  | { kind: 'running'; command: InstallCommand }
+  | { kind: 'done'; result: InstallResult }
+  | { kind: 'failed'; message: string };
+
 function runDoctorCheck(): Promise<DoctorReport> {
   return invoke<DoctorReport>('run_check');
+}
+
+function loadInstallPreview(): Promise<InstallPreview> {
+  return invoke<InstallPreview>('preview_install');
+}
+
+function runInstallCommand(action: InstallAction): Promise<InstallResult> {
+  return invoke<InstallResult>('install_or_upgrade', { action, confirm: true });
 }
 
 const groupOrder = ['环境', '宿主与工具', '凭据', '扩展包', '技能'] as const;
@@ -87,6 +136,29 @@ const statusIcon: Record<CheckStatus, LucideIcon> = {
   fail: CircleAlert,
   unknown: CircleHelp,
 };
+
+const installKindText: Record<InstallKind, string> = {
+  managed: '托管安装',
+  npm: 'npm 全局安装',
+  unknown: '未知（需手动升级）',
+};
+
+const installActionText: Record<InstallAction, string> = {
+  install: '安装 Pi CLI',
+  upgrade: '升级 Pi CLI',
+};
+
+const installStatusText: Record<InstallStatus, string> = {
+  succeeded: '安装/升级完成',
+  failed: '命令非零退出，请检查输出',
+  timeout: '执行超时（10 分钟），进程组已终止',
+  unavailable: '命令无法启动',
+};
+
+/** 命令以数组返回，展示时给含空格的参数加引号。 */
+function commandText(argv: string[]): string {
+  return argv.map((part) => (/\s/.test(part) ? `"${part}"` : part)).join(' ');
+}
 
 function groupOf(id: string): GroupLabel {
   if (id === 'os' || id === 'agent_dir') {
@@ -145,6 +217,16 @@ function errorMessage(error: unknown): string {
 
 export function DoctorPage() {
   const [state, setState] = useState<RunState>({ kind: 'idle' });
+  const [preview, setPreview] = useState<PreviewState>(
+    isDesktop ? { kind: 'loading' } : { kind: 'browser' },
+  );
+  const [installRun, setInstallRun] = useState<InstallRunState>({ kind: 'idle' });
+
+  useEffect(() => {
+    if (isDesktop) {
+      void refreshPreview();
+    }
+  }, []);
 
   async function handleRun() {
     setState({ kind: 'running' });
@@ -153,6 +235,30 @@ export function DoctorPage() {
       setState({ kind: 'ready', report });
     } catch (error) {
       setState({ kind: 'failed', message: errorMessage(error) });
+    }
+  }
+
+  async function refreshPreview() {
+    setPreview({ kind: 'loading' });
+    try {
+      setPreview({ kind: 'ready', preview: await loadInstallPreview() });
+    } catch (error) {
+      setPreview({ kind: 'failed', message: errorMessage(error) });
+    }
+  }
+
+  /** 后端会重新探测并校验动作，前端只能提交枚举与确认位。 */
+  async function handleInstall(command: InstallCommand) {
+    setInstallRun({ kind: 'running', command });
+    try {
+      const result = await runInstallCommand(command.action);
+      setInstallRun({ kind: 'done', result });
+      if (result.status === 'succeeded') {
+        await handleRun();
+        await refreshPreview();
+      }
+    } catch (error) {
+      setInstallRun({ kind: 'failed', message: errorMessage(error) });
     }
   }
 
@@ -198,6 +304,15 @@ export function DoctorPage() {
           </p>
         )}
       </Card>
+
+      <InstallCard
+        preview={preview}
+        run={installRun}
+        onRefresh={() => void refreshPreview()}
+        onStart={(command) => setInstallRun({ kind: 'confirming', command })}
+        onCancel={() => setInstallRun({ kind: 'idle' })}
+        onConfirm={(command) => void handleInstall(command)}
+      />
 
       {state.kind === 'idle' && (
         <Card className="p-lg text-center">
@@ -260,5 +375,192 @@ function CheckRow({ check }: { check: DoctorCheck }) {
         )}
       </div>
     </li>
+  );
+}
+
+function InstallCard({
+  preview,
+  run,
+  onRefresh,
+  onStart,
+  onCancel,
+  onConfirm,
+}: {
+  preview: PreviewState;
+  run: InstallRunState;
+  onRefresh: () => void;
+  onStart: (command: InstallCommand) => void;
+  onCancel: () => void;
+  onConfirm: (command: InstallCommand) => void;
+}) {
+  const ready = preview.kind === 'ready' ? preview.preview : null;
+  const command = ready?.command ?? null;
+  const running = run.kind === 'running';
+
+  return (
+    <Card className="p-lg">
+      <h2 className="text-sm font-semibold text-foreground">宿主安装与升级</h2>
+      <p className="mt-xs text-sm text-muted-foreground">
+        先展示命令，用户确认后才执行；不会自动安装 Node，也不会改 shell 启动文件。
+      </p>
+
+      {preview.kind === 'loading' && (
+        <p className="mt-md text-sm text-muted-foreground">正在探测安装条件…</p>
+      )}
+      {preview.kind === 'browser' && (
+        <p className="mt-md text-xs leading-relaxed text-muted-foreground">
+          浏览器预览里没有 Rust 进程，探测与安装命令都只在 Tauri 桌面版可用。
+        </p>
+      )}
+      {preview.kind === 'failed' && (
+        <p className="mt-md text-sm text-danger">{preview.message}</p>
+      )}
+
+      {ready !== null && (
+        <>
+          <dl className="mt-md flex flex-col gap-sm">
+            <InfoRow label="Node 版本" value={ready.nodeVersion ?? '未找到'} />
+            <InfoRow label="npm" value={ready.npmVersion ?? '未找到'} />
+            <InfoRow
+              label="Pi 版本"
+              value={ready.piVersion ?? (ready.piPath === null ? '未安装' : '读不到版本')}
+            />
+            <InfoRow
+              label="安装方式"
+              value={
+                ready.installKind === null
+                  ? '未安装'
+                  : installKindText[ready.installKind]
+              }
+            />
+            {ready.piPath !== null && (
+              <InfoRow label="Pi 入口" value={ready.piPath} mono />
+            )}
+          </dl>
+
+          {ready.blocking.length > 0 && (
+            <>
+              <ul className="mt-md flex flex-col gap-sm">
+                {ready.blocking.map((reason) => (
+                  <li
+                    key={reason}
+                    className="flex items-start gap-sm text-sm text-warning"
+                  >
+                    <TriangleAlert
+                      className="mt-0.5 h-4 w-4 shrink-0"
+                      aria-hidden="true"
+                    />
+                    <span className="break-all">{reason}</span>
+                  </li>
+                ))}
+              </ul>
+              {ready.nodeVersion === null && (
+                <p className="mt-sm text-xs leading-relaxed text-muted-foreground">
+                  先按官方文档安装 Node 22.19.0 或更高版本（https://nodejs.org，或
+                  nvm install 22 / fnm install 22），装完点“重新检测”。本应用不会自动安装
+                  Node。
+                </p>
+              )}
+            </>
+          )}
+
+          {command !== null && (
+            <div className="mt-md rounded-md bg-surface-muted px-md py-sm">
+              <p className="text-xs text-muted-foreground">将执行的命令</p>
+              <p className="mt-xs break-all font-mono text-sm text-foreground">
+                {commandText(command.argv)}
+              </p>
+              <p className="mt-xs text-xs text-muted-foreground">
+                命令由后端按平台与安装方式拼接，前端只能提交“安装/升级”这个动作。
+              </p>
+            </div>
+          )}
+
+          <div className="mt-lg flex flex-wrap gap-sm">
+            <Button variant="secondary" onClick={onRefresh} disabled={running}>
+              重新检测
+            </Button>
+            {command !== null && run.kind === 'idle' && (
+              <Button onClick={() => onStart(command)}>
+                {installActionText[command.action]}
+              </Button>
+            )}
+          </div>
+        </>
+      )}
+
+      {(run.kind === 'confirming' || run.kind === 'running') && (
+        <div className="mt-lg rounded-md bg-surface-muted px-md py-sm">
+          <p className="text-sm font-medium text-foreground">确认执行这条命令？</p>
+          <p className="mt-xs break-all font-mono text-sm text-foreground">
+            {commandText(run.command.argv)}
+          </p>
+          <p className="mt-xs text-xs leading-relaxed text-muted-foreground">
+            最多 10 分钟，输出脱敏后展示。失败不会自动重试，也不会换别的方案。
+          </p>
+          <div className="mt-md flex flex-wrap gap-sm">
+            <Button onClick={() => onConfirm(run.command)} disabled={running}>
+              {running ? '执行中…' : '确认执行'}
+            </Button>
+            <Button variant="secondary" onClick={onCancel} disabled={running}>
+              取消
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {run.kind === 'done' && (
+        <div className="mt-lg rounded-md bg-surface-muted px-md py-sm">
+          <p
+            className={cn(
+              'text-sm font-medium',
+              run.result.status === 'succeeded' ? 'text-success' : 'text-danger',
+            )}
+          >
+            {installStatusText[run.result.status]}
+          </p>
+          <p className="mt-xs text-xs text-muted-foreground">
+            退出码 {run.result.exitCode ?? '—'} · 耗时{' '}
+            {(run.result.elapsedMs / 1000).toFixed(1)} 秒
+            {run.result.truncated && ' · 输出已截断（仅保留最后 100 行、最多 200 KB）'}
+          </p>
+          {run.result.output !== '' && (
+            <pre className="mt-sm max-h-64 overflow-auto whitespace-pre-wrap break-all font-mono text-xs leading-relaxed text-foreground">
+              {run.result.output}
+            </pre>
+          )}
+          {run.result.status === 'succeeded' && (
+            <p className="mt-sm text-xs leading-relaxed text-muted-foreground">
+              已自动重跑环境医生：看上面的 Pi 路径与版本是否更新。若仍提示找不到 pi，请重开终端后再检查。
+            </p>
+          )}
+        </div>
+      )}
+
+      {run.kind === 'failed' && (
+        <p className="mt-lg text-sm text-danger">执行失败：{run.message}</p>
+      )}
+    </Card>
+  );
+}
+
+function InfoRow({
+  label,
+  value,
+  mono = false,
+}: {
+  label: string;
+  value: string;
+  mono?: boolean;
+}) {
+  return (
+    <div className="rounded-md bg-surface-muted px-md py-sm">
+      <dt className="text-xs text-muted-foreground">{label}</dt>
+      <dd
+        className={cn('break-all text-sm text-foreground', mono && 'font-mono')}
+      >
+        {value}
+      </dd>
+    </div>
   );
 }
