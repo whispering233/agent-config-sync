@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod scope;
 
 fn main() {
     tauri::Builder::default()
