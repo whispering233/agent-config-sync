@@ -1,4 +1,5 @@
 mod commands;
+mod apply;
 mod config;
 mod conflicts;
 mod doctor;
@@ -21,6 +22,7 @@ fn main() {
             snapshot::export_snapshot,
             plan::verify_and_plan,
             conflicts::scan_conflicts,
+            apply::apply_snapshot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
