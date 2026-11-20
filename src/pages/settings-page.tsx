@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react';
+import { getVersion } from '@tauri-apps/api/app';
 import { invoke } from '@tauri-apps/api/core';
 import { CircleAlert, CircleCheck, TriangleAlert } from 'lucide-react';
 import { Button } from '../components/ui/button';
@@ -453,7 +454,70 @@ export function SettingsPage() {
           </div>
         </>
       )}
+
+      <AboutCard />
     </div>
+  );
+}
+
+type VersionState =
+  | { kind: 'browser' }
+  | { kind: 'loading' }
+  | { kind: 'ready'; version: string }
+  | { kind: 'failed' };
+
+/** 版本来自打包时写入的元数据；浏览器预览里没有壳可问。 */
+function AboutCard() {
+  const [state, setState] = useState<VersionState>(
+    isDesktop ? { kind: 'loading' } : { kind: 'browser' },
+  );
+
+  useEffect(() => {
+    if (!isDesktop) {
+      return;
+    }
+    let cancelled = false;
+    getVersion()
+      .then((version) => {
+        if (!cancelled) {
+          setState({ kind: 'ready', version });
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setState({ kind: 'failed' });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const versionText =
+    state.kind === 'ready'
+      ? state.version
+      : state.kind === 'loading'
+        ? '读取中…'
+        : state.kind === 'failed'
+          ? '无法读取'
+          : '仅桌面版';
+
+  return (
+    <Card className="p-lg">
+      <h2 className="text-sm font-semibold text-foreground">关于</h2>
+      <dl className="mt-md flex flex-col gap-sm">
+        <PathRow label="应用" value="Agent Config Sync" />
+        <PathRow label="版本" value={versionText} />
+        <PathRow
+          label="运行时"
+          value={isDesktop ? 'Tauri 2 + React 18' : '浏览器预览（无桌面壳）'}
+        />
+      </dl>
+      <p className="mt-md text-xs text-muted-foreground">
+        桌面版依赖系统提供 WebKitGTK 4.1（Linux 上 Tauri 的
+        WebView），这是运行前提；缺失时应用无法启动。
+      </p>
+    </Card>
   );
 }
 

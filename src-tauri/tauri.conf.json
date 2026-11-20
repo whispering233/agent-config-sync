@@ -24,7 +24,19 @@
     }
   },
   "bundle": {
-    "active": false,
-    "icon": ["icons/icon.png"]
+    "active": true,
+    "targets": ["deb", "appimage"],
+    "category": "Utility",
+    "publisher": "Agent Config Sync",
+    "copyright": "Copyright © 2026 Agent Config Sync",
+    "shortDescription": "Pi CLI 配置同步桌面工具",
+    "longDescription": "Agent Config Sync 把 Pi CLI 的受管配置导出为可跨机同步的快照，并在另一台机器上按快照落地。快照以文件为准，覆盖前先备份，删除逐项确认；密钥只保留宿主原生引用，auth.json 永不进入快照。",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
   }
 }
