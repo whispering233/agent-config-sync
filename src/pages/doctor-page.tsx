@@ -71,6 +71,45 @@ type PreviewState =
   | { kind: 'ready'; preview: InstallPreview }
   | { kind: 'failed'; message: string };
 
+/** 与 Rust 侧 `packages::DeclaredPackage` 一一对应。 */
+type DeclaredPackage = { source: string; enabled: boolean };
+
+/** 与 Rust 侧 `packages::InstalledPackage` 一一对应。 */
+type InstalledPackage = { source: string; path: string };
+
+/** 与 Rust 侧 `packages::PackageStatus` 一一对应。 */
+type PackageStatus = {
+  declared: DeclaredPackage[];
+  installed: InstalledPackage[];
+  missing: string[];
+  extra: string[];
+};
+
+/** 与 Rust 侧 `packages::AlignResult` 一一对应；输出已截断并脱敏。 */
+type AlignResult = {
+  source: string;
+  status: InstallStatus;
+  exitCode: number | null;
+  output: string;
+  truncated: boolean;
+};
+
+/** 与 Rust 侧 `packages::AlignReport` 一一对应。 */
+type AlignReport = { results: AlignResult[]; completed: boolean };
+
+type PackageViewState =
+  | { kind: 'loading' }
+  | { kind: 'browser' }
+  | { kind: 'ready'; status: PackageStatus }
+  | { kind: 'failed'; message: string };
+
+type AlignRunState =
+  | { kind: 'idle' }
+  | { kind: 'confirming' }
+  | { kind: 'running' }
+  | { kind: 'done'; report: AlignReport }
+  | { kind: 'failed'; message: string };
+
 type InstallRunState =
   | { kind: 'idle' }
   | { kind: 'confirming'; command: InstallCommand }
@@ -88,6 +127,14 @@ function loadInstallPreview(): Promise<InstallPreview> {
 
 function runInstallCommand(action: InstallAction): Promise<InstallResult> {
   return invoke<InstallResult>('install_or_upgrade', { action, confirm: true });
+}
+
+function loadPackageStatus(): Promise<PackageStatus> {
+  return invoke<PackageStatus>('package_status');
+}
+
+function runAlignPackages(sources: string[]): Promise<AlignReport> {
+  return invoke<AlignReport>('align_packages', { sources, confirm: true });
 }
 
 const groupOrder = ['环境', '宿主与工具', '凭据', '扩展包', '技能'] as const;
@@ -155,9 +202,25 @@ const installStatusText: Record<InstallStatus, string> = {
   unavailable: '命令无法启动',
 };
 
+const alignStatusText: Record<InstallStatus, string> = {
+  succeeded: '已安装',
+  failed: '安装失败，已停止（不自动重试）',
+  timeout: '安装超时（10 分钟），进程组已终止',
+  unavailable: '命令无法启动',
+};
+
 /** 命令以数组返回，展示时给含空格的参数加引号。 */
 function commandText(argv: string[]): string {
   return argv.map((part) => (/\s/.test(part) ? `"${part}"` : part)).join(' ');
+}
+
+/** 与 Rust 侧 `doctor::sh_quote` 一致：后端拼接的单引号形式，展示时才与执行的一致。 */
+function shQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function installCommandText(source: string): string {
+  return `pi install ${shQuote(source)}`;
 }
 
 function groupOf(id: string): GroupLabel {
@@ -313,6 +376,8 @@ export function DoctorPage() {
         onCancel={() => setInstallRun({ kind: 'idle' })}
         onConfirm={(command) => void handleInstall(command)}
       />
+
+      <PackagesCard />
 
       {state.kind === 'idle' && (
         <Card className="p-lg text-center">
@@ -541,6 +606,255 @@ function InstallCard({
         <p className="mt-lg text-sm text-danger">执行失败：{run.message}</p>
       )}
     </Card>
+  );
+}
+
+function PackagesCard() {
+  const [view, setView] = useState<PackageViewState>(
+    isDesktop ? { kind: 'loading' } : { kind: 'browser' },
+  );
+  const [selected, setSelected] = useState<string[]>([]);
+  const [run, setRun] = useState<AlignRunState>({ kind: 'idle' });
+
+  useEffect(() => {
+    if (isDesktop) {
+      void refresh();
+    }
+  }, []);
+
+  async function refresh() {
+    setView({ kind: 'loading' });
+    try {
+      const status = await loadPackageStatus();
+      setView({ kind: 'ready', status });
+      // 默认全选缺失项，用户可以取消勾选；取消勾选的不会被提交。
+      setSelected(status.missing);
+    } catch (error) {
+      setView({ kind: 'failed', message: errorMessage(error) });
+    }
+  }
+
+  /** 后端会重新计算缺失清单并校验包名，校验失败一行命令都不执行。 */
+  async function handleAlign() {
+    setRun({ kind: 'running' });
+    try {
+      const report = await runAlignPackages(selected);
+      setRun({ kind: 'done', report });
+      if (report.completed) {
+        await refresh();
+      }
+    } catch (error) {
+      setRun({ kind: 'failed', message: errorMessage(error) });
+    }
+  }
+
+  function toggle(source: string) {
+    setSelected((current) =>
+      current.includes(source)
+        ? current.filter((item) => item !== source)
+        : [...current, source],
+    );
+  }
+
+  const status = view.kind === 'ready' ? view.status : null;
+  const busy = run.kind === 'running';
+
+  return (
+    <Card className="p-lg">
+      <h2 className="text-sm font-semibold text-foreground">包对齐</h2>
+      <p className="mt-xs text-sm text-muted-foreground">
+        比对 settings.json 的 packages 声明与 `pi list` 的实装。只安装缺失项；多余包只列出，不会自动删除。
+      </p>
+
+      {view.kind === 'loading' && (
+        <p className="mt-md text-sm text-muted-foreground">正在读取包状态…</p>
+      )}
+      {view.kind === 'browser' && (
+        <p className="mt-md text-xs leading-relaxed text-muted-foreground">
+          浏览器预览里没有 Rust 进程，读不到 settings.json 也执行不了 `pi list`。
+          包状态与安装命令只在 Tauri 桌面版可用。
+        </p>
+      )}
+      {view.kind === 'failed' && (
+        <p className="mt-md text-sm text-danger">{view.message}</p>
+      )}
+
+      {status !== null && (
+        <>
+          <dl className="mt-md grid grid-cols-2 gap-sm">
+            <InfoRow label="声明" value={`${status.declared.length} 个`} />
+            <InfoRow label="实装" value={`${status.installed.length} 个`} />
+            <InfoRow label="缺失" value={`${status.missing.length} 个`} />
+            <InfoRow label="多余" value={`${status.extra.length} 个`} />
+          </dl>
+
+          {status.declared.length > 0 && (
+            <PackageList
+              title="声明"
+              items={status.declared.map((item) =>
+                item.enabled ? item.source : `${item.source}（已停用，不自动安装）`,
+              )}
+            />
+          )}
+          {status.installed.length > 0 && (
+            <PackageList
+              title="实装"
+              items={status.installed.map((item) =>
+                item.path === '' ? item.source : `${item.source} · ${item.path}`,
+              )}
+            />
+          )}
+
+          {status.missing.length > 0 ? (
+            <div className="mt-md">
+              <p className="text-xs text-muted-foreground">
+                缺失（勾选要安装的项，命令由后端拼接）
+              </p>
+              <ul className="mt-sm flex flex-col gap-sm">
+                {status.missing.map((source) => (
+                  <li key={source}>
+                    <label className="flex items-start gap-sm text-sm text-foreground">
+                      <input
+                        type="checkbox"
+                        className="mt-1"
+                        checked={selected.includes(source)}
+                        disabled={busy || run.kind === 'confirming'}
+                        onChange={() => toggle(source)}
+                      />
+                      <span className="min-w-0 flex-1 break-all">
+                        {source}
+                        <span className="block font-mono text-xs text-muted-foreground">
+                          {installCommandText(source)}
+                        </span>
+                      </span>
+                    </label>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : (
+            <p className="mt-md text-sm text-success">没有缺失的包。</p>
+          )}
+
+          {status.extra.length > 0 && (
+            <PackageList
+              title="多余（不会自动删除，需要时手动 pi remove）"
+              items={status.extra}
+            />
+          )}
+
+          <div className="mt-lg flex flex-wrap gap-sm">
+            <Button variant="secondary" onClick={() => void refresh()} disabled={busy}>
+              刷新状态
+            </Button>
+            {run.kind !== 'confirming' && run.kind !== 'running' && (
+              <Button
+                onClick={() => setRun({ kind: 'confirming' })}
+                disabled={selected.length === 0}
+              >
+                对齐选中的 {selected.length} 个包
+              </Button>
+            )}
+          </div>
+        </>
+      )}
+
+      {(run.kind === 'confirming' || run.kind === 'running') && (
+        <div className="mt-lg rounded-md bg-surface-muted px-md py-sm">
+          <p className="text-sm font-medium text-foreground">确认执行这些命令？</p>
+          <ul className="mt-xs flex flex-col gap-xs font-mono text-sm text-foreground">
+            {selected.map((source) => (
+              <li key={source} className="break-all">
+                {installCommandText(source)}
+              </li>
+            ))}
+          </ul>
+          <p className="mt-xs text-xs leading-relaxed text-muted-foreground">
+            逐个执行，每个最多 10 分钟；失败即停，不自动重试，也不会换别的方案。
+          </p>
+          <div className="mt-md flex flex-wrap gap-sm">
+            <Button onClick={() => void handleAlign()} disabled={busy}>
+              {busy ? '安装中…' : '确认执行'}
+            </Button>
+            <Button
+              variant="secondary"
+              onClick={() => setRun({ kind: 'idle' })}
+              disabled={busy}
+            >
+              取消
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {run.kind === 'done' && (
+        <div className="mt-lg rounded-md bg-surface-muted px-md py-sm">
+          <p
+            className={cn(
+              'text-sm font-medium',
+              run.report.completed ? 'text-success' : 'text-danger',
+            )}
+          >
+            {run.report.completed
+              ? `${run.report.results.length} 个包已安装`
+              : '中途失败，后面的包没有执行'}
+          </p>
+          <ul className="mt-md flex flex-col gap-md">
+            {run.report.results.map((result) => (
+              <li key={result.source}>
+                <p className="break-all text-sm text-foreground">{result.source}</p>
+                <p
+                  className={cn(
+                    'text-xs',
+                    result.status === 'succeeded' ? 'text-success' : 'text-danger',
+                  )}
+                >
+                  {alignStatusText[result.status]} · 退出码 {result.exitCode ?? '—'}
+                  {result.truncated && ' · 输出已截断（仅保留最后 100 行、最多 200 KB）'}
+                </p>
+                {result.output !== '' && (
+                  <pre className="mt-xs max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-xs leading-relaxed text-foreground">
+                    {result.output}
+                  </pre>
+                )}
+              </li>
+            ))}
+          </ul>
+          <Button
+            variant="secondary"
+            className="mt-md"
+            onClick={() => {
+              setRun({ kind: 'idle' });
+              void refresh();
+            }}
+          >
+            重新读取状态
+          </Button>
+        </div>
+      )}
+
+      {run.kind === 'failed' && (
+        <p className="mt-lg text-sm text-danger">执行失败：{run.message}</p>
+      )}
+    </Card>
+  );
+}
+
+function PackageList({ title, items }: { title: string; items: string[] }) {
+  return (
+    <div className="mt-md">
+      <p className="text-xs text-muted-foreground">{title}</p>
+      <ul className="mt-xs flex flex-col gap-xs">
+        {items.map((item) => (
+          <li
+            key={item}
+            className="break-all rounded-md bg-surface-muted px-md py-xs font-mono text-xs text-foreground"
+          >
+            {item}
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 

@@ -4,6 +4,7 @@ mod config;
 mod conflicts;
 mod doctor;
 mod installer;
+mod packages;
 mod plan;
 mod scope;
 mod secrets;
@@ -19,6 +20,8 @@ fn main() {
             doctor::run_check,
             installer::preview_install,
             installer::install_or_upgrade,
+            packages::package_status,
+            packages::align_packages,
             snapshot::export_snapshot,
             plan::verify_and_plan,
             conflicts::scan_conflicts,

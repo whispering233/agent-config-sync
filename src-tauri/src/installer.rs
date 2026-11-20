@@ -301,7 +301,7 @@ fn select_command(
 }
 
 /// POSIX 命令统一走登录 shell：只有这样才拿得到 nvm/fnm/mise 的 PATH。
-fn shell_argv(script: &str) -> Vec<String> {
+pub(crate) fn shell_argv(script: &str) -> Vec<String> {
     let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("sh"));
     vec![
         shell.to_string_lossy().into_owned(),
@@ -498,7 +498,7 @@ fn result_of(action: InstallAction, outcome: CommandOutcome, elapsed: Duration) 
 }
 
 /// 只留尾部：先按字节截到 200 KB（按字符边界），再取最后 100 行，最后脱敏。
-fn tail_output(stdout: &str, stderr: &str) -> (String, bool) {
+pub(crate) fn tail_output(stdout: &str, stderr: &str) -> (String, bool) {
     let mut text = match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
         (true, _) => stderr.trim_start().to_string(),
         (false, true) => stdout.trim_end().to_string(),
@@ -527,7 +527,7 @@ fn tail_output(stdout: &str, stderr: &str) -> (String, bool) {
 }
 
 /// command 层入口：解析出生效宿主目录。
-fn resolve_agent_dir(app: &tauri::AppHandle) -> Result<Option<PathBuf>, String> {
+pub(crate) fn resolve_agent_dir(app: &tauri::AppHandle) -> Result<Option<PathBuf>, String> {
     let config_dir = app
         .path()
         .app_config_dir()
