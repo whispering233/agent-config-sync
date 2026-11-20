@@ -47,6 +47,70 @@ type ExportFailure = {
   findings: SecretFinding[];
 };
 
+/** 计划项的差异类别，与 Rust 侧 `PlanCategory` 一致。 */
+type PlanCategory = 'added' | 'modified' | 'deleted';
+
+/** 与 Rust 侧 `PlanItem` 一一对应；`deleted` 时 `snapshotSha256` 为 null。 */
+type PlanItem = {
+  path: string;
+  category: PlanCategory;
+  size: number;
+  snapshotSha256: string | null;
+  liveSha256: string | null;
+};
+
+/** 与 Rust 侧 `PlanReport` 一一对应。 */
+type PlanReport = {
+  manifestInfo: {
+    profileId: string;
+    createdAt: string;
+    fingerprint: string;
+    files: number;
+    source: {
+      app: string;
+      os: string;
+      arch: string;
+      pi: string | null;
+      node: string | null;
+    };
+    requirements: { node: string; pi: string };
+  };
+  verification: { checked: number };
+  plan: { added: PlanItem[]; modified: PlanItem[]; deleted: PlanItem[] };
+  totals: {
+    snapshotFiles: number;
+    liveFiles: number;
+    added: number;
+    modified: number;
+    deleted: number;
+    unchanged: number;
+  };
+  requirements: RequirementCheck[];
+};
+
+/** 一条宿主版本要求；`satisfied` 为 null 表示没探测到。 */
+type RequirementCheck = {
+  tool: string;
+  required: string;
+  found: string | null;
+  satisfied: boolean | null;
+};
+
+/** 与 Rust 侧 `HashMismatch` 一一对应。 */
+type HashMismatch = {
+  path: string;
+  reason: 'missing' | 'unreadable' | 'size' | 'hash' | 'out_of_bounds';
+  expectedSha256: string;
+  actualSha256: string | null;
+};
+
+/** 与 Rust 侧 `PlanFailure` 一一对应。 */
+type PlanFailure = {
+  code: string;
+  message: string;
+  mismatches: HashMismatch[];
+};
+
 type ConfigState =
   | { kind: 'loading' }
   | { kind: 'browser' }
@@ -59,6 +123,23 @@ type ExportState =
   | { kind: 'done'; report: ExportReport }
   | { kind: 'blocked'; failure: ExportFailure }
   | { kind: 'failed'; message: string };
+
+type PlanState =
+  | { kind: 'idle' }
+  | { kind: 'checking' }
+  | { kind: 'done'; report: PlanReport }
+  | { kind: 'failed'; message: string; mismatches: HashMismatch[] };
+
+/** 每个分组最多列出的条数；其余只计数。 */
+const PLAN_LIST_LIMIT = 20;
+
+const mismatchReasonText: Record<HashMismatch['reason'], string> = {
+  missing: '快照里没有这个文件',
+  unreadable: '文件读不出来',
+  size: '字节数不同',
+  hash: '哈希不同',
+  out_of_bounds: '路径越出同步文件夹',
+};
 
 const statusText: Partial<Record<PathStatus, string>> = {
   ok: '可用',
@@ -87,9 +168,23 @@ function asFailure(error: unknown): ExportFailure | null {
   };
 }
 
+function asPlanFailure(error: unknown): PlanFailure | null {
+  const failure = asFailure(error);
+  if (failure === null) {
+    return null;
+  }
+  const candidate = error as Partial<PlanFailure>;
+  return {
+    code: failure.code,
+    message: failure.message,
+    mismatches: Array.isArray(candidate.mismatches) ? candidate.mismatches : [],
+  };
+}
+
 export function SnapshotPage() {
   const [config, setConfig] = useState<ConfigState>({ kind: 'loading' });
   const [exported, setExported] = useState<ExportState>({ kind: 'idle' });
+  const [planning, setPlanning] = useState<PlanState>({ kind: 'idle' });
 
   useEffect(() => {
     if (!isDesktop) {
@@ -124,6 +219,23 @@ export function SnapshotPage() {
   const syncRoot = config.kind === 'ready' ? config.syncRoot : null;
   const exporting = exported.kind === 'exporting';
   const canExport = isDesktop && syncRoot !== null && !exporting;
+  const checking = planning.kind === 'checking';
+  const canCheck = isDesktop && syncRoot !== null && !checking;
+
+  async function runCheck() {
+    setPlanning({ kind: 'checking' });
+    try {
+      const report = await invoke<PlanReport>('verify_and_plan');
+      setPlanning({ kind: 'done', report });
+    } catch (error) {
+      const failure = asPlanFailure(error);
+      setPlanning({
+        kind: 'failed',
+        message: failure?.message ?? errorMessage(error),
+        mismatches: failure?.mismatches ?? [],
+      });
+    }
+  }
 
   async function runExport(allowPlaintext: boolean) {
     setExported({ kind: 'exporting' });
@@ -199,6 +311,112 @@ export function SnapshotPage() {
           </span>
         )}
       </div>
+
+      <Card className="p-lg">
+        <h2 className="text-sm font-semibold text-foreground">检查与预览</h2>
+        <p className="mt-xs text-sm text-muted-foreground">
+          只读校验：重算快照每个文件的大小与哈希，再和本机配置比较，得出新增 / 修改 / 删除候选；不写任何文件。
+        </p>
+        <div className="mt-md flex flex-wrap items-center gap-md">
+          <Button variant="secondary" onClick={() => void runCheck()} disabled={!canCheck}>
+            {checking ? '检查中…' : '检查快照'}
+          </Button>
+          {!isDesktop && (
+            <span className="text-sm text-muted-foreground">检查仅桌面版可用</span>
+          )}
+          {checking && (
+            <span className="text-sm text-muted-foreground" aria-live="polite">
+              正在读取 manifest、校验哈希并比较本机配置…
+            </span>
+          )}
+        </div>
+        {!isDesktop && (
+          <p className="mt-sm text-sm text-muted-foreground">
+            浏览器预览里没有本机快照：桌面版会读取 manifest.json、逐文件校验哈希，再列出差异。
+          </p>
+        )}
+
+        {planning.kind === 'done' && (
+          <div className="mt-md flex flex-col gap-md">
+            <dl className="flex flex-col gap-sm">
+              <ResultRow label="创建时间" value={planning.report.manifestInfo.createdAt} />
+              <ResultRow label="指纹" value={planning.report.manifestInfo.fingerprint} mono />
+              <ResultRow label="文件数" value={String(planning.report.manifestInfo.files)} />
+              <ResultRow
+                label="来源版本"
+                value={sourceText(planning.report.manifestInfo.source)}
+              />
+              <ResultRow
+                label="哈希校验"
+                value={`通过（${planning.report.verification.checked} 个文件）`}
+              />
+            </dl>
+            <p className="text-sm text-muted-foreground">
+              本机受管文件 {planning.report.totals.liveFiles} 个，其中未改动{' '}
+              {planning.report.totals.unchanged} 个。
+            </p>
+            <PlanGroup title="新增" items={planning.report.plan.added} />
+            <PlanGroup title="修改" items={planning.report.plan.modified} />
+            <PlanGroup
+              title="删除"
+              hint="应用时需逐项确认"
+              items={planning.report.plan.deleted}
+            />
+            {planning.report.totals.added === 0 &&
+              planning.report.totals.modified === 0 &&
+              planning.report.totals.deleted === 0 && (
+                <p className="text-sm text-success">本机配置与快照一致，没有待应用的变化。</p>
+              )}
+            {planning.report.requirements
+              .filter((check) => check.satisfied === false)
+              .map((check) => (
+                <p key={check.tool} className="text-sm text-warning">
+                  {check.tool} 版本不满足要求：需要 {check.required}，当前 {check.found ?? '未知'}
+                  ；只是警告，不阻止生成计划。
+                </p>
+              ))}
+            {planning.report.requirements.some((check) => check.satisfied === null) && (
+              <p className="text-sm text-muted-foreground">
+                未能探测到{' '}
+                {planning.report.requirements
+                  .filter((check) => check.satisfied === null)
+                  .map((check) => check.tool)
+                  .join('、')}{' '}
+                的版本，版本检查记为未知，不影响计划。
+              </p>
+            )}
+          </div>
+        )}
+
+        {planning.kind === 'failed' && (
+          <div className="mt-md flex flex-col gap-sm">
+            <p className="flex items-start gap-sm text-sm text-danger">
+              <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
+              <span>检查未通过：{planning.message}</span>
+            </p>
+            {planning.mismatches.length > 0 && (
+              <ul className="flex flex-col gap-sm">
+                {planning.mismatches.map((mismatch) => (
+                  <li
+                    key={mismatch.path}
+                    className="rounded-md bg-surface-muted px-md py-sm"
+                  >
+                    <p className="break-all font-mono text-xs text-foreground">
+                      {mismatch.path}
+                    </p>
+                    <p className="mt-xs text-xs text-muted-foreground">
+                      {mismatchReasonText[mismatch.reason]}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <p className="text-xs text-muted-foreground">
+              哈希不符通常意味着云盘还没传完；本次没有生成计划，也没有写任何文件。
+            </p>
+          </div>
+        )}
+      </Card>
 
       {exported.kind === 'done' && (
         <Card className="p-lg">
@@ -296,6 +514,51 @@ export function SnapshotPage() {
             更稳妥的做法是先把这些值改成 $NAME / ${'${NAME}'} 形式的引用，再重新导出。
           </p>
         </Card>
+      )}
+    </div>
+  );
+}
+
+function sourceText(source: PlanReport['manifestInfo']['source']): string {
+  return `${source.app} · ${source.os}/${source.arch} · pi ${
+    source.pi ?? '未知'
+  } · node ${source.node ?? '未知'}`;
+}
+
+/** 一组计划项：只列前 20 条，其余只报数量。 */
+function PlanGroup({
+  title,
+  hint,
+  items,
+}: {
+  title: string;
+  hint?: string;
+  items: PlanItem[];
+}) {
+  if (items.length === 0) {
+    return null;
+  }
+  const shown = items.slice(0, PLAN_LIST_LIMIT);
+  return (
+    <div>
+      <h3 className="text-xs font-semibold text-foreground">
+        {title} {items.length} 项
+        {hint !== undefined && (
+          <span className="ml-xs font-normal text-warning">· {hint}</span>
+        )}
+      </h3>
+      <ul className="mt-xs flex flex-col gap-sm">
+        {shown.map((item) => (
+          <li key={item.path} className="rounded-md bg-surface-muted px-md py-sm">
+            <p className="break-all font-mono text-xs text-foreground">{item.path}</p>
+            <p className="mt-xs text-xs text-muted-foreground">{item.size} B</p>
+          </li>
+        ))}
+      </ul>
+      {items.length > shown.length && (
+        <p className="mt-xs text-xs text-muted-foreground">
+          还有 {items.length - shown.length} 项
+        </p>
       )}
     </div>
   );

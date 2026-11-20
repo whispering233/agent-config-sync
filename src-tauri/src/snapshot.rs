@@ -422,7 +422,8 @@ pub fn fingerprint(format_version: u32, files: &[ManifestFile]) -> String {
     sha256_hex(&hasher.finalize())[..12].to_string()
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// 文件内容哈希：导入校验（T6）与导出共用同一套算法。
+pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))

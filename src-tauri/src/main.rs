@@ -2,6 +2,7 @@ mod commands;
 mod config;
 mod conflicts;
 mod doctor;
+mod plan;
 mod scope;
 mod secrets;
 mod snapshot;
@@ -15,6 +16,7 @@ fn main() {
             commands::save_app_config,
             doctor::run_check,
             snapshot::export_snapshot,
+            plan::verify_and_plan,
             conflicts::scan_conflicts,
         ])
         .run(tauri::generate_context!())
