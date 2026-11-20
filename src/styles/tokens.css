@@ -1,0 +1,41 @@
+:root {
+  /* 颜色 */
+  --color-background: #f5f6f3;
+  --color-surface: #ffffff;
+  --color-surface-muted: #eef0eb;
+  --color-border: #dfe3da;
+  --color-foreground: #1e241f;
+  --color-muted-foreground: #66706a;
+  --color-accent: #2f6f4f;
+  --color-accent-hover: #275c42;
+  --color-accent-foreground: #ffffff;
+  --color-nav-active: #e6efe8;
+  --color-nav-active-foreground: #25573e;
+
+  /* 圆角 */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+
+  /* 间距 */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+  --space-2xl: 48px;
+
+  /* 字号 */
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-lg: 18px;
+  --text-xl: 22px;
+
+  /* 布局 */
+  --layout-sidebar-width: 240px;
+
+  /* 字体 */
+  --font-sans: 'Inter', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei',
+    system-ui, sans-serif;
+}
