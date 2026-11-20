@@ -11,6 +11,9 @@
   --color-accent-foreground: #ffffff;
   --color-nav-active: #e6efe8;
   --color-nav-active-foreground: #25573e;
+  --color-danger: #b3261e;
+  --color-warning: #96650f;
+  --color-success: #2f6f4f;
 
   /* 圆角 */
   --radius-sm: 6px;

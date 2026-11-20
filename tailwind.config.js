@@ -19,6 +19,9 @@ export default {
         },
         'nav-active': 'var(--color-nav-active)',
         'nav-active-foreground': 'var(--color-nav-active-foreground)',
+        danger: 'var(--color-danger)',
+        warning: 'var(--color-warning)',
+        success: 'var(--color-success)',
       },
       borderRadius: {
         sm: 'var(--radius-sm)',
