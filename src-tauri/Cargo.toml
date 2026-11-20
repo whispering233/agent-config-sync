@@ -16,3 +16,7 @@ sha2 = "0.11"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+strip = true
+lto = "thin"
