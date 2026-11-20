@@ -2,6 +2,8 @@ mod commands;
 mod config;
 mod doctor;
 mod scope;
+mod secrets;
+mod snapshot;
 
 fn main() {
     tauri::Builder::default()
@@ -11,6 +13,7 @@ fn main() {
             commands::validate_app_config,
             commands::save_app_config,
             doctor::run_check,
+            snapshot::export_snapshot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
