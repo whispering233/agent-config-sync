@@ -104,6 +104,28 @@ type HashMismatch = {
   actualSha256: string | null;
 };
 
+/** 与 Rust 侧 `ApplyReport` 一一对应。 */
+type ApplyReport = {
+  fingerprint: string;
+  backupDir: string;
+  backupId: string;
+  written: number;
+  deleted: number;
+  skipped: number;
+  linked: number;
+  skippedDeletes: number;
+  warnings: string[];
+  failedAt: string | null;
+};
+
+/** 与 Rust 侧 `ApplyFailure` 一一对应。 */
+type ApplyFailure = {
+  code: string;
+  message: string;
+  completed: number;
+  backupDir: string | null;
+};
+
 /** 与 Rust 侧 `PlanFailure` 一一对应。 */
 type PlanFailure = {
   code: string;
@@ -130,8 +152,18 @@ type PlanState =
   | { kind: 'done'; report: PlanReport }
   | { kind: 'failed'; message: string; mismatches: HashMismatch[] };
 
+type ApplyState =
+  | { kind: 'idle' }
+  | { kind: 'confirming' }
+  | { kind: 'applying' }
+  | { kind: 'done'; report: ApplyReport }
+  | { kind: 'failed'; failure: ApplyFailure | null; message: string };
+
 /** 每个分组最多列出的条数；其余只计数。 */
 const PLAN_LIST_LIMIT = 20;
+
+/** 应用提示最多列出的条数；其余只计数。 */
+const APPLY_WARNING_LIMIT = 5;
 
 const mismatchReasonText: Record<HashMismatch['reason'], string> = {
   missing: '快照里没有这个文件',
@@ -181,10 +213,26 @@ function asPlanFailure(error: unknown): PlanFailure | null {
   };
 }
 
+function asApplyFailure(error: unknown): ApplyFailure | null {
+  const failure = asFailure(error);
+  if (failure === null) {
+    return null;
+  }
+  const candidate = error as Partial<ApplyFailure>;
+  return {
+    code: failure.code,
+    message: failure.message,
+    completed: typeof candidate.completed === 'number' ? candidate.completed : 0,
+    backupDir: candidate.backupDir ?? null,
+  };
+}
+
 export function SnapshotPage() {
   const [config, setConfig] = useState<ConfigState>({ kind: 'loading' });
   const [exported, setExported] = useState<ExportState>({ kind: 'idle' });
   const [planning, setPlanning] = useState<PlanState>({ kind: 'idle' });
+  const [selected, setSelected] = useState<string[]>([]);
+  const [applying, setApplying] = useState<ApplyState>({ kind: 'idle' });
 
   useEffect(() => {
     if (!isDesktop) {
@@ -224,6 +272,9 @@ export function SnapshotPage() {
 
   async function runCheck() {
     setPlanning({ kind: 'checking' });
+    // 计划重算后旧的勾选与结果都不再对应，清空。
+    setSelected([]);
+    setApplying({ kind: 'idle' });
     try {
       const report = await invoke<PlanReport>('verify_and_plan');
       setPlanning({ kind: 'done', report });
@@ -235,6 +286,44 @@ export function SnapshotPage() {
         mismatches: failure?.mismatches ?? [],
       });
     }
+  }
+
+  async function runApply() {
+    if (planning.kind !== 'done') {
+      return;
+    }
+    const fingerprint = planning.report.manifestInfo.fingerprint;
+    setApplying({ kind: 'applying' });
+    try {
+      const report = await invoke<ApplyReport>('apply_snapshot', {
+        expectedFingerprint: fingerprint,
+        deletePaths: selected,
+      });
+      setApplying({ kind: 'done', report });
+    } catch (error) {
+      const failure = asApplyFailure(error);
+      setApplying({
+        kind: 'failed',
+        failure,
+        message: failure?.message ?? errorMessage(error),
+      });
+    }
+  }
+
+  const applyBusy = applying.kind === 'applying';
+  const canApply =
+    isDesktop &&
+    !applyBusy &&
+    applying.kind !== 'done' &&
+    planning.kind === 'done' &&
+    (planning.report.totals.added > 0 ||
+      planning.report.totals.modified > 0 ||
+      selected.length > 0);
+
+  function toggleDelete(path: string) {
+    setSelected((current) =>
+      current.includes(path) ? current.filter((item) => item !== path) : [...current, path],
+    );
   }
 
   async function runExport(allowPlaintext: boolean) {
@@ -332,7 +421,7 @@ export function SnapshotPage() {
         </div>
         {!isDesktop && (
           <p className="mt-sm text-sm text-muted-foreground">
-            浏览器预览里没有本机快照：桌面版会读取 manifest.json、逐文件校验哈希，再列出差异。
+            浏览器预览里没有本机快照：桌面版会读取 manifest.json、逐文件校验哈希，再列出差异；应用快照也仅桌面版可用，并会先备份再写入。
           </p>
         )}
 
@@ -417,6 +506,135 @@ export function SnapshotPage() {
           </div>
         )}
       </Card>
+
+      {planning.kind === 'done' && (
+        <Card className="p-lg">
+          <h2 className="text-sm font-semibold text-foreground">应用</h2>
+          <p className="mt-xs text-sm text-muted-foreground">
+            把快照写进本机：新增 {planning.report.totals.added} 项、修改{' '}
+            {planning.report.totals.modified} 项；删除需逐项勾选，未勾选的保留。覆盖与删除前会先备份到本机应用数据目录。
+          </p>
+
+          {planning.report.plan.deleted.length === 0 ? (
+            <p className="mt-sm text-sm text-muted-foreground">没有删除候选。</p>
+          ) : (
+            <div className="mt-md">
+              <div className="flex flex-wrap items-center justify-between gap-sm">
+                <h3 className="text-xs font-semibold text-foreground">
+                  删除候选 {planning.report.plan.deleted.length} 项（已勾选 {selected.length} 项）
+                </h3>
+                <div className="flex gap-sm">
+                  <Button
+                    variant="secondary"
+                    onClick={() => setSelected(planning.report.plan.deleted.map((item) => item.path))}
+                    disabled={!isDesktop || applyBusy}
+                  >
+                    全选
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    onClick={() => setSelected([])}
+                    disabled={!isDesktop || applyBusy || selected.length === 0}
+                  >
+                    全不选
+                  </Button>
+                </div>
+              </div>
+              <ul className="mt-xs flex flex-col gap-sm">
+                {planning.report.plan.deleted.map((item) => (
+                  <li key={item.path} className="rounded-md bg-surface-muted px-md py-sm">
+                    <label className="flex items-start gap-sm">
+                      <input
+                        type="checkbox"
+                        className="mt-xs h-4 w-4"
+                        checked={selected.includes(item.path)}
+                        onChange={() => toggleDelete(item.path)}
+                        disabled={!isDesktop || applyBusy}
+                      />
+                      <span className="break-all font-mono text-xs text-foreground">
+                        {item.path}
+                      </span>
+                    </label>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <div className="mt-md flex flex-wrap items-center gap-md">
+            <Button onClick={() => setApplying({ kind: 'confirming' })} disabled={!canApply}>
+              {applyBusy ? '应用中…' : '应用快照'}
+            </Button>
+            {!isDesktop && (
+              <span className="text-sm text-muted-foreground">应用仅桌面版可用</span>
+            )}
+          </div>
+
+          {applying.kind === 'confirming' && (
+            <div className="mt-md rounded-md bg-surface-muted px-md py-sm">
+              <p className="text-sm text-foreground">
+                将写入 {planning.report.totals.added + planning.report.totals.modified}{' '}
+                个文件、删除 {selected.length} 个文件；覆盖与删除前会先备份到本机。
+              </p>
+              <div className="mt-sm flex flex-wrap gap-sm">
+                <Button onClick={() => void runApply()} disabled={applyBusy}>
+                  确认应用
+                </Button>
+                <Button variant="secondary" onClick={() => setApplying({ kind: 'idle' })}>
+                  取消
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {applyBusy && (
+            <p className="mt-sm text-sm text-muted-foreground" aria-live="polite">
+              正在备份并写入本机配置…
+            </p>
+          )}
+
+          {applying.kind === 'done' && (
+            <div className="mt-md flex flex-col gap-sm">
+              <dl className="flex flex-col gap-sm">
+                <ResultRow label="备份编号" value={applying.report.backupId} mono />
+                <ResultRow label="备份目录" value={applying.report.backupDir} mono />
+                <ResultRow label="写入" value={`${applying.report.written} 个文件`} />
+                <ResultRow label="删除" value={`${applying.report.deleted} 个文件`} />
+                <ResultRow label="保留的删除候选" value={`${applying.report.skipped} 个`} />
+                <ResultRow label="重建链接" value={`${applying.report.linked} 个`} />
+                <ResultRow label="跳过删除" value={`${applying.report.skippedDeletes} 个`} />
+              </dl>
+              <WarningList warnings={applying.report.warnings} />
+              <p className="text-sm text-success">
+                已按快照落地：请重启 Pi，或在会话里执行 /reload 让配置生效。
+              </p>
+              <p className="text-xs text-muted-foreground">
+                如需再次应用，请先重新检查快照。
+              </p>
+            </div>
+          )}
+
+          {applying.kind === 'failed' && (
+            <div className="mt-md flex flex-col gap-sm">
+              <p className="flex items-start gap-sm text-sm text-danger">
+                <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
+                <span>应用失败：{applying.message}</span>
+              </p>
+              {applying.failure !== null && (
+                <dl className="flex flex-col gap-sm">
+                  <ResultRow label="失败码" value={applying.failure.code} mono />
+                  {applying.failure.backupDir !== null && (
+                    <ResultRow label="备份目录" value={applying.failure.backupDir} mono />
+                  )}
+                </dl>
+              )}
+              <p className="text-xs text-muted-foreground">
+                失败即停：已完成的部分留在原地，备份已保留；不自动重试、不自动回滚。
+              </p>
+            </div>
+          )}
+        </Card>
+      )}
 
       {exported.kind === 'done' && (
         <Card className="p-lg">
@@ -558,6 +776,36 @@ function PlanGroup({
       {items.length > shown.length && (
         <p className="mt-xs text-xs text-muted-foreground">
           还有 {items.length - shown.length} 项
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** 应用提示：只列前 5 条，其余只报数量。 */
+function WarningList({ warnings }: { warnings: string[] }) {
+  if (warnings.length === 0) {
+    return null;
+  }
+  const shown = warnings.slice(0, APPLY_WARNING_LIMIT);
+  return (
+    <div>
+      <h3 className="text-xs font-semibold text-foreground">
+        提示 {warnings.length} 条
+      </h3>
+      <ul className="mt-xs flex flex-col gap-sm">
+        {shown.map((warning, index) => (
+          <li
+            key={`${index}-${warning}`}
+            className="rounded-md bg-surface-muted px-md py-sm"
+          >
+            <p className="break-all text-xs text-foreground">{warning}</p>
+          </li>
+        ))}
+      </ul>
+      {warnings.length > shown.length && (
+        <p className="mt-xs text-xs text-muted-foreground">
+          还有 {warnings.length - shown.length} 条
         </p>
       )}
     </div>
