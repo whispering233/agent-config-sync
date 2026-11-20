@@ -126,6 +126,37 @@ type ApplyFailure = {
   backupDir: string | null;
 };
 
+/** 与 Rust 侧 `BackupSummary` 一一对应。 */
+type BackupSummary = {
+  id: string;
+  createdAt: string;
+  fingerprint: string;
+  entries: number;
+};
+
+/** 与 Rust 侧 `BackupList` 一一对应。 */
+type BackupList = {
+  backups: BackupSummary[];
+  warnings: string[];
+};
+
+/** 与 Rust 侧 `RestoreReport` 一一对应。 */
+type RestoreReport = {
+  backupId: string;
+  safetyBackupId: string;
+  restored: number;
+  removed: number;
+  failedAt: string | null;
+};
+
+/** 与 Rust 侧 `RestoreFailure` 一一对应。 */
+type RestoreFailure = {
+  code: string;
+  message: string;
+  completed: number;
+  safetyBackupId: string | null;
+};
+
 /** 与 Rust 侧 `PlanFailure` 一一对应。 */
 type PlanFailure = {
   code: string;
@@ -159,11 +190,27 @@ type ApplyState =
   | { kind: 'done'; report: ApplyReport }
   | { kind: 'failed'; failure: ApplyFailure | null; message: string };
 
+type BackupsState =
+  | { kind: 'idle' }
+  | { kind: 'loading' }
+  | { kind: 'done'; list: BackupList }
+  | { kind: 'failed'; message: string };
+
+type RestoreState =
+  | { kind: 'idle' }
+  | { kind: 'confirming'; id: string }
+  | { kind: 'restoring'; id: string }
+  | { kind: 'done'; report: RestoreReport }
+  | { kind: 'failed'; failure: RestoreFailure | null; message: string };
+
 /** 每个分组最多列出的条数；其余只计数。 */
 const PLAN_LIST_LIMIT = 20;
 
 /** 应用提示最多列出的条数；其余只计数。 */
 const APPLY_WARNING_LIMIT = 5;
+
+/** 备份卡片最多列出的份数；更旧的仍在磁盘上。 */
+const BACKUP_LIST_SHOWN = 5;
 
 const mismatchReasonText: Record<HashMismatch['reason'], string> = {
   missing: '快照里没有这个文件',
@@ -227,12 +274,28 @@ function asApplyFailure(error: unknown): ApplyFailure | null {
   };
 }
 
+function asRestoreFailure(error: unknown): RestoreFailure | null {
+  const failure = asFailure(error);
+  if (failure === null) {
+    return null;
+  }
+  const candidate = error as Partial<RestoreFailure>;
+  return {
+    code: failure.code,
+    message: failure.message,
+    completed: typeof candidate.completed === 'number' ? candidate.completed : 0,
+    safetyBackupId: candidate.safetyBackupId ?? null,
+  };
+}
+
 export function SnapshotPage() {
   const [config, setConfig] = useState<ConfigState>({ kind: 'loading' });
   const [exported, setExported] = useState<ExportState>({ kind: 'idle' });
   const [planning, setPlanning] = useState<PlanState>({ kind: 'idle' });
   const [selected, setSelected] = useState<string[]>([]);
   const [applying, setApplying] = useState<ApplyState>({ kind: 'idle' });
+  const [backups, setBackups] = useState<BackupsState>({ kind: 'idle' });
+  const [restoring, setRestoring] = useState<RestoreState>({ kind: 'idle' });
 
   useEffect(() => {
     if (!isDesktop) {
@@ -262,6 +325,13 @@ export function SnapshotPage() {
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  useEffect(() => {
+    if (!isDesktop) {
+      return;
+    }
+    void loadBackups();
   }, []);
 
   const syncRoot = config.kind === 'ready' ? config.syncRoot : null;
@@ -311,6 +381,7 @@ export function SnapshotPage() {
   }
 
   const applyBusy = applying.kind === 'applying';
+  const restoreBusy = restoring.kind === 'restoring';
   const canApply =
     isDesktop &&
     !applyBusy &&
@@ -324,6 +395,36 @@ export function SnapshotPage() {
     setSelected((current) =>
       current.includes(path) ? current.filter((item) => item !== path) : [...current, path],
     );
+  }
+
+  async function loadBackups() {
+    setBackups({ kind: 'loading' });
+    try {
+      const list = await invoke<BackupList>('list_backups');
+      setBackups({ kind: 'done', list });
+    } catch (error) {
+      setBackups({ kind: 'failed', message: errorMessage(error) });
+    }
+  }
+
+  async function runRestore(id: string) {
+    setRestoring({ kind: 'restoring', id });
+    try {
+      const report = await invoke<RestoreReport>('restore_backup', {
+        backupId: id,
+        confirm: true,
+      });
+      setRestoring({ kind: 'done', report });
+      // 回滚前又备份了一次，列表要刷新。
+      void loadBackups();
+    } catch (error) {
+      const failure = asRestoreFailure(error);
+      setRestoring({
+        kind: 'failed',
+        failure,
+        message: failure?.message ?? errorMessage(error),
+      });
+    }
   }
 
   async function runExport(allowPlaintext: boolean) {
@@ -635,6 +736,130 @@ export function SnapshotPage() {
           )}
         </Card>
       )}
+
+      <Card className="p-lg">
+        <h2 className="text-sm font-semibold text-foreground">备份与回滚</h2>
+        <p className="mt-xs text-sm text-muted-foreground">
+          应用前会把将被覆盖或删除的文件备份到本机应用数据目录；回滚只从备份还原本机配置，不碰快照。
+        </p>
+
+        {!isDesktop && (
+          <p className="mt-sm text-sm text-muted-foreground">
+            备份与回滚仅桌面版可用：浏览器预览读不到本机应用数据目录。
+          </p>
+        )}
+        {backups.kind === 'loading' && (
+          <p className="mt-sm text-sm text-muted-foreground">正在读取本机备份…</p>
+        )}
+        {backups.kind === 'failed' && (
+          <p className="mt-sm text-sm text-danger">读取备份失败：{backups.message}</p>
+        )}
+        {backups.kind === 'done' && backups.list.backups.length === 0 && (
+          <p className="mt-sm text-sm text-muted-foreground">
+            本机还没有备份：应用一次快照后这里会出现记录。
+          </p>
+        )}
+        {backups.kind === 'done' && backups.list.backups.length > 0 && (
+          <ul className="mt-md flex flex-col gap-sm">
+            {backups.list.backups.slice(0, BACKUP_LIST_SHOWN).map((backup) => (
+              <li key={backup.id} className="rounded-md bg-surface-muted px-md py-sm">
+                <div className="flex flex-wrap items-center justify-between gap-sm">
+                  <div>
+                    <p className="font-mono text-xs text-foreground">{backup.createdAt}</p>
+                    <p className="mt-xs text-xs text-muted-foreground">
+                      指纹 <span className="font-mono">{backup.fingerprint}</span> ·{' '}
+                      {backup.entries} 个条目
+                    </p>
+                  </div>
+                  <Button
+                    variant="secondary"
+                    onClick={() => setRestoring({ kind: 'confirming', id: backup.id })}
+                    disabled={!isDesktop || restoreBusy}
+                  >
+                    回滚到此
+                  </Button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+        {backups.kind === 'done' && backups.list.backups.length > BACKUP_LIST_SHOWN && (
+          <p className="mt-xs text-xs text-muted-foreground">
+            只列出最近 {BACKUP_LIST_SHOWN} 份，共 {backups.list.backups.length} 份。
+          </p>
+        )}
+        {backups.kind === 'done' && backups.list.warnings.length > 0 && (
+          <ul className="mt-sm flex flex-col gap-sm">
+            {backups.list.warnings.map((warning) => (
+              <li key={warning} className="text-xs text-warning">
+                {warning}
+              </li>
+            ))}
+          </ul>
+        )}
+
+        {restoring.kind === 'confirming' && (
+          <div className="mt-md rounded-md bg-surface-muted px-md py-sm">
+            <p className="text-sm text-foreground">
+              将把本机配置还原成备份 <span className="font-mono">{restoring.id}</span> 的状态；
+              还原前会先把当前状态自动备份一次，回滚不碰快照。
+            </p>
+            <div className="mt-sm flex flex-wrap gap-sm">
+              <Button onClick={() => void runRestore(restoring.id)} disabled={restoreBusy}>
+                确认回滚
+              </Button>
+              <Button variant="secondary" onClick={() => setRestoring({ kind: 'idle' })}>
+                取消
+              </Button>
+            </div>
+          </div>
+        )}
+        {restoring.kind === 'restoring' && (
+          <p className="mt-sm text-sm text-muted-foreground" aria-live="polite">
+            正在备份当前状态并还原…
+          </p>
+        )}
+        {restoring.kind === 'done' && (
+          <div className="mt-md flex flex-col gap-sm">
+            <dl className="flex flex-col gap-sm">
+              <ResultRow label="还原的备份" value={restoring.report.backupId} mono />
+              <ResultRow label="还原前备份" value={restoring.report.safetyBackupId} mono />
+              <ResultRow label="还原" value={`${restoring.report.restored} 个条目`} />
+              <ResultRow label="删除" value={`${restoring.report.removed} 个新增条目`} />
+            </dl>
+            <p className="text-sm text-success">
+              已从备份还原：请重启 Pi，或在会话里执行 /reload 让配置生效。
+            </p>
+            <p className="text-xs text-muted-foreground">
+              想反悔可以从「还原前备份」再回滚一次。
+            </p>
+          </div>
+        )}
+        {restoring.kind === 'failed' && (
+          <div className="mt-md flex flex-col gap-sm">
+            <p className="flex items-start gap-sm text-sm text-danger">
+              <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
+              <span>回滚失败：{restoring.message}</span>
+            </p>
+            {restoring.failure !== null && (
+              <dl className="flex flex-col gap-sm">
+                <ResultRow label="失败码" value={restoring.failure.code} mono />
+                <ResultRow label="已还原" value={`${restoring.failure.completed} 个条目`} />
+                {restoring.failure.safetyBackupId !== null && (
+                  <ResultRow
+                    label="还原前备份"
+                    value={restoring.failure.safetyBackupId}
+                    mono
+                  />
+                )}
+              </dl>
+            )}
+            <p className="text-xs text-muted-foreground">
+              失败即停：已完成的部分留在原地，还原前的备份已保留；不自动重试、不自动回退。
+            </p>
+          </div>
+        )}
+      </Card>
 
       {exported.kind === 'done' && (
         <Card className="p-lg">

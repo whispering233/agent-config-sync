@@ -382,13 +382,13 @@ fn rebuild_link(agent_dir: &Path, link: &RebuildLink) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn create_link(target: &str, path: &Path) -> io::Result<()> {
+pub(crate) fn create_link(target: &str, path: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(target, path)
 }
 
 /// 非 Unix 由 [`SYMLINK_SUPPORTED`] 提前挡下，走不到这里；保留实现只是为了让函数签名在两端一致。
 #[cfg(not(unix))]
-fn create_link(_target: &str, _path: &Path) -> io::Result<()> {
+pub(crate) fn create_link(_target: &str, _path: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "当前平台不支持符号链接",
@@ -412,7 +412,7 @@ fn is_under(path: &str, ancestor: &str) -> bool {
 
 /// 链接路径必须在受管范围内：白名单与排除规则同计划，但链接本身可以是目录，
 /// 所以根级目录名也算在内。目的是不让被改过的 manifest 借链接删掉 `auth.json` 这类文件。
-fn is_managed_link(relative: &Path) -> bool {
+pub(crate) fn is_managed_link(relative: &Path) -> bool {
     let names: Vec<&str> = relative
         .components()
         .map(|component| match component {
@@ -487,20 +487,63 @@ fn write_backup(
         .collect();
     touched.extend(confirmed.iter().map(String::as_str));
 
+    write_backup_entries(agent_dir, &touched, fingerprint, backup)
+}
+
+/// 回滚前再备份一次：把即将被改动或删除的路径按同一格式写进新备份目录。
+/// 返回备份目录名与位置；`fingerprint` 由调用方给（回滚时记被还原备份的指纹）。
+pub(crate) fn back_up_paths(
+    agent_dir: &Path,
+    app_data_dir: &Path,
+    relatives: &[&str],
+    fingerprint: &str,
+) -> Result<(String, PathBuf), ApplyFailure> {
+    let backup = create_backup_dir(app_data_dir)?;
+    let files_dir = backup.dir.join(BACKUP_FILES_DIR_NAME);
+    let mut entries = symlink_ancestors_of(agent_dir, relatives)
+        .iter()
+        .map(|relative| record(agent_dir, relative, &files_dir, true))
+        .collect::<Result<Vec<RestoreEntry>, ApplyFailure>>()?;
+    entries.extend(
+        relatives
+            .iter()
+            .map(|relative| record(agent_dir, relative, &files_dir, true))
+            .collect::<Result<Vec<RestoreEntry>, ApplyFailure>>()?,
+    );
+    write_manifest(&backup, fingerprint, entries)?;
+    prune(&app_data_dir.join(BACKUPS_DIR_NAME));
+
+    Ok((backup.id, backup.dir))
+}
+
+fn write_backup_entries(
+    agent_dir: &Path,
+    touched: &[&str],
+    fingerprint: &str,
+    backup: &Backup,
+) -> Result<(), ApplyFailure> {
     let files_dir = backup.dir.join(BACKUP_FILES_DIR_NAME);
     // 写入时 `ensure_dir` 会把祖先链接换成真实目录，链接本身只能在写入前记下来；
     // 这些条目放在文件条目之前，T8 先恢复链接再往里放文件。
-    let mut entries = symlink_ancestors_of(agent_dir, &touched)
+    let mut entries = symlink_ancestors_of(agent_dir, touched)
         .iter()
-        .map(|relative| record(agent_dir, relative, &files_dir))
+        .map(|relative| record(agent_dir, relative, &files_dir, false))
         .collect::<Result<Vec<RestoreEntry>, ApplyFailure>>()?;
     entries.extend(
         touched
             .iter()
-            .map(|relative| record(agent_dir, relative, &files_dir))
+            .map(|relative| record(agent_dir, relative, &files_dir, false))
             .collect::<Result<Vec<RestoreEntry>, ApplyFailure>>()?,
     );
 
+    write_manifest(backup, fingerprint, entries)
+}
+
+fn write_manifest(
+    backup: &Backup,
+    fingerprint: &str,
+    entries: Vec<RestoreEntry>,
+) -> Result<(), ApplyFailure> {
     let manifest = RestoreManifest {
         version: RESTORE_VERSION,
         created_at: backup.created_at.clone(),
@@ -526,7 +569,7 @@ fn symlink_ancestors_of(agent_dir: &Path, relatives: &[&str]) -> Vec<String> {
 }
 
 /// `relative` 的祖先目录里实际是符号链接的那些（不含自身），由外到内。
-fn symlink_ancestors(agent_dir: &Path, relative: &str) -> Vec<String> {
+pub(crate) fn symlink_ancestors(agent_dir: &Path, relative: &str) -> Vec<String> {
     let mut current = agent_dir.to_path_buf();
     let mut ancestor = String::new();
     let mut found = Vec::new();
@@ -548,7 +591,13 @@ fn symlink_ancestors(agent_dir: &Path, relative: &str) -> Vec<String> {
 }
 
 /// 备份单个路径：文件复制内容，符号链接只记目标，新增文件只记 `existed: false`。
-fn record(agent_dir: &Path, relative: &str, files_dir: &Path) -> Result<RestoreEntry, ApplyFailure> {
+/// `allow_dir` 只给回滚前的备份用：此刻是目录就记成目录条目，不挡回滚。
+fn record(
+    agent_dir: &Path,
+    relative: &str,
+    files_dir: &Path,
+    allow_dir: bool,
+) -> Result<RestoreEntry, ApplyFailure> {
     let live = scope::resolve_within(agent_dir, Path::new(relative)).map_err(|error| {
         ApplyFailure::new("backup_failed", format!("无法定位 {relative}：{error}"))
     })?;
@@ -574,10 +623,20 @@ fn record(agent_dir: &Path, relative: &str, files_dir: &Path) -> Result<RestoreE
 
     // 计划项都是文件；目标位置此刻是目录说明计划期间磁盘变了，停下让人看，不覆盖。
     if metadata.is_dir() {
-        return Err(ApplyFailure::new(
-            "backup_failed",
-            format!("{relative} 现在是目录，无法作为文件应用；请重新检查后再应用"),
-        ));
+        if !allow_dir {
+            return Err(ApplyFailure::new(
+                "backup_failed",
+                format!("{relative} 现在是目录，无法作为文件应用；请重新检查后再应用"),
+            ));
+        }
+        // 目录内容不会被回滚动到，回滚遇到目录也拒绝，所以只记条目。
+        return Ok(RestoreEntry {
+            path: relative.to_string(),
+            kind: RestoreKind::Dir,
+            existed: true,
+            mode: Some(metadata.permissions().mode() & 0o777),
+            link_target: None,
+        });
     }
 
     let file_type = metadata.file_type();
