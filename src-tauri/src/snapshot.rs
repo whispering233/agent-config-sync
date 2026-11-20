@@ -386,7 +386,7 @@ fn write_manifest(sync_root: &Path, manifest: &Manifest) -> Result<(), ExportFai
     })
 }
 
-/// 逐文件重算哈希。T6 的校验直接复用；本卡在写完 manifest 后自检一次。
+/// 逐文件重算哈希。导入校验直接复用；导出在写完 manifest 后自检一次。
 pub fn verify_files(sync_root: &Path, files: &[ManifestFile]) -> Result<(), ExportFailure> {
     for file in files {
         let bytes = fs::read(sync_root.join(&file.path)).map_err(|error| {
@@ -422,7 +422,7 @@ pub fn fingerprint(format_version: u32, files: &[ManifestFile]) -> String {
     sha256_hex(&hasher.finalize())[..12].to_string()
 }
 
-/// 文件内容哈希：导入校验（T6）与导出共用同一套算法。
+/// 文件内容哈希：导入校验与导出共用同一套算法。
 pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()

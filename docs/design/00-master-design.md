@@ -29,6 +29,7 @@
 | Q6 | 宿主安装 | 官方 installer 无 TTY 子进程；npm 全局安装作为降级；Windows 仅走 npm；不引入 PTY | 官方 installer 会 pin 依赖；无 TTY 时行为确定；Windows 版有静默安装 Portable Git 的风险 |
 | Q7 | 配置套数 | v1 单套；manifest 预留 `profileId`，快照根目录参数化 | 多套配置是本机问题，不是同步问题 |
 | Q8 | 平台顺序 | Linux → Windows → macOS | 开发机即验证机；Windows 有 installer/Git 副作用；macOS 需签名公证 |
+| Q9 | 包对齐 | 只安装"已启用且缺失"的声明包；多余包只展示，不自动移除 | 移除包的影响面大于安装，交给用户判断 |
 
 ## 3. 能力边界
 
@@ -52,10 +53,12 @@
  │   ├─ snapshot   白名单收集、脱敏、写 manifest、计算指纹
  │   ├─ verify     manifest 完整性、哈希、格式版本
  │   ├─ plan       与 live 比较，生成新增/修改/删除清单
- │   ├─ apply      备份、写入、删除（确认后）、回滚
- │   ├─ secrets    引用化、扫描、补齐
+ │   ├─ apply      重算计划、备份、写入、删除（确认后）
+ │   ├─ rollback   备份列表、还原前备份、按 restore.json 反做
+ │   ├─ secrets    引用化、扫描、requiredSecrets 补齐
  │   ├─ packages   声明与实装对齐，调用宿主 CLI 重装
- │   └─ installer  宿主安装/升级
+ │   ├─ installer  宿主安装/升级（两段式，超时杀进程组）
+ │   └─ conflicts  冲突文件识别与差异摘要（只读）
  │
  ├─ 快照（云盘同步文件夹）
  │     snapshot/ + manifest.json

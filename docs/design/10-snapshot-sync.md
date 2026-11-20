@@ -92,13 +92,15 @@
   "requiredSecrets": [
     { "name": "EXA_API_KEY", "usedBy": ["snapshot/web-search.json"], "hint": "https://exa.ai" }
   ],
-  "requiredPackages": [{ "source": "npm:pi-web-access", "enabled": true }]
+  "requiredPackages": [{ "source": "npm:pi-web-access", "enabled": true }],
+  "plaintextSecrets": false
 }
 ```
 
 - `fingerprint`：对 `formatVersion` 与所有 `{path, sha256}` 排序后取哈希，显示前 12 位。用途：两台机器肉眼核对"是不是同一份快照"。
 - manifest **最后写**：文件先落盘，manifest 落盘即代表快照完整。
 - 未知 `formatVersion` 一律拒绝读取，不尝试兼容。
+- `plaintextSecrets: true` 表示导出时用户在知情下保留了明文密钥，导入端据此告警。
 
 ## 5. 导出（上传快照）
 
@@ -134,7 +136,8 @@
 4. 预览         展示每项差异与来源（diff 文本摘要 + 大小 + 时间）
    ├─ 删除项默认不勾选，需逐项确认
    └─ 展示 requiredSecrets / requiredPackages 待办
-5. 备份         把将被覆盖/删除的文件复制到本机备份目录
+5. 应用前复核   重算计划并按 fingerprint 比对；不一致 → `plan_stale`，整次拒绝
+   备份         把将被覆盖/删除的文件与祖先链接复制到本机备份目录
 6. 落地         重建链接 → 写入/删除（链接之下的项跳过）；沿用原文件权限位；失败即停并保留备份
 7. 收尾
    ├─ 包对齐：按 requiredPackages 调用宿主安装命令（需确认）
@@ -161,28 +164,36 @@ idle → reading → verifying → planning → previewing → backing-up → ap
 
 ## 7. 备份与回滚
 
-- 位置：本机应用数据目录（**不放云盘**），每次应用一个时间戳子目录。
-- 内容：只备份将被覆盖/删除的文件，外加 `restore.json`（原始路径、权限、来源快照 fingerprint）。
-- 保留：最近 10 次。
-- 回滚：从备份目录恢复到原路径，恢复前再做一次备份。回滚不触碰快照。
+```text
+<app-data>/backups/<UTC 时间戳>/
+├── files/<相对路径>       # 将被覆盖或删除的现有文件内容
+└── restore.json           # { version, createdAt, fingerprint, entries[] }
+```
+
+- `entries`：`{ path, kind: file|symlink|dir, existed, mode, linkTarget }`。符号链接只记录目标，不复制内容；`existed: false` 表示该路径是应用新增的。
+- 位置在本机应用数据目录（**不放云盘**）；目录权限 `0700`。
+- 覆盖/删除前备份；被物化替换的祖先链接也会记录，便于回滚恢复链接。
+- 保留最近 10 份，超出清理最旧。
+- 回滚：按 `restore.json` 反做（文件写回并恢复 mode、链接重建、新增路径删除），**还原前再备份一次当前状态**；回滚不触碰快照。路径越界或备份损坏时整次拒绝。
 
 ## 8. 冲突文件
 
-- 扫描受管范围内匹配 `*-冲突*` 与 `*-NSConflict*` 的文件。
-- 展示：冲突文件与对应原文件的 diff 摘要。
-- 动作（人工选择，逐条）：保留原文件并把冲突文件移入备份目录 / 用冲突文件替换原文件 / 暂不处理。
-- 不自动合并，不自动删除。
+- **已实现（只读）**：扫描受管范围内匹配 `*-冲突*` 与 `*-NSConflict*` 的文件，与对应原文件配对，输出行数、差异行数、首处差异行号；孤儿副本、二进制、超 1 MB、不可读单独标记。
+- **未实现**：处理动作与 UI（保留原文件 / 用冲突副本替换 / 暂不处理），见 `backlog.md`。
+- 原则：不自动合并，不自动删除。
 
 ## 9. 失败码
 
 | code | 含义 |
 | :--- | :--- |
-| `manifest_missing` | 云盘尚未同步完成或路径错误 |
-| `manifest_unsupported` | `formatVersion` 不认识 |
+| `manifest_missing` / `manifest_corrupt` / `manifest_unsupported` | 快照缺失、无法解析或格式版本不支持 |
 | `hash_mismatch` | 快照文件与 manifest 不一致 |
-| `no_write_permission` | 目标目录不可写 |
-| `backup_failed` | 备份失败，已中止 |
-| `apply_partial` | 写入中途失败，需回滚 |
+| `plan_stale` | 应用前重算的指纹与用户确认时不同 |
+| `delete_not_in_plan` | 请求删除的路径不在本次计划或受管范围内 |
+| `delete_through_symlink` | 待删路径经过非 manifest 记录的符号链接 |
+| `no_write_permission` / `backup_failed` | 目标不可写 / 备份失败，已中止 |
+| `apply_failed` | 落地中途失败，已停止；可用备份回滚 |
+| `restore_failed` / `backup_invalid` / `backup_missing` | 回滚失败或备份不可用 |
 | `host_version_unsatisfied` | 宿主版本低于要求（警告） |
 | `secret_residue` | 快照内仍有字面密钥（警告） |
 

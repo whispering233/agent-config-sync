@@ -2,10 +2,7 @@
 //!
 //! 规则来源：`docs/design/10-snapshot-sync.md` 的「受管范围」「符号链接」两节。
 //! 范围判定集中在下面的常量与 [`is_excluded_name`] / [`resolve_within`]，
-//! 后续的快照、计划、删除判定都应复用它们，不另写一套。
-
-// T3 只落核心模块，接入前从 main.rs 看都是死代码。
-#![allow(dead_code)]
+//! 快照、计划与落地都复用它们，不另写一套。
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -93,8 +90,6 @@ pub enum SkipReason {
     SpecialFile,
     /// 链接成环，重复进入同一物理目录。
     LinkLoop,
-    /// 路径越出目标根。
-    OutOfBounds,
 }
 
 /// 被跳过的条目。

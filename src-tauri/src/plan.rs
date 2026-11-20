@@ -1,7 +1,7 @@
 //! 快照校验与导入计划（只读）。
 //!
 //! 规则来源：`docs/design/10-snapshot-sync.md` 第 4、6 节。
-//! 只读：读 manifest、读快照文件、读 live 文件，不写任何文件；落地在 T7。
+//! 只读：读 manifest、读快照文件、读 live 文件，不写任何文件；落地由 apply 负责。
 //! 核心 [`plan_snapshot`] 不依赖 Tauri，子进程通过 [`CommandRunner`] 注入，可直接临时目录单测。
 //!
 //! 失败停在原地：manifest 缺失/版本不支持/损坏、任一文件哈希不符都直接返回失败，不给半套计划。
