@@ -21,3 +21,4 @@
 - 回滚：备份列表、还原前自动备份、按 restore.json 反做。
 - 密钥向导：requiredSecrets 状态、本机字面值写入、环境变量命令。
 - 包对齐：声明与实装比对、确认后安装缺失项。
+- Linux 分发：deb 与 AppImage 打包、关于页、release 去符号。

@@ -28,11 +28,16 @@ Pi CLI 配置同步桌面工具（设计阶段，尚无代码）。
 - 密钥策略：`docs/design/30-secrets.md`
 - 技术架构：`docs/design/architecture.md`
 - 遗留项：`docs/design/backlog.md`
+- 构建与分发：`docs/design/build.md`
 - 任务卡片（临时）：`docs/design/tasks.md`
 
 ## 当前状态
 
-设计完成，未开始编码。技术栈：Tauri v2 + Rust + React + TypeScript + Tailwind + shadcn/ui；首个平台 Linux。
+v0.1：Linux 可构建、可安装（deb + AppImage）。功能面覆盖环境医生、宿主安装、快照导出、校验预览、应用与备份、回滚、密钥向导、包对齐。
+
+- 构建与打包：`docs/design/build.md`
+- 技术栈：Tauri v2 + Rust + React + TypeScript + Tailwind + shadcn/ui
+- Windows / macOS 尚未打包；分享包与自研 WebDAV 在 backlog
 
 ## 目录结构
 
