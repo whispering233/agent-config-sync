@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { CircleAlert, CircleCheck, TriangleAlert } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card } from '../components/ui/card';
@@ -29,6 +30,26 @@ type LoadState =
   | { kind: 'loading' }
   | { kind: 'browser' }
   | { kind: 'ready'; view: AppConfigView }
+  | { kind: 'failed'; message: string };
+
+/** 与 Rust 侧 `SecretStatus` 一一对应。 */
+type SecretStatus = {
+  name: string;
+  usedBy: string[];
+  hint: string | null;
+  envPresent: boolean;
+};
+
+/** 与 Rust 侧 `WriteReport` 一一对应；只含数量，不含值。 */
+type WriteReport = {
+  name: string;
+  files: number;
+};
+
+type SecretsState =
+  | { kind: 'idle' }
+  | { kind: 'loading' }
+  | { kind: 'ready'; items: SecretStatus[] }
   | { kind: 'failed'; message: string };
 
 const EMPTY_FORM: SettingsForm = { syncRoot: '', agentDirOverride: '' };
@@ -86,6 +107,36 @@ function isDirty(base: AppConfig, form: SettingsForm): boolean {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** 命令失败时 Rust 侧返回 `{code, message}`，不是 Error 实例。 */
+function failureMessage(error: unknown): string {
+  if (typeof error === 'object' && error !== null && 'message' in error) {
+    return String((error as { message: unknown }).message);
+  }
+  return errorMessage(error);
+}
+
+function checkSecrets(): Promise<SecretStatus[]> {
+  return invoke<SecretStatus[]>('check_secrets');
+}
+
+function writeSecret(name: string, value: string): Promise<WriteReport> {
+  return invoke<WriteReport>('write_secret', { name, value });
+}
+
+const isWindowsHost = typeof navigator !== 'undefined' && /windows/i.test(navigator.userAgent);
+
+/** 只生成本机命令文本供复制；不执行，也不写 shell 启动文件。 */
+function exportCommand(name: string, value: string): string {
+  if (isWindowsHost) {
+    return value === ''
+      ? `setx ${name} "<值>"`
+      : `setx ${name} "${value.replace(/"/g, '""')}"`;
+  }
+  return value === ''
+    ? `export ${name}='<值>'`
+    : `export ${name}='${value.replace(/'/g, "'\\''")}'`;
 }
 
 export function SettingsPage() {
@@ -335,6 +386,20 @@ export function SettingsPage() {
           </Card>
 
           <Card className="p-lg">
+            <h2 className="text-sm font-semibold text-foreground">密钥</h2>
+            <p className="mt-xs text-xs text-muted-foreground">
+              快照里只有环境变量引用。这里的两条路都只影响本机：写入后回写快照时仍会被引用化，
+              不会出现明文；应用不修改 shell 启动文件。
+            </p>
+            <SecretsBody
+              savedSyncRoot={
+                loadState.kind === 'ready' ? loadState.view.config.syncRoot : null
+              }
+              dirty={dirty}
+            />
+          </Card>
+
+          <Card className="p-lg">
             <h2 className="text-sm font-semibold text-foreground">生效路径</h2>
             <dl className="mt-md flex flex-col gap-sm">
               <PathRow
@@ -448,6 +513,171 @@ function PathRow({ label, value, status, note }: PathRowProps) {
         <dd className="mt-xs text-xs text-muted-foreground">{note}</dd>
       )}
     </div>
+  );
+}
+
+type SecretsBodyProps = {
+  /** 已保存的同步文件夹；未保存的改动不影响这里读的 manifest。 */
+  savedSyncRoot: string | null;
+  dirty: boolean;
+};
+
+function SecretsBody({ savedSyncRoot, dirty }: SecretsBodyProps) {
+  const [state, setState] = useState<SecretsState>({ kind: 'idle' });
+
+  useEffect(() => {
+    if (!isDesktop || savedSyncRoot === null) {
+      setState({ kind: 'idle' });
+      return;
+    }
+
+    let cancelled = false;
+    setState({ kind: 'loading' });
+    checkSecrets()
+      .then((items) => {
+        if (!cancelled) {
+          setState({ kind: 'ready', items });
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setState({ kind: 'failed', message: failureMessage(error) });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [savedSyncRoot]);
+
+  if (!isDesktop) {
+    return (
+      <p className="mt-md text-sm text-muted-foreground">
+        浏览器预览不读取本机密钥。桌面版会列出 manifest 的 requiredSecrets，
+        检测本机环境变量，并提供复制命令与写入本机两条路。
+      </p>
+    );
+  }
+
+  if (savedSyncRoot === null) {
+    return (
+      <p className="mt-md text-sm text-muted-foreground">
+        还没有保存同步文件夹，先在上方“位置”里选择并保存。
+      </p>
+    );
+  }
+
+  if (state.kind === 'loading' || state.kind === 'idle') {
+    return <p className="mt-md text-sm text-muted-foreground">正在读取 manifest…</p>;
+  }
+
+  if (state.kind === 'failed') {
+    return <p className="mt-md text-sm text-danger">{state.message}</p>;
+  }
+
+  return (
+    <div className="mt-md flex flex-col gap-md">
+      {dirty && (
+        <p className="text-xs text-muted-foreground">
+          路径有未保存的改动；密钥列表仍来自已保存的同步文件夹。
+        </p>
+      )}
+      {state.items.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          这份快照没有待补密钥：配置里没有依赖环境变量的项。
+        </p>
+      ) : (
+        <ul className="flex flex-col gap-md">
+          {state.items.map((secret) => (
+            <SecretRow key={secret.name} secret={secret} />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function SecretRow({ secret }: { secret: SecretStatus }) {
+  const [value, setValue] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [outcome, setOutcome] = useState<{ ok: boolean; text: string } | null>(null);
+
+  async function handleWrite() {
+    setBusy(true);
+    setOutcome(null);
+    try {
+      const report = await writeSecret(secret.name, value);
+      setValue('');
+      setOutcome({ ok: true, text: `已写入本机 ${report.files} 个文件` });
+    } catch (error) {
+      setOutcome({ ok: false, text: failureMessage(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleCopy() {
+    try {
+      await navigator.clipboard.writeText(exportCommand(secret.name, value));
+      setOutcome({ ok: true, text: '命令已复制' });
+    } catch {
+      setOutcome({ ok: false, text: '复制失败，请手动复制命令' });
+    }
+  }
+
+  const inputId = `secret-${secret.name}`;
+
+  return (
+    <li className="rounded-md bg-surface-muted px-md py-sm">
+      <div className="flex flex-wrap items-center justify-between gap-sm">
+        <span className="break-all font-mono text-sm text-foreground">{secret.name}</span>
+        <span
+          className={cn('text-xs', secret.envPresent ? 'text-success' : 'text-warning')}
+        >
+          {secret.envPresent ? '环境变量已配置' : '环境变量缺失'}
+        </span>
+      </div>
+      <p className="mt-xs text-xs text-muted-foreground">
+        用于 {secret.usedBy.join('、')}
+      </p>
+      {secret.hint !== null && (
+        <p className="mt-xs text-xs text-muted-foreground">获取提示：{secret.hint}</p>
+      )}
+
+      <div className="mt-sm flex gap-sm">
+        <Input
+          id={inputId}
+          type="password"
+          value={value}
+          onChange={(event) => {
+            setValue(event.target.value);
+            setOutcome(null);
+          }}
+          placeholder="仅写入本机，不会进入快照"
+          autoComplete="off"
+          spellCheck={false}
+          aria-label={`${secret.name} 的密钥值`}
+        />
+        <Button
+          className="shrink-0"
+          onClick={handleWrite}
+          disabled={busy || value === ''}
+        >
+          {busy ? '写入中…' : '写入本机'}
+        </Button>
+        <Button variant="secondary" className="shrink-0" onClick={handleCopy}>
+          复制 export 命令
+        </Button>
+      </div>
+      {outcome !== null && (
+        <p
+          className={cn('mt-xs text-xs', outcome.ok ? 'text-success' : 'text-danger')}
+          aria-live="polite"
+        >
+          {outcome.text}
+        </p>
+      )}
+    </li>
   );
 }
 

@@ -8,6 +8,7 @@ mod plan;
 mod scope;
 mod secrets;
 mod snapshot;
+mod wizard;
 
 fn main() {
     tauri::Builder::default()
@@ -23,6 +24,8 @@ fn main() {
             plan::verify_and_plan,
             conflicts::scan_conflicts,
             apply::apply_snapshot,
+            wizard::check_secrets,
+            wizard::write_secret,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
