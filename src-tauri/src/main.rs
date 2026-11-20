@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod conflicts;
 mod doctor;
 mod scope;
 mod secrets;
@@ -14,6 +15,7 @@ fn main() {
             commands::save_app_config,
             doctor::run_check,
             snapshot::export_snapshot,
+            conflicts::scan_conflicts,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
