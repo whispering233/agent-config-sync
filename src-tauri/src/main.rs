@@ -5,6 +5,7 @@ mod conflicts;
 mod doctor;
 mod installer;
 mod plan;
+mod rollback;
 mod scope;
 mod secrets;
 mod snapshot;
@@ -23,6 +24,8 @@ fn main() {
             plan::verify_and_plan,
             conflicts::scan_conflicts,
             apply::apply_snapshot,
+            rollback::list_backups,
+            rollback::restore_backup,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
