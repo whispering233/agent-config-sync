@@ -33,7 +33,7 @@ Pi CLI 配置同步桌面工具（设计阶段，尚无代码）。
 
 ## 当前状态
 
-v0.1：Linux 可构建、可安装（deb 已验证；AppImage 可构建，但打包时需从 GitHub 下载 runtime，网络受限时失败）。功能面覆盖环境医生、宿主安装、快照导出、校验预览、应用与备份、回滚、密钥向导、包对齐。
+v0.1：Linux 可构建、可安装（deb 与 AppImage 均已验证）。功能面覆盖环境医生、宿主安装、快照导出、校验预览、应用与备份、回滚、密钥向导、包对齐。
 
 - 构建与打包：`docs/design/build.md`
 - 技术栈：Tauri v2 + Rust + React + TypeScript + Tailwind + shadcn/ui
