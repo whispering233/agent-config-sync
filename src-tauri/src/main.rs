@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod doctor;
 mod scope;
 
 fn main() {
@@ -9,6 +10,7 @@ fn main() {
             commands::load_app_config,
             commands::validate_app_config,
             commands::save_app_config,
+            doctor::run_check,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
