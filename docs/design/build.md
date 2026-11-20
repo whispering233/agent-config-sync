@@ -70,3 +70,4 @@ timeout --preserve-status 10 xvfb-run -a env \
 - 无自动更新：升级需重新下载安装包。
 - Windows / macOS 尚未打包（见 `backlog.md`）。
 - AppImage 依赖目标机器可执行 AppImage（必要时用 `APPIMAGE_EXTRACT_AND_RUN=1` 在无 FUSE 环境运行）。
+- AppImage 打包时 `appimagetool` 会从 GitHub 下载 type2 runtime；若网络拦截 release 资产（表现为下载返回空内容），打包会失败，deb 不受影响。可自行准备并校验 runtime 后用 `--runtime-file` 手工打包。
