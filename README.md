@@ -20,7 +20,7 @@ Pi CLI 配置同步桌面工具（设计阶段，尚无代码）。
 
 ## 文档
 
-设计与决策以 `docs/` 为准，入口见 [docs-map.md](docs-map.md)。
+设计与决策以 `docs/` 为准，入口见 [docs/docs-map.md](docs/docs-map.md)。
 
 - 总体设计与已定决策：`docs/design/00-master-design.md`
 - 快照格式与同步流程：`docs/design/10-snapshot-sync.md`
@@ -39,7 +39,7 @@ Pi CLI 配置同步桌面工具（设计阶段，尚无代码）。
 ```text
 docs/
 ├── design/            设计与任务卡片
-docs-map.md            文档索引
+└── docs-map.md        文档索引
 README.md              本文件
 CHANGELOG.md           变更记录
 ```

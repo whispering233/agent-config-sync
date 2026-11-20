@@ -2,7 +2,7 @@
 
 ## 定位
 
-Pi CLI 配置同步桌面工具。设计与决策以 `docs/` 为准，索引见 `docs-map.md`。
+Pi CLI 配置同步桌面工具。设计与决策以 `docs/` 为准，索引见 `docs/docs-map.md`。
 
 ## 不可擅自变更的决策
 
