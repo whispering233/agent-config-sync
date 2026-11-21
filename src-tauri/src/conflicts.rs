@@ -416,7 +416,7 @@ mod tests {
         report
             .items
             .iter()
-            .map(|item| item.conflict.to_string_lossy().into_owned())
+            .map(|item| item.conflict.to_string_lossy().replace('\\', "/"))
             .collect()
     }
 

@@ -407,6 +407,7 @@ mod tests {
     use crate::apply::BACKUP_RETENTION;
     #[cfg(unix)]
     use crate::doctor::{CommandOutcome, CommandRunner};
+    #[cfg(unix)]
     use crate::platform::HostOs;
     #[cfg(unix)]
     use std::os::unix::fs::{symlink, PermissionsExt};

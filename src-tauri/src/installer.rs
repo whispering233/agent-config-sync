@@ -326,8 +326,16 @@ fn install_kind(agent_dir: Option<&Path>, pi_path: &str) -> InstallKind {
         .filter(|path| path.exists());
 
     if marker.is_some() {
-        InstallKind::Managed
-    } else if platform::is_npm_install_path(pi_path) {
+        return InstallKind::Managed;
+    }
+    // Unix 的 npm 入口是链接，解析后落在 node_modules 下；Windows 是 `npm\pi.cmd` 中间层，
+    // 不解析也不在 node_modules 下，改看隔壁是否有 npm 的 node_modules。
+    let resolved = std::fs::canonicalize(pi_path).unwrap_or_else(|_| PathBuf::from(pi_path));
+    let resolved = resolved.to_string_lossy();
+    let npm_shim = Path::new(resolved.as_ref())
+        .parent()
+        .is_some_and(|dir| dir.join("node_modules").is_dir());
+    if platform::is_npm_install_path(&resolved) || npm_shim {
         InstallKind::Npm
     } else {
         InstallKind::Unknown
@@ -341,7 +349,13 @@ pub fn preview(
     host: HostOs,
 ) -> InstallPreview {
     let probe = probe(agent_dir, runner, host);
-    build_preview(agent_dir, std::env::consts::OS, probe)
+    // 命令选择必须跟探测用同一宿主；用 env 会让显式传入的 host 在别的平台上失真。
+    let os = if host == HostOs::Windows {
+        "windows"
+    } else {
+        "linux"
+    };
+    build_preview(agent_dir, os, probe)
 }
 
 /// 预览的纯逻辑部分，平台由调用方给定，便于单测覆盖命令选择矩阵。
@@ -916,6 +930,15 @@ mod tests {
             install_kind(None, "C:\\Users\\u\\.pi\\agent\\bin\\pi.cmd"),
             InstallKind::Unknown
         );
+    }
+
+    #[test]
+    fn npm_shim_next_to_node_modules_counts_as_npm_install() {
+        let temp = TempDir::new("npm-shim");
+        fs::create_dir_all(temp.path().join("npm/node_modules")).expect("建目录");
+        fs::write(temp.path().join("npm/pi.cmd"), "").expect("写文件");
+        let pi = temp.path().join("npm/pi.cmd").display().to_string();
+        assert_eq!(install_kind(None, &pi), InstallKind::Npm);
     }
 
     #[test]

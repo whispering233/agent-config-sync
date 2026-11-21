@@ -11,8 +11,8 @@ use crate::doctor::{self, CommandOutcome, CommandRunner, ShellRunner, Version, P
 use crate::platform::{HostOs, ProgramPath};
 use crate::scope::{self, EntryKind};
 use crate::snapshot::{
-    self, Manifest, ManifestFile, Requirements, SourceInfo, FORMAT_VERSION, MANIFEST_FILE_NAME,
-    SNAPSHOT_DIR_NAME,
+    self, Manifest, ManifestFile, ManifestSymlink, Requirements, SourceInfo, FORMAT_VERSION,
+    MANIFEST_FILE_NAME, SNAPSHOT_DIR_NAME,
 };
 use crate::webdav_transfer;
 use serde::Serialize;
@@ -183,7 +183,7 @@ pub fn plan_snapshot(
         });
     }
 
-    let live = live_files(agent_dir)?;
+    let live = live_files(agent_dir, &manifest.symlinks)?;
     let (plan, totals) = build_plan(&manifest.files, &live);
 
     Ok(PlanReport {
@@ -306,7 +306,10 @@ struct LiveFile {
 }
 
 /// 按受管范围扫 live 并算哈希。范围外文件永不读取。
-fn live_files(agent_dir: &Path) -> Result<BTreeMap<String, LiveFile>, PlanFailure> {
+fn live_files(
+    agent_dir: &Path,
+    manifest_symlinks: &[ManifestSymlink],
+) -> Result<BTreeMap<String, LiveFile>, PlanFailure> {
     let scanned = scope::scan(agent_dir).map_err(|error| {
         PlanFailure::new(
             "agent_dir_unreadable",
@@ -314,17 +317,34 @@ fn live_files(agent_dir: &Path) -> Result<BTreeMap<String, LiveFile>, PlanFailur
         )
     })?;
 
+    // 快照没声明的链接不在受管内容里；不进去读，否则就碰到了链接目标。
+    let managed_links: Vec<String> = manifest_symlinks
+        .iter()
+        .map(|link| live_relative(&link.path).to_string())
+        .collect();
+    let unmanaged_links: Vec<String> = scanned
+        .entries
+        .iter()
+        .filter(|entry| entry.link_target.is_some())
+        .map(|entry| slash(&entry.relative_path))
+        .filter(|path| !managed_links.contains(path))
+        .collect();
+
     let mut files = BTreeMap::new();
     for entry in scanned
         .entries
         .iter()
         .filter(|entry| entry.kind == EntryKind::File)
     {
+        let path = slash(&entry.relative_path);
+        if unmanaged_links.iter().any(|link| is_under(&path, link)) {
+            continue;
+        }
         let sha256 = fs::read(agent_dir.join(&entry.relative_path))
             .ok()
             .map(|bytes| snapshot::sha256_hex(&bytes));
         files.insert(
-            slash(&entry.relative_path),
+            path,
             LiveFile {
                 size: entry.size,
                 sha256,
@@ -332,6 +352,12 @@ fn live_files(agent_dir: &Path) -> Result<BTreeMap<String, LiveFile>, PlanFailur
         );
     }
     Ok(files)
+}
+
+/// 路径是否在某个链接目录之下（不含链接本身）。
+fn is_under(path: &str, link: &str) -> bool {
+    path.strip_prefix(link)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// 比较 manifest 与 live：快照有 live 无 → 新增；都有但哈希不同 → 修改；live 有快照无 → 删除。
@@ -741,6 +767,32 @@ mod tests {
         fs::create_dir_all(&sync_root).expect("创建同步目录");
         snapshot::export(&agent, &sync_root, false).expect("导出夹具快照");
         (agent, sync_root)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unmanaged_symlink_contents_are_skipped() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new("unmanaged-link");
+        let agent = temp.path().join("agent");
+        let outside = temp.path().join("outside");
+        write_file(&outside.join("keep.txt"), "keep");
+        fs::create_dir_all(agent.join("skills")).expect("建 skills");
+        symlink(&outside, agent.join("skills/extra")).expect("建目录链接");
+
+        let live = live_files(&agent, &[]).expect("扫描");
+        assert!(live.is_empty(), "未声明的链接内容不应进入计划: {live:?}");
+
+        let managed = [ManifestSymlink {
+            path: "snapshot/skills/extra".to_string(),
+            target: outside.display().to_string(),
+        }];
+        let live = live_files(&agent, &managed).expect("扫描");
+        assert_eq!(
+            live.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["skills/extra/keep.txt"]
+        );
     }
 
     fn dir_entries(root: &Path) -> Vec<String> {

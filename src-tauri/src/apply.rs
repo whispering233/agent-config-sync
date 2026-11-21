@@ -1720,8 +1720,10 @@ mod tests {
     }
 
     /// 平台拒绝建链接：Windows 默认权限下 `ERROR_PRIVILEGE_NOT_HELD` 的替身。
+    #[cfg(unix)]
     struct RefusingLinks;
 
+    #[cfg(unix)]
     impl LinkCreator for RefusingLinks {
         fn create_link(&self, _target: &str, _path: &Path, _is_dir: bool) -> io::Result<()> {
             Err(io::Error::new(

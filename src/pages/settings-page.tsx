@@ -399,7 +399,7 @@ export function SettingsPage() {
                     id="sync-root"
                     value={form.syncRoot}
                     onChange={(event) => updateField('syncRoot', event.target.value)}
-                    placeholder="/home/you/Cloud/pi-snapshot"
+                    placeholder="输入云盘同步文件夹的路径"
                     spellCheck={false}
                     aria-invalid={findingsFor('syncRoot').some(
                       (finding) => finding.level === 'error',
@@ -577,8 +577,7 @@ function AboutCard() {
         />
       </dl>
       <p className="mt-md text-xs text-muted-foreground">
-        桌面版依赖系统提供 WebKitGTK 4.1（Linux 上 Tauri 的
-        WebView），这是运行前提；缺失时应用无法启动。
+        桌面版使用系统 WebView（Linux 为 WebKitGTK 4.1），缺失时应用无法启动。
       </p>
     </Card>
   );

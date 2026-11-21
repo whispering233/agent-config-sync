@@ -133,6 +133,10 @@ impl HostOs {
 /// `\r` / `\n` 会把一条命令行拆成两条。
 const CMD_UNSAFE_CHARS: [char; 10] = ['"', '%', '!', '&', '|', '<', '>', '^', '\r', '\n'];
 
+/// GUI 进程没有控制台，Windows 会为每个控制台子进程新建窗口；检测一次会连闪多次。
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// 单引号包裹并转义，避免参数里的字符逃出引号。
 pub(crate) fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
@@ -211,6 +215,7 @@ pub(crate) fn build_command(argv: &[String]) -> Result<Command, String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
         if is_cmd_line(program, args) {
             command.args(&args[..3]).raw_arg(args[3].clone());
             return Ok(command);
@@ -287,7 +292,10 @@ pub(crate) fn kill_group(_pid: u32) {}
 /// 子进程会留在后台，所以超时走 `taskkill /T /F`。
 #[cfg(windows)]
 pub(crate) fn kill_tree(pid: u32) {
-    let _ = Command::new("taskkill")
+    use std::os::windows::process::CommandExt;
+    let mut command = Command::new("taskkill");
+    command.creation_flags(CREATE_NO_WINDOW);
+    let _ = command
         .args(["/T", "/F", "/PID", &pid.to_string()])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

@@ -446,6 +446,8 @@ export function SnapshotPage() {
         root: planRoot,
       });
       setApplying({ kind: 'done', report });
+      // 应用前刚生成备份，列表要跟着更新，否则用户看不到可回滚的条目。
+      void loadBackups();
     } catch (error) {
       const failure = asApplyFailure(error);
       setApplying({

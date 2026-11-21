@@ -284,7 +284,7 @@ fn rewrite_document(
     required: &mut BTreeMap<String, Vec<String>>,
 ) -> Option<String> {
     let mut document: Value = serde_json::from_str(text).ok()?;
-    rewrite_value(
+    let changed = rewrite_value(
         &mut document,
         &mut Vec::new(),
         style,
@@ -292,6 +292,10 @@ fn rewrite_document(
         namer,
         required,
     );
+    // 没有替换就不动原文：格式化本身不是变更，否则刚导出的快照会立刻显示“修改”。
+    if !changed {
+        return Some(text.to_string());
+    }
     let mut output = serde_json::to_string_pretty(&document).ok()?;
     output.push('\n');
     Some(output)
@@ -304,9 +308,10 @@ fn rewrite_value(
     label: &str,
     namer: &mut Namer,
     required: &mut BTreeMap<String, Vec<String>>,
-) {
+) -> bool {
     match value {
         Value::Object(map) => {
+            let mut changed = false;
             for (key, child) in map.iter_mut() {
                 keys.push(key.clone());
                 match child {
@@ -322,19 +327,23 @@ fn rewrite_value(
                             let reference = style.reference(&name);
                             text.replace_range(start..end, &reference);
                             record_secret(required, &name, label);
+                            changed = true;
                         }
                     }
-                    other => rewrite_value(other, keys, style, label, namer, required),
+                    other => changed |= rewrite_value(other, keys, style, label, namer, required),
                 }
                 keys.pop();
             }
+            changed
         }
         Value::Array(items) => {
+            let mut changed = false;
             for item in items.iter_mut() {
-                rewrite_value(item, keys, style, label, namer, required);
+                changed |= rewrite_value(item, keys, style, label, namer, required);
             }
+            changed
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -789,6 +798,18 @@ mod tests {
         assert!(read_file(&root.join("web-search.json"))
             .contains("\"!op read op://private/exa/api-key\""));
         assert_eq!(names(&outcome), vec!["DOCS_TOKEN", "OPENROUTER_API_KEY"]);
+    }
+
+    #[test]
+    fn untouched_documents_keep_their_original_bytes() {
+        let temp = TempDir::new("keep-bytes");
+        let root = temp.path();
+        let original = "{\"providers\":{\"openrouter\":{\"apiKey\":\"$OPENROUTER_API_KEY\"}}}";
+        write_file(&root.join("models.json"), original);
+
+        let outcome = sanitize_snapshot(root).expect("脱敏");
+        assert_eq!(read_file(&root.join("models.json")), original);
+        assert_eq!(names(&outcome), vec!["OPENROUTER_API_KEY"]);
     }
 
     #[test]

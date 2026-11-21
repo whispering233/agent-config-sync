@@ -2094,7 +2094,12 @@ mod tests {
 
         let empty = TempDir::new("windows-empty-path");
         let search = windows_search(&[empty.path()]);
-        let pi = agent.path().join("bin/pi.cmd").display().to_string();
+        let pi = agent
+            .path()
+            .join("bin")
+            .join("pi.cmd")
+            .display()
+            .to_string();
 
         let runner = FakeRunner::single(ok("1.5.2\n"));
         let found = windows_pi(&runner, &search, Some(agent.path()), None);
