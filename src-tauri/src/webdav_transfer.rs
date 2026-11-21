@@ -1502,6 +1502,7 @@ mod tests {
     /// 真机互通检查：需要一个真实 WebDAV 服务器（本地 `webdav-server` 或坚果云均可）。
     /// 手动跑：`DAV_URL=… DAV_USER=… DAV_PASS=… cargo test interop -- --ignored --nocapture`
     /// 它验证的是假 transport 覆盖不到的部分：Basic 认证、真实 XML、中文路径编码、条件写入。
+    /// 注意：会覆盖该地址下 `PiAgentSync/` 的内容，只对测试账号跑。
     #[test]
     #[ignore = "需要真实 WebDAV 服务器与凭据（DAV_URL / DAV_USER / DAV_PASS）"]
     fn interop_roundtrip_against_a_real_server() {
@@ -1522,18 +1523,37 @@ mod tests {
         let probe = crate::webdav::probe(&client).expect("探测应通过");
         assert!(!probe.leftover_write_test_file, "测试服务器应允许 DELETE");
 
-        let first = upload(&client, &app_data, &agent, false, false).expect("首次上传应成功");
-        let fingerprint = match first {
-            UploadOutcome::Uploaded {
-                fingerprint,
-                uploaded,
-                ..
-            } => {
-                assert!(uploaded > 0);
-                fingerprint
-            }
-            other => panic!("期望 Uploaded，得到 {other:?}"),
-        };
+        // 云端可能留着上一轮的快照，而本机目录是新的：按设计会报保守冲突。
+        // 测试要可重跑，所以确认覆盖一次，而不是把“上次运行的残留”当成失败。
+        let fingerprint =
+            match upload(&client, &app_data, &agent, false, false).expect("上传应成功") {
+                UploadOutcome::Uploaded {
+                    fingerprint,
+                    uploaded,
+                    skipped,
+                    ..
+                } => {
+                    assert!(uploaded + skipped > 0);
+                    fingerprint
+                }
+                UploadOutcome::Conflict { .. } => {
+                    match upload(&client, &app_data, &agent, false, true)
+                        .expect("确认覆盖后应成功")
+                    {
+                        UploadOutcome::Uploaded {
+                            fingerprint,
+                            uploaded,
+                            skipped,
+                            ..
+                        } => {
+                            assert!(uploaded + skipped > 0);
+                            fingerprint
+                        }
+                        other => panic!("期望 Uploaded，得到 {other:?}"),
+                    }
+                }
+                other => panic!("期望 Uploaded 或 Conflict，得到 {other:?}"),
+            };
 
         // 同一份内容再传一次：不应该冲突，也不该重传任何文件。
         let again = upload(&client, &app_data, &agent, false, false).expect("二次上传应成功");
