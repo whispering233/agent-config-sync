@@ -957,6 +957,7 @@ mod tests {
             &["prompts/leftover.md".to_string()],
             &data,
             &FakeRunner,
+            &crate::apply::PlatformLinkCreator,
         )
         .expect("应用应成功");
         assert_eq!(

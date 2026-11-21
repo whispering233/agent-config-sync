@@ -1304,6 +1304,7 @@ mod tests {
             &[],
             &app_data,
             &FakeRunner,
+            &crate::apply::PlatformLinkCreator,
         )
         .expect("应用应成功");
         assert_eq!(applied.written, 1);

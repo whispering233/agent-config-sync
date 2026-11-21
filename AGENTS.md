@@ -56,7 +56,7 @@ Pi CLI 配置的换机交付工具（手动快照交付，不做实时同步）�
 ## 验证
 
 ```bash
-cd src-tauri && cargo test      # 期望全绿（239 通过 + 2 个 ignored 的真机测试）
+cd src-tauri && cargo test      # 期望全绿（另含需真机环境的 ignored 测试）
 cd src-tauri && cargo check
 cd src-tauri && cargo fmt -- --check
 npm run build
