@@ -13,12 +13,16 @@ export type ConfigField = 'syncRoot' | 'agentDir' | 'backupRetention';
 
 export type AgentDirSource = 'override' | 'env' | 'default' | 'unresolved';
 
+/** 快照的传输方式；旧配置没有该字段时后端按 `local` 读入。 */
+export type Transport = 'local' | 'webdav';
+
 /** 与 Rust 侧 `AppConfig` 一一对应。 */
 export type AppConfig = {
   version: number;
   syncRoot: string | null;
   agentDirOverride: string | null;
   backupRetention: number;
+  transport: Transport;
 };
 
 export type ValidationFinding = {

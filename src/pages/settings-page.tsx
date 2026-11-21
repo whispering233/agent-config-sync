@@ -16,15 +16,23 @@ import {
   type ConfigField,
   type ConfigValidation,
   type PathStatus,
+  type Transport,
   type ValidationFinding,
 } from '../lib/app-config';
-import { isDesktop, pickDirectory } from '../lib/desktop';
+import {
+  isDesktop,
+  loadWebdavSummary,
+  pickDirectory,
+  saveWebdavCredentials,
+  type WebdavSummary,
+} from '../lib/desktop';
 import { previewPathFindings } from '../lib/path-input';
 import { cn } from '../lib/utils';
 
 type SettingsForm = {
   syncRoot: string;
   agentDirOverride: string;
+  transport: Transport;
 };
 
 type LoadState =
@@ -53,7 +61,27 @@ type SecretsState =
   | { kind: 'ready'; items: SecretStatus[] }
   | { kind: 'failed'; message: string };
 
-const EMPTY_FORM: SettingsForm = { syncRoot: '', agentDirOverride: '' };
+const EMPTY_FORM: SettingsForm = {
+  syncRoot: '',
+  agentDirOverride: '',
+  transport: 'local',
+};
+
+/** 坚果云是文档里唯一给出预填的服务商；其他家靠用户粘贴地址。 */
+const JIANGUOYUN_URL = 'https://dav.jianguoyun.com/dav';
+
+const transportOptions: { value: Transport; label: string; hint: string }[] = [
+  {
+    value: 'local',
+    label: '本地文件夹',
+    hint: '把快照写进云盘同步文件夹，由云盘客户端负责送到另一台机器。',
+  },
+  {
+    value: 'webdav',
+    label: 'WebDAV',
+    hint: '应用自己直连远端搬运快照；凭据只记在本机，不进快照。',
+  },
+];
 
 const statusText: Record<PathStatus, string> = {
   unset: '未设置',
@@ -82,6 +110,7 @@ function formFromConfig(config: AppConfig): SettingsForm {
   return {
     syncRoot: config.syncRoot ?? '',
     agentDirOverride: config.agentDirOverride ?? '',
+    transport: config.transport,
   };
 }
 
@@ -96,13 +125,15 @@ function configFromForm(base: AppConfig, form: SettingsForm): AppConfig {
     syncRoot: trimToNull(form.syncRoot),
     agentDirOverride: trimToNull(form.agentDirOverride),
     backupRetention: base.backupRetention,
+    transport: form.transport,
   };
 }
 
 function isDirty(base: AppConfig, form: SettingsForm): boolean {
   return (
     trimToNull(form.syncRoot) !== (base.syncRoot ?? null) ||
-    trimToNull(form.agentDirOverride) !== (base.agentDirOverride ?? null)
+    trimToNull(form.agentDirOverride) !== (base.agentDirOverride ?? null) ||
+    form.transport !== base.transport
   );
 }
 
@@ -241,7 +272,7 @@ export function SettingsPage() {
     validation?.ok === true &&
     !saving;
 
-  function updateField(field: keyof SettingsForm, value: string) {
+  function updateField<K extends keyof SettingsForm>(field: K, value: SettingsForm[K]) {
     setForm((current) => ({ ...current, [field]: value }));
     setSaveError(null);
     setJustSaved(false);
@@ -307,7 +338,7 @@ export function SettingsPage() {
       <header>
         <h1 className="text-lg font-semibold text-foreground">设置</h1>
         <p className="mt-xs text-sm text-muted-foreground">
-          指定云盘里的同步文件夹，并确认 Pi 的宿主目录。配置只保存在本机，不会进入快照。
+          选择快照的传输方式与同步文件夹，并确认 Pi 的宿主目录。配置与 WebDAV 凭据只保存在本机，不会进入快照。
         </p>
       </header>
 
@@ -328,6 +359,34 @@ export function SettingsPage() {
           <Card className="p-lg">
             <h2 className="text-sm font-semibold text-foreground">位置</h2>
             <div className="mt-lg flex flex-col gap-lg">
+              <div>
+                <span id="transport-label" className="text-sm font-medium text-foreground">
+                  传输方式
+                </span>
+                <div
+                  className="mt-sm flex flex-wrap gap-sm"
+                  role="group"
+                  aria-labelledby="transport-label"
+                >
+                  {transportOptions.map((option) => (
+                    <Button
+                      key={option.value}
+                      variant={form.transport === option.value ? 'primary' : 'secondary'}
+                      aria-pressed={form.transport === option.value}
+                      onClick={() => updateField('transport', option.value)}
+                    >
+                      {option.label}
+                    </Button>
+                  ))}
+                </div>
+                <p className="mt-xs text-xs text-muted-foreground">
+                  {
+                    transportOptions.find((option) => option.value === form.transport)
+                      ?.hint
+                  }
+                </p>
+              </div>
+
               <Field
                 id="sync-root"
                 label="同步文件夹"
@@ -385,6 +444,8 @@ export function SettingsPage() {
               )}
             </div>
           </Card>
+
+          {form.transport === 'webdav' && <WebdavCard />}
 
           <Card className="p-lg">
             <h2 className="text-sm font-semibold text-foreground">密钥</h2>
@@ -788,5 +849,180 @@ function FindingRow({ finding }: { finding: ValidationFinding }) {
       <Icon className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
       <span>{finding.message}</span>
     </p>
+  );
+}
+
+type WebdavForm = {
+  url: string;
+  username: string;
+  password: string;
+};
+
+const EMPTY_WEBDAV_FORM: WebdavForm = { url: '', username: '', password: '' };
+
+/**
+ * 凭据单独保存：它不参与配置校验，也不进快照。
+ * 密码永远是空白输入框，只在输入非空时覆盖已保存的值。
+ */
+function WebdavCard() {
+  const [summary, setSummary] = useState<WebdavSummary | null>(null);
+  const [form, setForm] = useState<WebdavForm>(EMPTY_WEBDAV_FORM);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    if (!isDesktop) {
+      return;
+    }
+
+    let cancelled = false;
+    loadWebdavSummary()
+      .then((value) => {
+        if (cancelled) {
+          return;
+        }
+        setSummary(value);
+        setForm({ url: value.url, username: value.username, password: '' });
+      })
+      .catch((failure: unknown) => {
+        if (!cancelled) {
+          setError(failureMessage(failure));
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!saved) {
+      return;
+    }
+    const timer = window.setTimeout(() => setSaved(false), 2500);
+    return () => window.clearTimeout(timer);
+  }, [saved]);
+
+  function update(field: keyof WebdavForm, value: string) {
+    setForm((current) => ({ ...current, [field]: value }));
+    setError(null);
+    setSaved(false);
+  }
+
+  const canSave =
+    isDesktop &&
+    !saving &&
+    form.url.trim() !== '' &&
+    form.username.trim() !== '';
+
+  async function handleSave() {
+    if (!canSave) {
+      return;
+    }
+
+    setSaving(true);
+    setError(null);
+    try {
+      const next = await saveWebdavCredentials({
+        url: form.url,
+        username: form.username,
+        // 空串代表"不修改"，命令层按缺省处理。
+        password: form.password === '' ? undefined : form.password,
+      });
+      setSummary(next);
+      setForm({ url: next.url, username: next.username, password: '' });
+      setSaved(true);
+    } catch (failure) {
+      setError(failureMessage(failure));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Card className="p-lg">
+      <h2 className="text-sm font-semibold text-foreground">WebDAV 凭据</h2>
+      <p className="mt-xs text-xs text-muted-foreground">
+        保存在本机应用数据目录（权限 600），不进入快照、备份、日志与同步文件夹。
+        明文落盘，建议使用可单独吊销的应用密码，而不是账号登录密码。
+      </p>
+
+      {!isDesktop && (
+        <p className="mt-md text-sm text-muted-foreground">
+          浏览器预览不读写本机凭据；桌面版才能保存。
+        </p>
+      )}
+
+      <div className="mt-lg flex flex-col gap-lg">
+        <Field
+          id="webdav-url"
+          label="服务地址"
+          hint="只接受 http:// 或 https://；应用会在该地址下建 PiAgentSync/ 目录。"
+        >
+          <div className="mt-sm flex gap-sm">
+            <Input
+              id="webdav-url"
+              value={form.url}
+              onChange={(event) => update('url', event.target.value)}
+              placeholder="https://dav.example.com/dav"
+              spellCheck={false}
+              autoComplete="off"
+            />
+            <Button
+              variant="secondary"
+              className="shrink-0"
+              onClick={() => update('url', JIANGUOYUN_URL)}
+            >
+              坚果云
+            </Button>
+          </div>
+        </Field>
+
+        <Field
+          id="webdav-username"
+          label="用户名"
+          hint="按服务商要求填写；坚果云填注册邮箱。"
+        >
+          <Input
+            id="webdav-username"
+            className="mt-sm"
+            value={form.username}
+            onChange={(event) => update('username', event.target.value)}
+            placeholder="you@example.com"
+            spellCheck={false}
+            autoComplete="off"
+          />
+        </Field>
+
+        <Field
+          id="webdav-password"
+          label="应用密码"
+          hint="留空表示保留已保存的密码；修改看不到原值。"
+        >
+          <Input
+            id="webdav-password"
+            type="password"
+            className="mt-sm"
+            value={form.password}
+            onChange={(event) => update('password', event.target.value)}
+            placeholder={
+              summary?.hasPassword
+                ? '已保存，留空则不修改'
+                : '应用密码（不是账号登录密码）'
+            }
+            autoComplete="new-password"
+          />
+        </Field>
+      </div>
+
+      <div className="mt-lg flex flex-wrap items-center gap-md">
+        <Button onClick={handleSave} disabled={!canSave}>
+          {saving ? '保存中…' : '保存凭据'}
+        </Button>
+        {saved && <span className="text-sm text-success">已保存</span>}
+        {error !== null && <span className="text-sm text-danger">{error}</span>}
+      </div>
+    </Card>
   );
 }

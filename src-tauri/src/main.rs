@@ -2,6 +2,7 @@ mod commands;
 mod apply;
 mod config;
 mod conflicts;
+mod credentials;
 mod doctor;
 mod installer;
 mod packages;
@@ -19,6 +20,8 @@ fn main() {
             commands::load_app_config,
             commands::validate_app_config,
             commands::save_app_config,
+            commands::load_webdav_summary,
+            commands::save_webdav_credentials,
             doctor::run_check,
             installer::preview_install,
             installer::install_or_upgrade,

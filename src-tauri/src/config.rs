@@ -23,6 +23,17 @@ pub const MAX_BACKUP_RETENTION: u32 = 100;
 /// 宿主目录的第二优先级来源（优先级：配置覆盖 > 该环境变量 > `~/.pi/agent`）。
 pub const AGENT_DIR_ENV_VAR: &str = "PI_CODING_AGENT_DIR";
 
+/// 快照的传输方式。旧版本配置文件没有该字段，按 [`Transport::Local`] 读入。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Transport {
+    /// 本地文件夹：由云盘客户端负责把文件送到另一台机器。
+    #[default]
+    Local,
+    /// WebDAV：应用自己直连远端。
+    Webdav,
+}
+
 /// 应用配置的内容。字段名会以 camelCase 序列化给前端。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,6 +43,8 @@ pub struct AppConfig {
     pub agent_dir_override: Option<PathBuf>,
     #[serde(default = "default_backup_retention")]
     pub backup_retention: u32,
+    #[serde(default)]
+    pub transport: Transport,
 }
 
 impl Default for AppConfig {
@@ -41,6 +54,7 @@ impl Default for AppConfig {
             sync_root: None,
             agent_dir_override: None,
             backup_retention: DEFAULT_BACKUP_RETENTION,
+            transport: Transport::default(),
         }
     }
 }
@@ -53,6 +67,7 @@ impl AppConfig {
             sync_root: normalize_optional_path(self.sync_root.as_deref()),
             agent_dir_override: normalize_optional_path(self.agent_dir_override.as_deref()),
             backup_retention: self.backup_retention,
+            transport: self.transport,
         }
     }
 }
@@ -572,7 +587,9 @@ fn overlap_message(sync_root: &Path, agent_dir: &Path) -> Option<&'static str> {
     }
 }
 
-fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+/// 私有文件的写法：创建时就带 0600，避免写完再 chmod 之间被读到。
+/// 凭据模块复用同一份实现，不另写一套。
+pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     let mut file = create_private_file(path)?;
     file.write_all(contents)?;
     file.sync_all()?;
@@ -689,6 +706,34 @@ mod tests {
     }
 
     #[test]
+    fn legacy_config_without_transport_reads_as_local() {
+        let dir = TempDir::new("legacy-transport");
+        fs::write(
+            dir.join(CONFIG_FILE_NAME),
+            r#"{"version":1,"syncRoot":null,"agentDirOverride":null,"backupRetention":10}"#,
+        )
+        .unwrap();
+
+        let loaded = load_config(dir.path()).expect("旧配置应能读入");
+        assert_eq!(loaded.transport, Transport::Local);
+        assert_eq!(loaded, AppConfig::default());
+    }
+
+    #[test]
+    fn transport_round_trips_through_the_config_file() {
+        let dir = TempDir::new("transport-round-trip");
+        let config = AppConfig {
+            transport: Transport::Webdav,
+            ..AppConfig::default()
+        };
+        save_config(dir.path(), &config).expect("保存应成功");
+
+        let text = fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap();
+        assert!(text.contains("\"transport\": \"webdav\""), "{text}");
+        assert_eq!(load_config(dir.path()).unwrap().transport, Transport::Webdav);
+    }
+
+    #[test]
     fn save_then_load_round_trips() {
         let dir = TempDir::new("round-trip");
         let home = dir.join("home");
@@ -758,6 +803,7 @@ mod tests {
             "agentDirOverride",
             "backupRetention",
             "syncRoot",
+            "transport",
             "version",
         ]
         .iter()
@@ -791,6 +837,7 @@ mod tests {
                 "syncRoot": serde_json::Value::Null,
                 "agentDirOverride": serde_json::Value::Null,
                 "backupRetention": DEFAULT_BACKUP_RETENTION,
+                "transport": "local",
             })
         );
     }

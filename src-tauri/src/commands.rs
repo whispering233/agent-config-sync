@@ -3,6 +3,7 @@
 use crate::config::{
     self, AppConfig, ConfigError, ConfigValidation, AGENT_DIR_ENV_VAR, CONFIG_FILE_NAME,
 };
+use crate::credentials::{self, CredentialError, WebdavCredentials};
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
@@ -48,6 +49,64 @@ fn view(config: AppConfig, validation: ConfigValidation, config_file: &PathBuf) 
 
 fn readable(error: ConfigError) -> String {
     error.to_string()
+}
+
+/// WebDAV 凭据的摘要。只回答「存了什么地址与用户名」和「是否已有密码」，
+/// 密码本身永不进入 IPC 返回值。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebdavSummary {
+    url: String,
+    username: String,
+    has_password: bool,
+}
+
+fn webdav_summary(credentials: Option<&WebdavCredentials>) -> WebdavSummary {
+    match credentials {
+        Some(credentials) => WebdavSummary {
+            url: credentials.url.clone(),
+            username: credentials.username.clone(),
+            has_password: !credentials.password.is_empty(),
+        },
+        None => WebdavSummary {
+            url: String::new(),
+            username: String::new(),
+            has_password: false,
+        },
+    }
+}
+
+fn credential_error(error: CredentialError) -> String {
+    error.to_string()
+}
+
+fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map_err(|error| format!("无法定位应用数据目录：{error}"))
+}
+
+#[tauri::command]
+pub fn load_webdav_summary(app: AppHandle) -> Result<WebdavSummary, String> {
+    let dir = app_data_dir(&app)?;
+    let credentials = credentials::load(&dir).map_err(credential_error)?;
+
+    Ok(webdav_summary(credentials.as_ref()))
+}
+
+/// 保存凭据。密码缺省或空串表示保留原值，因此换地址不必重输密码。
+#[tauri::command]
+pub fn save_webdav_credentials(
+    app: AppHandle,
+    url: String,
+    username: String,
+    password: Option<String>,
+) -> Result<WebdavSummary, String> {
+    let dir = app_data_dir(&app)?;
+    let saved = credentials::upsert(&dir, &url, &username, password.as_deref())
+        .map_err(credential_error)?;
+
+    Ok(webdav_summary(Some(&saved)))
 }
 
 #[tauri::command]
