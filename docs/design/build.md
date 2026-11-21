@@ -106,10 +106,31 @@ timeout --preserve-status 10 xvfb-run -a env \
   ./agent-config-sync
 ```
 
+## 图标
+
+源文件在仓库根目录的 `src-tauri/icon.svg`（应用图标）与 `src-tauri/icon-tray.svg` / `src-tauri/icon-tray-template.svg`（托盘）。
+
+```bash
+# 应用图标：先生成桌面端全套 PNG/ICO/ICNS，再补 16 与 1024 两档
+npx tauri icon src-tauri/icon.svg
+npx tauri icon src-tauri/icon.svg --png 16,1024
+
+# 托盘彩色图（透明底）
+npx tauri icon src-tauri/icon-tray.svg --png 32 -o /tmp/tray-color
+cp /tmp/tray-color/32x32.png src-tauri/icons/tray.png
+
+# macOS 菜单栏单色模板图
+npx tauri icon src-tauri/icon-tray-template.svg --png 32 -o /tmp/tray-template
+cp /tmp/tray-template/32x32.png src-tauri/icons/tray-template.png
+```
+
+- 16/32/64/128/256/512/1024 都应来自 CLI，不再保留手工放大的占位图。
+- 托盘图固定 32×32；彩色图用于 Windows/Linux，template 图只用于 macOS。
+- 改图后重新跑上述命令并提交 `src-tauri/icons/`；图标不参与 Rust 逻辑，回滚只需还原目录。
+
 ## 已知限制
 
 - 未签名：deb/AppImage 均无签名与公证；分发给他人前需补信任链。
-- 图标为 128→1024 放大的占位图，发布前应替换为正式设计稿。
 - 无自动更新：升级需重新下载安装包。
 - macOS 尚未打包（见 `backlog.md`）；Windows 未签名、无卸载清理钩子。
 - AppImage 依赖目标机器可执行 AppImage（必要时用 `APPIMAGE_EXTRACT_AND_RUN=1` 在无 FUSE 环境运行）。
