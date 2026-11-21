@@ -7,13 +7,13 @@
 
 use crate::config::{self, AGENT_DIR_ENV_VAR};
 use crate::doctor::{CommandOutcome, CommandRunner, ShellRunner, PROBE_TIMEOUT};
+use crate::platform;
 use crate::scope;
 use crate::snapshot::{self, Manifest};
 use serde::Serialize;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -278,7 +278,7 @@ fn replace_references(text: &str, name: &str, value: &str) -> (String, usize) {
     (out, hits)
 }
 
-/// 同目录临时文件 + rename；覆盖普通文件时沿用原 mode，符号链接与目录一律不写。
+/// 同目录临时文件 + 替换；覆盖普通文件时沿用原 mode，符号链接与目录一律不写。
 fn write_preserving_mode(target: &Path, text: &str) -> io::Result<()> {
     let metadata = fs::symlink_metadata(target)?;
     if !metadata.is_file() {
@@ -287,7 +287,8 @@ fn write_preserving_mode(target: &Path, text: &str) -> io::Result<()> {
             "目标不是普通文件",
         ));
     }
-    let mode = metadata.permissions().mode() & 0o777;
+    // Windows 没有权限位，`mode_of` 给 `None`，替换时就不设权限。
+    let mode = platform::mode_of(&metadata);
 
     let name = target
         .file_name()
@@ -303,7 +304,10 @@ fn write_preserving_mode(target: &Path, text: &str) -> io::Result<()> {
             .create_new(true)
             .open(&temp)?;
         file.write_all(text.as_bytes())?;
-        fs::set_permissions(&temp, fs::Permissions::from_mode(mode))?;
+        // 覆盖普通文件时沿用原 mode；rename 覆盖已存在文件在两平台都成立。
+        if let Some(mode) = mode {
+            platform::set_mode(&temp, mode)?;
+        }
         fs::rename(&temp, target)
     })();
     if written.is_err() {
@@ -384,6 +388,8 @@ pub async fn write_secret(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     static NEXT_DIR_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -505,6 +511,7 @@ mod tests {
         fs::write(sync_root.join(snapshot::MANIFEST_FILE_NAME), text).expect("写 manifest");
     }
 
+    #[cfg(unix)]
     fn mode_of(path: &Path) -> u32 {
         fs::metadata(path).expect("读取元数据").permissions().mode() & 0o777
     }
@@ -657,6 +664,7 @@ mod tests {
         let web_search = agent.join("web-search.json");
         fs::create_dir_all(&agent).expect("创建宿主目录");
         fs::write(&web_search, r#"{"exaApiKey": "$EXA_API_KEY"}"#).expect("写夹具");
+        #[cfg(unix)]
         fs::set_permissions(&web_search, fs::Permissions::from_mode(0o600)).expect("设置权限");
 
         let report =
@@ -673,6 +681,7 @@ mod tests {
             fs::read_to_string(&web_search).expect("读结果"),
             format!(r#"{{"exaApiKey": "{SECRET}"}}"#)
         );
+        #[cfg(unix)]
         assert_eq!(mode_of(&web_search), 0o600);
         // 没有临时文件残留。
         let names: Vec<String> = fs::read_dir(&agent)

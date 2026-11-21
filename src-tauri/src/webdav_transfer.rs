@@ -11,15 +11,15 @@
 //! 任一失败都删掉本次暂存目录，远端状态保持原样。
 
 use crate::config;
+use crate::platform;
 use crate::scope;
 use crate::snapshot::{self, ExportFailure, Manifest, FORMAT_VERSION, MANIFEST_FILE_NAME};
 use crate::webdav::{DavError, DavTransport, WebdavClient};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::{self, DirBuilder};
+use std::fs;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -554,15 +554,11 @@ fn prepare_upload_workspace(app_data: &Path) -> Result<PathBuf, TransferError> {
         fs::remove_dir_all(&root).map_err(storage_error)?;
     }
     fs::create_dir_all(&root).map_err(storage_error)?;
-    // create_dir_all 按 umask 建，补一次显式权限：工作区里可能有明文密钥。
-    fs::set_permissions(&root, fs::Permissions::from_mode(STAGING_DIR_MODE))
-        .map_err(storage_error)?;
+    // create_dir_all 按 umask 建，补一次显式权限：工作区里可能有明文密钥（Windows 上不设）。
+    platform::set_mode(&root, STAGING_DIR_MODE).map_err(storage_error)?;
 
     let dir = root.join(snapshot::format_timestamp(now_seconds()).replace(':', "-"));
-    DirBuilder::new()
-        .mode(STAGING_DIR_MODE)
-        .create(&dir)
-        .map_err(storage_error)?;
+    platform::create_dir_all_mode(&dir, STAGING_DIR_MODE).map_err(storage_error)?;
 
     Ok(dir)
 }
@@ -597,9 +593,8 @@ fn parse_manifest(bytes: &[u8]) -> Result<Manifest, TransferError> {
 fn create_staging_dir(app_data: &Path) -> Result<PathBuf, TransferError> {
     let root = app_data.join(STAGING_DIR_NAME);
     fs::create_dir_all(&root).map_err(storage_error)?;
-    // create_dir_all 按 umask 建，补一次显式权限。
-    fs::set_permissions(&root, fs::Permissions::from_mode(STAGING_DIR_MODE))
-        .map_err(storage_error)?;
+    // create_dir_all 按 umask 建，补一次显式权限（Windows 上不设）。
+    platform::set_mode(&root, STAGING_DIR_MODE).map_err(storage_error)?;
 
     let base = snapshot::format_timestamp(now_seconds()).replace(':', "-");
     let mut name = base.clone();
@@ -610,10 +605,7 @@ fn create_staging_dir(app_data: &Path) -> Result<PathBuf, TransferError> {
     }
 
     let dir = root.join(&name);
-    DirBuilder::new()
-        .mode(STAGING_DIR_MODE)
-        .create(&dir)
-        .map_err(storage_error)?;
+    platform::create_dir_all_mode(&dir, STAGING_DIR_MODE).map_err(storage_error)?;
 
     Ok(dir)
 }
@@ -933,6 +925,7 @@ mod tests {
         // 暂存目录只有本用户可进入。
         #[cfg(unix)]
         {
+            use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(app_data.join(STAGING_DIR_NAME))
                 .unwrap()
                 .permissions()

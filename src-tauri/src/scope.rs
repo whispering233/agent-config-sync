@@ -11,6 +11,8 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+use crate::platform;
+
 /// 根级固定纳入的普通文件。
 pub const INCLUDED_ROOT_FILES: &[&str] = &[
     "AGENTS.md",
@@ -317,7 +319,8 @@ impl Walker {
             }
         };
 
-        let link_target = if link_metadata.file_type().is_symlink() {
+        // junction 与符号链接都算链接：`read_link` 读得到目标就算。
+        let link_target = if platform::is_link_like(&physical_path) {
             match fs::read_link(&physical_path) {
                 Ok(target) => Some(target),
                 Err(_) => {
@@ -420,6 +423,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     fn skipped_paths(outcome: &ScanOutcome) -> Vec<(String, SkipReason)> {
         outcome
             .skipped

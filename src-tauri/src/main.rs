@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod apply;
 mod commands;
 mod config;
@@ -7,6 +9,7 @@ mod doctor;
 mod installer;
 mod packages;
 mod plan;
+mod platform;
 mod rollback;
 mod scope;
 mod secrets;
