@@ -75,7 +75,7 @@ type PreviewState =
 type DeclaredPackage = { source: string; enabled: boolean };
 
 /** 与 Rust 侧 `packages::InstalledPackage` 一一对应。 */
-type InstalledPackage = { source: string; path: string };
+type InstalledPackage = { source: string; path: string; version: string | null };
 
 /** 与 Rust 侧 `packages::PackageStatus` 一一对应。 */
 type PackageStatus = {
@@ -691,17 +691,23 @@ function PackagesCard() {
           {status.declared.length > 0 && (
             <PackageList
               title="声明"
-              items={status.declared.map((item) =>
-                item.enabled ? item.source : `${item.source}（已停用，不自动安装）`,
-              )}
+              items={status.declared.map((item) => ({
+                text: item.enabled
+                  ? item.source
+                  : `${item.source}（已停用，不自动安装）`,
+              }))}
             />
           )}
           {status.installed.length > 0 && (
             <PackageList
               title="实装"
-              items={status.installed.map((item) =>
-                item.path === '' ? item.source : `${item.source} · ${item.path}`,
-              )}
+              items={status.installed.map((item) => ({
+                text:
+                  item.version === null
+                    ? item.source
+                    : `${item.source} · ${item.version}`,
+                sub: item.path === '' ? undefined : item.path,
+              }))}
             />
           )}
 
@@ -739,7 +745,7 @@ function PackagesCard() {
           {status.extra.length > 0 && (
             <PackageList
               title="多余（不会自动删除，需要时手动 pi remove）"
-              items={status.extra}
+              items={status.extra.map((source) => ({ text: source }))}
             />
           )}
 
@@ -840,17 +846,28 @@ function PackagesCard() {
   );
 }
 
-function PackageList({ title, items }: { title: string; items: string[] }) {
+function PackageList({
+  title,
+  items,
+}: {
+  title: string;
+  items: ReadonlyArray<{ text: string; sub?: string }>;
+}) {
   return (
     <div className="mt-md">
       <p className="text-xs text-muted-foreground">{title}</p>
       <ul className="mt-xs flex flex-col gap-xs">
         {items.map((item) => (
           <li
-            key={item}
+            key={item.text}
             className="break-all rounded-md bg-surface-muted px-md py-xs font-mono text-xs text-foreground"
           >
-            {item}
+            {item.text}
+            {item.sub !== undefined && (
+              <span className="block font-mono text-xs text-muted-foreground">
+                {item.sub}
+              </span>
+            )}
           </li>
         ))}
       </ul>

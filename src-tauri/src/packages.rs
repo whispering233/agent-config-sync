@@ -24,12 +24,14 @@ pub struct DeclaredPackage {
     pub enabled: bool,
 }
 
-/// `pi list` 里的一个实装包及其安装目录。
+/// `pi list` 里的一个实装包、安装目录与读到的版本号。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstalledPackage {
     pub source: String,
     pub path: String,
+    /// 安装目录下 `package.json` 的 `version`；读不到时为 `None`，不影响其余结果。
+    pub version: Option<String>,
 }
 
 /// 一次比对的结果。
@@ -156,7 +158,27 @@ fn installed_packages(runner: &dyn CommandRunner) -> Result<Vec<InstalledPackage
         return Err("tool_not_found：找不到 pi 命令，无法读取实装列表".to_string());
     }
 
-    parse_user_packages(&stdout)
+    parse_user_packages(&stdout).map(|mut installed| {
+        for item in &mut installed {
+            item.version = installed_package_version(&item.path);
+        }
+        installed
+    })
+}
+
+/// 版本号读自安装目录的 `package.json`；路径为空、文件缺失、解析失败或字段缺失都返回 `None`。
+///
+/// 单个包读不到版本不应让整次状态读取失败，因此这里把错误全部折成 `None`。
+fn installed_package_version(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let text = fs::read_to_string(Path::new(path).join("package.json")).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&text).ok()?;
+    manifest
+        .get("version")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
 }
 
 /// 解析 `pi list` 的 `User packages:` 段：两空格缩进是来源，四空格缩进是安装目录。
@@ -192,6 +214,7 @@ pub fn parse_user_packages(list: &str) -> Result<Vec<InstalledPackage>, String> 
             2 => installed.push(InstalledPackage {
                 source: text.to_string(),
                 path: String::new(),
+                version: None,
             }),
             4 => {
                 if let Some(last) = installed.last_mut() {
@@ -478,10 +501,12 @@ mod tests {
                 InstalledPackage {
                     source: "npm:pi-lens".to_string(),
                     path: "/home/u/.pi/agent/npm/node_modules/pi-lens".to_string(),
+                    version: None,
                 },
                 InstalledPackage {
                     source: "git:github.com/u/r".to_string(),
                     path: "/home/u/r".to_string(),
+                    version: None,
                 },
             ]
         );
@@ -535,6 +560,60 @@ mod tests {
         );
         // 停用的包只展示，不自动装回来。
         assert_eq!(status.missing, vec!["npm:pi-lens", "npm:pi-docs"]);
+    }
+
+    #[test]
+    fn installed_version_comes_from_install_dir_manifest() {
+        let dir = TempDir::new("installed-version");
+        let manifest_path = dir.write(
+            "npm/node_modules/pi-lens/package.json",
+            r#"{"name":"pi-lens","version":"1.4.2"}"#,
+        );
+        let install_dir = manifest_path.parent().unwrap().to_str().unwrap();
+        let list = user_list(&[("npm:pi-lens", install_dir)]);
+
+        let installed = installed_packages(&FakeProbe::list(&list)).unwrap();
+
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].version.as_deref(), Some("1.4.2"));
+        assert_eq!(installed[0].path, install_dir);
+    }
+
+    #[test]
+    fn installed_version_without_manifest_is_none() {
+        let dir = TempDir::new("installed-no-manifest");
+        let install_dir = dir.path().join("pi-lens");
+        fs::create_dir_all(&install_dir).unwrap();
+        let list = user_list(&[("npm:pi-lens", install_dir.to_str().unwrap())]);
+
+        let installed = installed_packages(&FakeProbe::list(&list)).unwrap();
+
+        assert_eq!(installed[0].version, None);
+    }
+
+    #[test]
+    fn installed_version_without_version_field_is_none() {
+        let dir = TempDir::new("installed-no-version");
+        let manifest_path = dir.write(
+            "npm/node_modules/pi-lens/package.json",
+            r#"{"name":"pi-lens"}"#,
+        );
+        let install_dir = manifest_path.parent().unwrap().to_str().unwrap();
+        let list = user_list(&[("npm:pi-lens", install_dir)]);
+
+        let installed = installed_packages(&FakeProbe::list(&list)).unwrap();
+
+        assert_eq!(installed[0].version, None);
+    }
+
+    #[test]
+    fn installed_version_with_empty_path_is_none() {
+        let list = user_list(&[("npm:pi-lens", "")]);
+
+        let installed = installed_packages(&FakeProbe::list(&list)).unwrap();
+
+        assert_eq!(installed[0].path, "");
+        assert_eq!(installed[0].version, None);
     }
 
     #[test]
