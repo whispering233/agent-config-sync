@@ -2,6 +2,25 @@
 
 > 临时文件。任务完成并验证后必须从本文件删除，不留历史记录。
 
+## 批次：文案与仓库元数据
+
+### R1 环境检测改名
+
+- 范围：UI 可见文案统一为「环境检测」：`src/App.tsx` 导航项、`src/pages/doctor-page.tsx` 页标题与提示、`README.md`、`docs/design/20-env-doctor.md` 标题与正文、`docs/design/architecture.md`、`docs/design/00-master-design.md`。
+- 不做：代码标识符（`doctor`）、文件名 `20-env-doctor.md`、`CHANGELOG.md` 历史段。
+- 验证：`npm run build`；`grep -rn "环境医生\|医生"` 只剩允许的代码标识符；文档链接不断。
+
+### L1 MIT LICENSE
+
+- 范围：新增根目录 `LICENSE`（MIT，版权人 `whispering233`）；`package.json` 加 `"license": "MIT"`；`src-tauri/tauri.conf.json` 的 `bundle.licenseFile` 指向 `../LICENSE`；`README.md` 补一行许可证说明。
+- 验证：`npm run build`；`cargo check`（配置字段非法会让 tauri-build 失败）；JSON 可解析。
+
+### P1 包对齐显示版本号
+
+- 范围：`packages.rs` 的 `InstalledPackage` 增加 `version`（读安装目录的 `package.json`，读不到或字段缺失记 `null`，不影响整体状态）；`doctor-page.tsx` 实装列表展示版本；补单测（正常、无 `package.json`、无 `version` 字段、路径为空）；`docs/design/20-env-doctor.md` 的 `packages` 行补一句版本来源。
+- 验证：`cargo test`、`npm run build`。
+- 回滚：字段为可选新增，回退不影响旧前端。
+
 ## 批次：Windows 自测链路
 
 依赖顺序：W1 → W2、W1 → W3。W2 与 W3 改动的文件不重叠，可并行。
