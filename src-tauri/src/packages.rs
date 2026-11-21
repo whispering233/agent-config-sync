@@ -6,6 +6,7 @@
 
 use crate::doctor::{self, CommandOutcome, CommandRunner, ShellRunner};
 use crate::installer::{self, GroupRunner, InstallRunner, InstallStatus};
+use crate::platform;
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::fs;
@@ -270,7 +271,7 @@ pub fn align(
     let mut completed = true;
 
     for source in sources {
-        let argv = installer::shell_argv(&format!("pi install {}", doctor::sh_quote(source)));
+        let argv = installer::shell_argv(&format!("pi install {}", platform::sh_quote(source)));
         let result = align_result(source, runner.run(&argv, installer::EXEC_TIMEOUT));
         if result.status != InstallStatus::Succeeded {
             completed = false;

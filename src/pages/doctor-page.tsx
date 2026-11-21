@@ -214,7 +214,7 @@ function commandText(argv: string[]): string {
   return argv.map((part) => (/\s/.test(part) ? `"${part}"` : part)).join(' ');
 }
 
-/** 与 Rust 侧 `doctor::sh_quote` 一致：后端拼接的单引号形式，展示时才与执行的一致。 */
+/** 与 Rust 侧 `platform::sh_quote` 一致：后端拼接的单引号形式，展示时才与执行的一致。 */
 function shQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
