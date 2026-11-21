@@ -52,10 +52,8 @@ pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
         .tooltip("Agent Config Sync");
 
     #[cfg(target_os = "linux")]
-    {
-        // AppIndicator 需要把图标落到磁盘；应用缓存目录比 XDG_RUNTIME_DIR 稳。
-        builder = builder.temp_dir_path(app.path().app_cache_dir()?.join("tray-icon"));
-    }
+    // AppIndicator 需要把图标落到磁盘；应用缓存目录比 XDG_RUNTIME_DIR 稳。
+    let builder = builder.temp_dir_path(app.path().app_cache_dir()?.join("tray-icon"));
 
     builder.build(app)?;
     app.manage(TrayState {
