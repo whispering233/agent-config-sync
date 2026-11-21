@@ -9,7 +9,7 @@ Pi CLI 配置的换机交付工具：把配置导出成**可校验的快照**，
 | 模块 | 做什么 |
 | :--- | :--- |
 | 设置 | 选择传输方式（本地文件夹 / WebDAV）与宿主目录；WebDAV 凭据单独保存；路径校验 |
-| 医生 | 探测 node/npm/pi/凭据/包/断链；安装或升级 Pi（确认后执行） |
+| 环境检测 | 探测 node/npm/pi/凭据/包/断链；安装或升级 Pi（确认后执行） |
 | 快照 | 按受管范围导出、密钥引用化、写 manifest 与指纹 |
 | 校验 | 校验 manifest 与逐文件哈希，生成新增/修改/删除计划 |
 | 应用 | 计划过期保护、删除逐项确认、备份、原子写、链接重建 |
@@ -34,7 +34,7 @@ chmod +x "src-tauri/target/release/bundle/appimage/Agent Config Sync_0.0.1_amd64
 
 1. 二选一：装一个文件夹同步工具（坚果云、OneDrive、Syncthing 均可）拿到本地目录；或直接准备 WebDAV 地址与应用密码（坚果云在「账户设置 → 安全设置 → 第三方应用管理」生成）。
 2. 应用 → 设置：传输方式选本地文件夹（同步文件夹选 `<同步目录>/PiAgentSync`）或 WebDAV（填地址、邮箱、应用密码，可先「测试连接」）；宿主目录通常留空（生效 `~/.pi/agent`，或 `PI_CODING_AGENT_DIR`）。
-3. 医生 → 开始检查；需要时安装/升级 Pi 或对齐包。
+3. 环境检测 → 开始检查；需要时安装/升级 Pi 或对齐包。
 4. 快照 → 导出（本地模式等云盘传完；WebDAV 模式点「上传到 WebDAV」）。
 5. 另一台机器指向同一目录或同一 WebDAV 账号 → 检查/下载快照 → 勾选删除项 → 应用 → 按提示补密钥/装包。
 
@@ -73,7 +73,7 @@ npm run tauri build -- --bundles deb,appimage
 
 - 总体设计与决策：`docs/design/00-master-design.md`
 - 快照与落地：`docs/design/10-snapshot-sync.md`
-- 环境医生与安装：`docs/design/20-env-doctor.md`
+- 环境检测与安装：`docs/design/20-env-doctor.md`
 - 密钥策略：`docs/design/30-secrets.md`
 - WebDAV 传输：`docs/design/40-webdav.md`
 - 架构：`docs/design/architecture.md`

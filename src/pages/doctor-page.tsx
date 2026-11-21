@@ -328,7 +328,7 @@ export function DoctorPage() {
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-lg">
       <header>
-        <h1 className="text-lg font-semibold text-foreground">环境医生</h1>
+        <h1 className="text-lg font-semibold text-foreground">环境检测</h1>
         <p className="mt-xs text-sm text-muted-foreground">
           只读检查 Node.js、Pi CLI、凭据与扩展包是否就绪。检查过程不写任何文件，也不会安装东西。
         </p>
@@ -596,7 +596,7 @@ function InstallCard({
           )}
           {run.result.status === 'succeeded' && (
             <p className="mt-sm text-xs leading-relaxed text-muted-foreground">
-              已自动重跑环境医生：看上面的 Pi 路径与版本是否更新。若仍提示找不到 pi，请重开终端后再检查。
+              已自动重跑环境检测：看上面的 Pi 路径与版本是否更新。若仍提示找不到 pi，请重开终端后再检查。
             </p>
           )}
         </div>
