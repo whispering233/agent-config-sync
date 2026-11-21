@@ -75,7 +75,8 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
 ### 符号链接
 
 - 导出：**物化复制**目标内容，并在 manifest 的 `symlinks` 中记录 `{path, target}`。
-- 导入：目标存在时**按 manifest 重建链接**；目标缺失或断链则退化为物化复制并告警。落在重建链接之下的写入与删除一律跳过；不在 manifest 里的祖先链接（本机自建）禁止删除，整次应用拒绝。
+- 导入：目标存在时**按 manifest 重建链接**；目标缺失、断链或平台不允许建链接（Windows 默认权限下 `ERROR_PRIVILEGE_NOT_HELD`）则退化为物化复制并告警。落在重建链接之下的写入与删除一律跳过；不在 manifest 里的祖先链接（本机自建）禁止删除，整次应用拒绝。
+- Windows：按目标类型分别调 `symlink_file` / `symlink_dir`；junction 与符号链接都算链接类（判定为 `read_link` 能读到目标）。
 - 断链：导出前检测，断链仅警告并跳过该条目。
 
 ## 4. manifest
@@ -148,7 +149,7 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
    └─ 展示 requiredSecrets / requiredPackages 待办
 5. 应用前复核   重算计划并按 fingerprint 比对；不一致 → `plan_stale`，整次拒绝
    备份         把将被覆盖/删除的文件与祖先链接复制到本机备份目录
-6. 落地         重建链接 → 写入/删除（链接之下的项跳过）；沿用原文件权限位；失败即停并保留备份
+6. 落地         重建链接 → 写入/删除（链接之下的项跳过）；沿用原文件权限位（仅 POSIX）；失败即停并保留备份
 7. 收尾
    ├─ 包对齐：按 requiredPackages 调用宿主安装命令（需确认）
    ├─ 密钥补齐：逐项输入，写入本机配置或给出环境变量命令
@@ -182,11 +183,11 @@ idle → reading → verifying → planning → previewing → backing-up → ap
 └── restore.json           # { version, createdAt, fingerprint, entries[] }
 ```
 
-- `entries`：`{ path, kind: file|symlink|dir, existed, mode, linkTarget }`。符号链接只记录目标，不复制内容；`existed: false` 表示该路径是应用新增的。
+- `entries`：`{ path, kind: file|symlink|dir, existed, mode, linkTarget }`。符号链接只记录目标，不复制内容；`existed: false` 表示该路径是应用新增的。`mode` 为 `null` 表示平台不提供权限位（Windows）或条目无需权限（链接、目录）。
 - 位置在本机应用数据目录（**不放云盘**）；目录权限 `0700`。
 - 覆盖/删除前备份；被物化替换的祖先链接也会记录，便于回滚恢复链接。
 - 保留最近 10 份，超出清理最旧。
-- 回滚：按 `restore.json` 反做（文件写回并恢复 mode、链接重建、新增路径删除），**还原前再备份一次当前状态**；回滚不触碰快照。路径越界或备份损坏时整次拒绝。
+- 回滚：按 `restore.json` 反做（文件写回并恢复 mode、链接重建、新增路径删除），**还原前再备份一次当前状态**；回滚不触碰快照。路径越界或备份损坏时整次拒绝。`mode` 为 `null` 时跳过权限还原，不报错。
 
 ## 8. 冲突文件
 

@@ -60,7 +60,7 @@
 | 数据 | 位置 | 是否跨机 |
 | :--- | :--- | :--- |
 | 快照与 manifest | 用户指定的云盘同步文件夹 | ✅ |
-| 应用配置 | 系统应用数据目录 | ❌ |
+| 应用配置 | 系统应用配置目录（Windows 上与数据目录同为 `%APPDATA%\<identifier>`） | ❌ |
 | WebDAV 凭据 | 系统应用数据目录下的 `webdav.json`（0600） | ❌ |
 | 远端同步状态 | 系统应用数据目录下的 `remote-state.json`（上次看到的远端 manifest，非密钥） | ❌ |
 | 暂存与上传工作区 | 系统应用数据目录下的 `staging/` 与 `upload-workspace/`（中间产物，用完即清） | ❌ |
@@ -70,15 +70,17 @@
 
 备份目录权限 `0700`；写入宿主文件时沿用原权限位（`auth.json` 类文件保持 `0600`）。
 
+Windows 没有 POSIX 权限位：备份清单的 `mode` 记 `null`，落地与回滚都不设权限；凭据文件的保护改由用户配置目录的默认 ACL 承担。
+
 ## 5. 平台矩阵
 
 | 平台 | v1 | 后续 | 已知差异 |
 | :--- | :--- | :--- | :--- |
 | Linux | ✅ AppImage + deb | 签名仓库 | WebKitGTK 版本差异；无密钥环依赖 |
-| Windows | 仅设计兼容 | NSIS 安装包 | 官方 installer 的 Portable Git 副作用 → 走 npm；路径大小写；进程树；不跨 WSL（不读写 WSL 路径、不在 WSL 内执行命令） |
+| Windows | ✅ NSIS（未签名） | 签名、卸载清理钩子 | 官方 installer 的 Portable Git 副作用 → 走 npm；路径大小写；进程树；`cmd /C` 只为 `.cmd` 中间层；不跨 WSL（不读写 WSL 路径、不在 WSL 内执行命令） |
 | macOS | 仅设计兼容 | dmg（先不签名） | 需公证才能免 Gatekeeper 拦截；`~/.local/bin` 不在默认 PATH |
 
-代码约束：路径一律用平台路径类型；命令通过登录 shell 执行；Windows 专属分支先留空实现并标注。
+代码约束：路径一律用平台路径类型；子进程 POSIX 走登录 shell、Windows 走 `cmd /C`；平台差异用并列实现（编译期分段），不留空实现占位。
 
 ## 6. 包依赖链
 

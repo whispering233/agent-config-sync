@@ -20,10 +20,18 @@
 - 前置：备份能力（已具备）。
 - 要点：逐条展示差异，提供"保留原文件 / 用冲突副本替换 / 暂不处理"；动作写入备份目录，绝不自动合并。
 
-### Windows / macOS 分发
+### Windows 签名与卸载清理
 
-- 动机：Linux 之外的用户需要安装包。
-- 要点：Windows 用 NSIS + Authenticode；macOS 用 dmg + 签名与公证（需开发者账号）；CI 三平台矩阵。
+- 现状：Windows NSIS 自测链路已具备（未签名，perUser）。
+- 要点：
+  - Authenticode 签名，消除 SmartScreen 首次拦截。
+  - 卸载钩子：只在用户主动卸载且明确选择时清理 `%APPDATA%\<identifier>`；必须跳过升级路径（`$UpdateMode`）与静默卸载，删除前用 `config.json` 作归属判据，默认按钮为「否」。
+  - 参考实现见本地 `ai-editor` 的 `installer.nsh`（签名文件判据 + `${isUpdated}` / `${Silent}` 双 guard）。
+
+### macOS 分发
+
+- 动机：Linux/Windows 之外的用户需要安装包。
+- 要点：dmg + 签名与公证（需开发者账号）；`~/.local/bin` 不在默认 PATH。
 - 注意：Windows 的官方 installer 副作用已在本项目规避（只走 npm），打包不影响该策略。
 
 ## P2

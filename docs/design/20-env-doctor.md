@@ -6,7 +6,7 @@
 - **修复是独立动作**：每个建议都由用户单独点击触发，且先展示将执行的命令。
 - **区分"没装"与"装了但坏了"**：命令存在但 `--version` 失败，与命令不存在是两种状态。
 - **不修改 shell 启动文件**。环境变量只给命令或写入用户级环境（Windows），不改 `.zshrc`。
-- **命令一律通过登录 shell 执行**：GUI 进程的 PATH 通常不含 nvm/fnm/mise 的路径。
+- **命令按平台执行**：POSIX 走登录 shell（GUI 进程的 PATH 通常不含 nvm/fnm/mise 的路径）；Windows 逐命令经 `cmd /C` 执行（`npm` / `pi` 是 `.cmd` 中间层，且 PATH 由用户环境直接继承，不需要登录 shell）。
 
 ## 2. 探测矩阵
 
@@ -14,16 +14,16 @@
 | :--- | :--- | :--- | :--- |
 | `os` | 系统信息 | — | 展示 |
 | `agent_dir` | `PI_CODING_AGENT_DIR` 或默认 `~/.pi/agent` | 存在/可写 | 创建或修正路径 |
-| `node.path` | 登录 shell `command -v node` + 常见目录兜底 | 找到/未找到 | 安装 Node 说明 |
+| `node.path` | POSIX：登录 shell `command -v node` + 常见目录兜底；Windows：`where node` | 找到/未找到 | 安装 Node 说明 |
 | `node.version` | `node -p process.versions.node` | `>=22.19.0` | 升级 Node |
-| `npm` | `command -v npm` / `npm -v` / `npm prefix -g` | 找到/未找到 | 随 Node 一起装 |
-| `pi.path` | 登录 shell `command -v pi` + `<agent_dir>/bin/pi` + `$(npm prefix -g)/bin/pi` | 找到/未找到 | 安装宿主 |
+| `npm` | `where`/`command -v npm` + `npm -v` + `npm prefix -g` | 找到/未找到 | 随 Node 一起装 |
+| `pi.path` | `where`/`command -v pi` + `<agent_dir>/bin/pi` + npm 全局前缀下的入口（POSIX `bin/pi`，Windows `pi.cmd`） | 找到/未找到 | 安装宿主 |
 | `pi.version` | `pi --version`（输出裸版本号，如 `1.5.2`） | 可解析 | 升级宿主 |
 | `pi.install_kind` | 是否存在 `<agent_dir>/install/managed-install.json`；路径是否在 `node_modules` 下 | 托管安装 / npm 安装 / 未知 | 决定升级命令 |
 | `pi.latest` | `npm view @earendil-works/pi-coding-agent version`（需网络，可关闭） | 与本地比较 | 提示升级 |
 | `auth` | 对已配置的 provider 执行 `pi auth check --provider <id> --json` | `ready` / `not_ready` / `invalid` | 打开密钥向导 |
 | `packages` | 读 `settings.json` 的 `packages` + 解析 `pi list` 文本 | 声明与实装一致/缺包 | 一键重装 |
-| `skills.links` | 统计 `skills/` 下的符号链接与断链 | 有断链 | 提示重建 |
+| `skills.links` | 统计 `skills/` 下的链接类条目与断链（POSIX 符号链接；Windows 符号链接与 junction） | 有断链 | 提示重建 |
 | `conflicts` | 受管范围内匹配 `*-冲突*` / `*-NSConflict*` | 有冲突 | 打开冲突处理 |
 | `snapshot` | 快照目录与 `manifest.json` 存在性、格式版本、哈希、创建时间 | 可用/不完整/不存在 | 重新上传或检查云盘 |
 | `json.parse` | 解析受管 JSON 文件（容忍 JSON5 注释） | 可解析 | 展示错误位置 |
@@ -32,7 +32,9 @@
 
 ## 3. 探测实现约束
 
-- **哨兵分隔**：一条 shell 命令执行多个探测，每个结果前后打唯一标记，避免被 shell 启动脚本的噪音污染。
+- **哨兵分隔**：POSIX 用一条登录 shell 命令执行多个探测，每个结果前后打唯一标记，避免被 shell 启动脚本的噪音污染。
+- **命令形态分平台**：Windows 每个探测点单独启动进程（必要时 `cmd /C`），不拼批处理脚本——批处理没有可读的错误处理，且 cmd 自身输出走 OEM 代码页。
+- **编码与引号**：子进程输出按 UTF-8 解码（宿主 CLI 由 Node 写出），不经 cmd 代码页转换；参数按平台转义，POSIX 用单引号，Windows 用双引号并拒绝内嵌引号。
 - **超时**：普通命令 5 秒；`pi auth check` 15 秒；`npm view` 10 秒。超时即判 `unknown`，不重试。
 - **区分状态**：`found` / `not_found` / `broken`（存在但执行失败）/ `unknown`（超时或输出不可解析）。
 - **不打印密钥**：命令输出在落日志前统一过滤（`sk-`、`Bearer`、`token=` 等模式）。
