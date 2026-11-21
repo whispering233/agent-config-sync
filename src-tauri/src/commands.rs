@@ -5,6 +5,7 @@ use crate::config::{
 };
 use crate::credentials::{self, CredentialError, WebdavCredentials};
 use crate::webdav::{self, DavError, ReqwestTransport, WebdavClient};
+use crate::webdav_transfer::{self, TransferError};
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
@@ -161,6 +162,65 @@ pub async fn test_webdav_connection(
     })
     .await
     .map_err(|error| format!("测试连接失败：{error}"))?
+}
+
+/// 一次下载的结果。`stagingRoot` 顶替同步根，交给 `verify_and_plan` 与 `apply_snapshot`。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadView {
+    staging_root: PathBuf,
+    fingerprint: String,
+    file_count: usize,
+    created_at: String,
+    /// 本次下载之前记录的同步时间；本机没有记录时为 null。
+    previous_seen_at: Option<String>,
+}
+
+/// 凭据缺失就是「还没配置」：这句话要能直接指路，不能只报文件不存在。
+fn download_credential_error(error: CredentialError) -> String {
+    match error {
+        CredentialError::Read { .. } | CredentialError::Corrupt { .. } => error.to_string(),
+        other => format!("还没有可用的 WebDAV 凭据：{other}；请先在设置页填写地址、用户名与密码"),
+    }
+}
+
+/// 网络类错误沿用设置页那套中文说法，其余直接用下载模块的说明。
+fn transfer_error(error: TransferError) -> String {
+    match error {
+        TransferError::Network(dav) => dav_error(dav),
+        other => other.to_string(),
+    }
+}
+
+/// 按远端 manifest 把快照取到本机暂存目录。不写 live，不碰同步文件夹。
+#[tauri::command]
+pub async fn download_remote_snapshot(app: AppHandle) -> Result<DownloadView, String> {
+    // 单文件传输超时 120s 是阻塞等待，留在 UI 线程会冻住窗口。
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = app_data_dir(&app)?;
+        let credentials = credentials::load(&dir)
+            .map_err(download_credential_error)?
+            .ok_or_else(|| {
+                "还没有配置 WebDAV：请先在设置页填写地址、用户名与密码".to_string()
+            })?;
+        let transport = ReqwestTransport::new(&credentials.username, &credentials.password)
+            .map_err(dav_error)?;
+        let outcome = webdav_transfer::download(
+            &WebdavClient::new(transport, &credentials.url),
+            &dir,
+        )
+        .map_err(transfer_error)?;
+
+        Ok(DownloadView {
+            staging_root: outcome.staging_root,
+            fingerprint: outcome.manifest.fingerprint,
+            file_count: outcome.manifest.files.len(),
+            created_at: outcome.manifest.created_at,
+            previous_seen_at: outcome.previous_seen_at,
+        })
+    })
+    .await
+    .map_err(|error| format!("下载失败：{error}"))?
 }
 
 #[tauri::command]

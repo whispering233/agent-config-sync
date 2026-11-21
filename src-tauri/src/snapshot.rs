@@ -540,7 +540,8 @@ fn now_seconds() -> u64 {
 }
 
 /// RFC 3339 UTC（秒级）。只用 std：chrono 不在允许新增的依赖里。
-fn format_timestamp(unix_seconds: u64) -> String {
+/// 备份与暂存目录的命名也用它，不另写第二套日历换算。
+pub(crate) fn format_timestamp(unix_seconds: u64) -> String {
     let days = (unix_seconds / 86_400) as i64;
     let seconds_of_day = unix_seconds % 86_400;
     let (year, month, day) = civil_from_days(days);

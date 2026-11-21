@@ -59,3 +59,19 @@ export function testWebdavConnection(input: WebdavInput): Promise<WebdavProbe> {
     password: input.password ?? null,
   });
 }
+
+/** 与 Rust 侧 `DownloadView` 一一对应：一次下载落到了本机暂存目录。 */
+export type RemoteDownload = {
+  /** 暂存目录；可以当作 `root` 传给 `verify_and_plan` 与 `apply_snapshot`。 */
+  stagingRoot: string;
+  fingerprint: string;
+  fileCount: number;
+  createdAt: string;
+  /** 本次下载之前记录的同步时间；本机没有记录时为 null。 */
+  previousSeenAt: string | null;
+};
+
+/** 按远端 manifest 把快照取到本机暂存目录。不写本机配置，也不碰同步文件夹。 */
+export function downloadRemoteSnapshot(): Promise<RemoteDownload> {
+  return invoke<RemoteDownload>('download_remote_snapshot');
+}

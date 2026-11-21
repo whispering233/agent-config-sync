@@ -11,6 +11,7 @@ use crate::doctor::{CommandRunner, ShellRunner};
 use crate::plan;
 use crate::scope;
 use crate::snapshot::{ManifestSymlink, MANIFEST_FILE_NAME, SNAPSHOT_DIR_NAME};
+use crate::webdav_transfer;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::{self, DirBuilder, OpenOptions};
@@ -832,14 +833,18 @@ fn utc_timestamp(unix_seconds: u64) -> String {
 }
 
 /// command 层入口：同步根目录与宿主目录取自应用配置，备份写进应用数据目录。
+///
+/// `root` 为 `Some` 时用它顶替同步根：WebDAV 下载把快照放在暂存目录里，应用也必须能
+/// 指向那里。允许的根与计划用同一套判定（[`webdav_transfer::resolve_root`]）。
 #[tauri::command]
 pub async fn apply_snapshot(
     app: AppHandle,
     expected_fingerprint: String,
     delete_paths: Vec<String>,
+    root: Option<String>,
 ) -> Result<ApplyReport, ApplyFailure> {
     tauri::async_runtime::spawn_blocking(move || {
-        run(&app, &expected_fingerprint, &delete_paths)
+        run(&app, &expected_fingerprint, &delete_paths, root)
     })
     .await
     .map_err(|error| ApplyFailure::new("apply_failed", format!("应用失败：{error}")))?
@@ -849,6 +854,7 @@ fn run(
     app: &AppHandle,
     expected_fingerprint: &str,
     delete_paths: &[String],
+    root: Option<String>,
 ) -> Result<ApplyReport, ApplyFailure> {
     let config_dir = app.path().app_config_dir().map_err(|error| {
         ApplyFailure::new(
@@ -865,12 +871,18 @@ fn run(
     let config = config::load_config(&config_dir)
         .map_err(|error| ApplyFailure::new("app_config_unavailable", error.to_string()))?;
 
-    let sync_root = config.sync_root.clone().ok_or_else(|| {
-        ApplyFailure::new(
-            "sync_root_missing",
-            "还没有设置同步文件夹，请先在设置页选择",
-        )
-    })?;
+    let sync_root = match root {
+        Some(requested) => {
+            webdav_transfer::resolve_root(config.sync_root.as_deref(), &app_data_dir, &requested)
+                .map_err(|message| ApplyFailure::new("root_not_allowed", message))?
+        }
+        None => config.sync_root.clone().ok_or_else(|| {
+            ApplyFailure::new(
+                "sync_root_missing",
+                "还没有设置同步文件夹，请先在设置页选择",
+            )
+        })?,
+    };
 
     // 只读取这一个文档化的环境变量；错误信息里不回显其内容。
     let env_agent_dir = std::env::var_os(config::AGENT_DIR_ENV_VAR).map(PathBuf::from);

@@ -13,6 +13,7 @@ use crate::snapshot::{
     self, Manifest, ManifestFile, Requirements, SourceInfo, FORMAT_VERSION, MANIFEST_FILE_NAME,
     SNAPSHOT_DIR_NAME,
 };
+use crate::webdav_transfer;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -476,7 +477,10 @@ fn format_version(version: Version) -> String {
 }
 
 /// command 层入口：同步根目录与宿主目录取自应用配置，然后跑一次只读检查。
-fn probe(app: &AppHandle) -> Result<PlanReport, PlanFailure> {
+///
+/// `root` 为 `Some` 时用它顶替同步根：WebDAV 下载把快照放在暂存目录里，校验与计划
+/// 必须能指向那里。允许的根由 [`webdav_transfer::resolve_root`] 统一判定。
+fn probe(app: &AppHandle, root: Option<String>) -> Result<PlanReport, PlanFailure> {
     let config_dir = app.path().app_config_dir().map_err(|error| {
         PlanFailure::new(
             "app_config_unavailable",
@@ -486,9 +490,21 @@ fn probe(app: &AppHandle) -> Result<PlanReport, PlanFailure> {
     let config = config::load_config(&config_dir)
         .map_err(|error| PlanFailure::new("app_config_unavailable", error.to_string()))?;
 
-    let sync_root = config.sync_root.clone().ok_or_else(|| {
-        PlanFailure::new("sync_root_missing", "还没有设置同步文件夹，请先在设置页选择")
-    })?;
+    let sync_root = match root {
+        Some(requested) => {
+            let app_data = app.path().app_data_dir().map_err(|error| {
+                PlanFailure::new(
+                    "app_data_unavailable",
+                    format!("无法定位应用数据目录：{error}"),
+                )
+            })?;
+            webdav_transfer::resolve_root(config.sync_root.as_deref(), &app_data, &requested)
+                .map_err(|message| PlanFailure::new("root_not_allowed", message))?
+        }
+        None => config.sync_root.clone().ok_or_else(|| {
+            PlanFailure::new("sync_root_missing", "还没有设置同步文件夹，请先在设置页选择")
+        })?,
+    };
 
     // 只读取这一个文档化的环境变量；错误信息里不回显其内容。
     let env_agent_dir = std::env::var_os(config::AGENT_DIR_ENV_VAR).map(PathBuf::from);
@@ -504,8 +520,11 @@ fn probe(app: &AppHandle) -> Result<PlanReport, PlanFailure> {
 
 /// 子进程会阻塞最多 5 秒，放阻塞线程池，别占住 UI 线程。
 #[tauri::command]
-pub async fn verify_and_plan(app: AppHandle) -> Result<PlanReport, PlanFailure> {
-    tauri::async_runtime::spawn_blocking(move || probe(&app))
+pub async fn verify_and_plan(
+    app: AppHandle,
+    root: Option<String>,
+) -> Result<PlanReport, PlanFailure> {
+    tauri::async_runtime::spawn_blocking(move || probe(&app, root))
         .await
         .map_err(|error| PlanFailure::new("plan_failed", format!("检查失败：{error}")))?
 }
