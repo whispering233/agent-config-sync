@@ -40,11 +40,27 @@ npm run tauri -- build -- --bundles deb,appimage
 
 ```text
 src-tauri/target/release/bundle/
-├── deb/Agent Config Sync_0.1.0_amd64.deb          （约 3.1 MB）
-└── appimage/Agent Config Sync_0.1.0_amd64.AppImage（约 83 MB）
+├── deb/Agent Config Sync_0.0.1_amd64.deb          （约 3.1 MB）
+└── appimage/Agent Config Sync_0.0.1_amd64.AppImage（约 83 MB）
 ```
 
 release 配置：`strip = true`、`lto = "thin"`（`src-tauri/Cargo.toml`）。二进制已去符号。
+
+## CI 流水线
+
+| 工作流 | 触发 | 做什么 |
+| :--- | :--- | :--- |
+| `ci.yml` | push main / PR | `cargo test`、`cargo check`、`npm run build`；不打包 |
+| `release.yml` | push tag `v*` | 校验三处版本号一致 → 从 `CHANGELOG.md` 对应版本段建 GitHub Release |
+| `desktop.yml` | push tag `v*` / 手动 | 在 `ubuntu-22.04` 构建 deb 与 AppImage 并挂到该 tag 的 Release；手动入口可补包到已有 Release |
+
+约束：
+
+- runner 锁 `ubuntu-22.04`：AppImage 的最低 glibc 跟随 runner，用 `latest` 会让老发行版报 `GLIBC_2.xx not found`。
+- 版本号有三处（`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`），CI 只校验不写回；不一致就失败，不建 Release。
+- 首个 tag 之前必须先在 `CHANGELOG.md` 落 `## [vX.Y.Z] - <日期>` 段，否则 Release 没有正文。
+- 打包依赖 GitHub release 资产（`appimagetool` 的 type2 runtime）；runner 无法出网时 AppImage 会失败，deb 不受影响。
+- Release 正文只由 `release.yml` 负责；资产上传不改正文。
 
 ## 发布前验证
 

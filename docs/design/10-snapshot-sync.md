@@ -1,8 +1,15 @@
 # 快照与同步
 
-## 1. 前提：传输由云盘客户端负责
+## 1. 前提：传输由传输层负责
 
-本模块不实现任何网络协议。云盘客户端提供的能力与限制：
+快照格式与落地语义不区分传输方式。两种模式：
+
+| 模式 | 谁负责"文件到达" | 说明 |
+| :--- | :--- | :--- |
+| 本地文件夹 | 云盘客户端 | 保留；可离线使用 |
+| WebDAV | 本应用 | 协议、凭据与冲突见 `40-webdav.md` |
+
+以下事实只适用于**本地文件夹模式**，即云盘客户端提供的能力与限制：
 
 | 特性 | 事实 | 对本设计的影响 |
 | :--- | :--- | :--- |
@@ -33,6 +40,8 @@
 │   └── agents/
 └── manifest.json              # 最后写入
 ```
+
+WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结构与本地模式一致（见 `40-webdav.md`）。
 
 快照目录本身不包含：`auth.json`、`sessions/`、`npm/`、`install/`、缓存与状态文件。
 
@@ -78,7 +87,7 @@
   "createdAt": "2026-11-20T05:30:00Z",
   "fingerprint": "a1b2c3d4e5f6",
   "source": {
-    "app": "0.1.0",
+    "app": "0.0.1",
     "os": "linux",
     "arch": "x64",
     "pi": "1.5.2",
@@ -117,6 +126,7 @@
 7. 完成        展示 fingerprint 与文件数，提示"等待云盘上传完成"
 ```
 
+- 传输层为 WebDAV 时，第 5/6 步换成"本地暂存 → 增量 PUT → manifest 最后 PUT"；步骤顺序与判定不变，失败码见 `40-webdav.md`。
 - 导出是**全量替换**：先写临时目录再整体替换，避免半套快照。
 - 不删除同步根目录下的其他文件（将来分享包等产物可能共存）。
 - 任何一步失败：删除临时目录，保留原快照不动。
@@ -144,6 +154,8 @@
    ├─ 密钥补齐：逐项输入，写入本机配置或给出环境变量命令
    └─ 提示重启宿主或 /reload
 ```
+
+- 传输层为 WebDAV 时，第 1 步先取远端 manifest，再按清单把文件取到本机暂存目录；其后的校验、计划、预览与应用完全复用本节流程。
 
 ### 删除判定
 
@@ -196,6 +208,13 @@ idle → reading → verifying → planning → previewing → backing-up → ap
 | `restore_failed` / `backup_invalid` / `backup_missing` | 回滚失败或备份不可用 |
 | `host_version_unsatisfied` | 宿主版本低于要求（警告） |
 | `secret_residue` | 快照内仍有字面密钥（警告） |
+| `remote_not_configured` | 未填地址/用户名/密码 |
+| `remote_unreachable` | DNS、TLS、超时或 5xx |
+| `remote_auth_failed` | 远端 401/403（凭据无效或权限不足） |
+| `remote_quota` | 远端 507，或 403 且提示配额 |
+| `remote_manifest_corrupt` | 远端 manifest 无法解析或格式版本不支持 |
+| `remote_not_found` | 下载时远端没有 manifest |
+| `remote_changed` | 提交 manifest 时远端已被改写 |
 
 ## 10. 已知限制
 
@@ -203,3 +222,5 @@ idle → reading → verifying → planning → previewing → backing-up → ap
 - 不感知云盘同步进度，只能靠 manifest 与 fingerprint。
 - 文件被重写时注释不保留（JSON5 → JSON）；本地文件只在"写入字面密钥"时才重写。
 - 跨平台路径差异（扩展内绝对路径、MCP `cwd`）不做翻译，只在预览中提示。
+- 远端上传是"整份 manifest + 变更文件"，不做断点续传与限流退避。
+- 远端不被当前快照引用的旧文件不自动删除，也不会被下载端应用。
