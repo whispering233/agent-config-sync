@@ -1,0 +1,89 @@
+name: Desktop
+
+# tag 推送出正式资产；手动入口只补包到已存在的 Release，不建 Release
+# 键名加引号：`on` 在 YAML 1.1 里会被解析成布尔值，引号能让任何解析器都认
+"on":
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "目标 Release 的 tag，例如 v0.0.1"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    # 锁 22.04：AppImage 的最低 glibc 跟随 runner，latest 会让老发行版报 GLIBC 缺失
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    env:
+      # 手动触发时 ref 是分支名，tag 只能用输入值；tag 推送时两者等价
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri 在 Linux 上链接 webkit2gtk 等系统库，缺了编译直接失败
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            build-essential
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # beforeBuildCommand 已经跑了前端构建，这里不重复 npm run build
+      # `--` 是 npm 的透传分隔符，后面的参数原样交给 tauri CLI
+      - name: Build deb and AppImage
+        run: npm run tauri -- build --bundles deb,appimage
+
+      # release 流水线并行创建 Release，可能比本任务晚就绪，所以轮询等待
+      - name: Wait for Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for attempt in $(seq 1 10); do
+            if gh release view "$TAG" --json tagName >/dev/null; then
+              echo "release $TAG 已就绪"
+              exit 0
+            fi
+            echo "第 $attempt 次探测未找到 release $TAG，6 秒后重试"
+            sleep 6
+          done
+          echo "release $TAG 始终未出现，无法上传资产" >&2
+          exit 1
+
+      - name: Upload assets to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$TAG" \
+            src-tauri/target/release/bundle/deb/*.deb \
+            src-tauri/target/release/bundle/appimage/*.AppImage \
+            --clobber
+
+      # 上传失败时仍留一份可下载产物，便于排查是不是打包或权限问题
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-linux
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: warn
