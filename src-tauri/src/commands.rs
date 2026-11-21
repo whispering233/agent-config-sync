@@ -1,15 +1,17 @@
 //! command 层：把核心配置模块接到 Tauri 上，只做路径注入与错误映射。
 
+use crate::auto_sync;
 use crate::config::{
     self, AppConfig, ConfigError, ConfigValidation, AGENT_DIR_ENV_VAR, CONFIG_FILE_NAME,
 };
 use crate::credentials::{self, CredentialError, WebdavCredentials};
 use crate::doctor::{self, ShellRunner};
 use crate::platform::HostOs;
+use crate::runtime;
 use crate::snapshot;
 use crate::webdav::{self, DavError, ReqwestTransport, WebdavClient};
 use crate::webdav_transfer::{self, TransferError, UploadOutcome};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
 /// 一次配置读取的完整结果：配置内容、生效路径与校验结果。
@@ -44,11 +46,11 @@ fn context(app: &AppHandle) -> Result<ConfigContext, String> {
     })
 }
 
-fn view(config: AppConfig, validation: ConfigValidation, config_file: &PathBuf) -> AppConfigView {
+fn view(config: AppConfig, validation: ConfigValidation, config_file: &Path) -> AppConfigView {
     AppConfigView {
         config,
         validation,
-        config_file_path: config_file.clone(),
+        config_file_path: config_file.to_path_buf(),
     }
 }
 
@@ -203,6 +205,8 @@ fn transfer_error(error: TransferError) -> String {
 pub async fn download_remote_snapshot(app: AppHandle) -> Result<DownloadView, String> {
     // 单文件传输超时 120s 是阻塞等待，留在 UI 线程会冻住窗口。
     tauri::async_runtime::spawn_blocking(move || {
+        // 与自动上行、应用/回滚共用同一把锁，避免两套写盘同时跑。
+        let _guard = crate::runtime::lock_operation();
         let dir = app_data_dir(&app)?;
         let credentials = credentials::load(&dir)
             .map_err(download_credential_error)?
@@ -291,6 +295,7 @@ fn upload_failure_from(error: TransferError) -> UploadFailure {
 pub async fn upload_snapshot(app: AppHandle, overwrite: bool) -> Result<UploadView, UploadFailure> {
     // 导出、逐文件 PUT 与 120s 单文件超时都是阻塞等待，留在 UI 线程会冻住窗口。
     tauri::async_runtime::spawn_blocking(move || {
+        let _guard = crate::runtime::lock_operation();
         let config_dir = app.path().app_config_dir().map_err(|error| {
             upload_failure(
                 "app_config_unavailable",
@@ -402,15 +407,49 @@ pub fn validate_app_config(app: AppHandle, config: AppConfig) -> Result<AppConfi
 #[tauri::command]
 pub fn save_app_config(app: AppHandle, config: AppConfig) -> Result<AppConfigView, String> {
     let context = context(&app)?;
-    let (saved, validation) = config::save_config_checked(
+    let launch_at_login = config.launch_at_login;
+    let previous_launch_at_login = config::load_config(&context.config_dir)
+        .map(|current| current.launch_at_login)
+        .ok();
+    let launch_changed = previous_launch_at_login != Some(launch_at_login);
+    if launch_changed {
+        runtime::set_launch_at_login(&app, launch_at_login)?;
+    }
+    let saved = match config::save_config_checked(
         &context.config_dir,
         &config,
         context.env_agent_dir.as_deref(),
         context.home_dir.as_deref(),
-    )
-    .map_err(readable)?;
+    ) {
+        Ok(saved) => saved,
+        Err(error) => {
+            // 配置没写成时把系统登记改回去，避免设置页显示与实际相反。
+            if launch_changed {
+                if let Some(previous) = previous_launch_at_login {
+                    let _ = runtime::set_launch_at_login(&app, previous);
+                }
+            }
+            return Err(readable(error));
+        }
+    };
+    let (saved, validation) = saved;
+
+    auto_sync::wake();
 
     Ok(view(saved, validation, &context.config_file))
+}
+
+/// 托盘/设置页读取自动上行状态。
+#[tauri::command]
+pub fn auto_sync_status() -> auto_sync::AutoSyncStatus {
+    auto_sync::status()
+}
+
+/// 设置页的「立即同步」：唤醒后台线程，不等待上传完成。
+#[tauri::command]
+pub fn trigger_auto_sync() -> auto_sync::AutoSyncStatus {
+    auto_sync::trigger_now();
+    auto_sync::status()
 }
 
 #[cfg(test)]

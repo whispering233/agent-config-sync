@@ -154,6 +154,24 @@ pub fn export_with(
     sync_root: &Path,
     versions: SourceVersions,
 ) -> Result<ExportReport, ExportFailure> {
+    export_with_options(agent_dir, sync_root, versions, true)
+}
+
+/// 与 [`export_with`] 相同，但不复制根级 `auth.json`；自动上行默认用它。
+pub fn export_without_auth(
+    agent_dir: &Path,
+    sync_root: &Path,
+    versions: SourceVersions,
+) -> Result<ExportReport, ExportFailure> {
+    export_with_options(agent_dir, sync_root, versions, false)
+}
+
+fn export_with_options(
+    agent_dir: &Path,
+    sync_root: &Path,
+    versions: SourceVersions,
+    include_auth: bool,
+) -> Result<ExportReport, ExportFailure> {
     precheck(agent_dir, sync_root)?;
 
     let stamp = unique_stamp();
@@ -168,7 +186,12 @@ pub fn export_with(
         })?;
     }
 
-    let materialized = scope::materialize(agent_dir, &temp_dir).map_err(|error| {
+    let materialized = if include_auth {
+        scope::materialize(agent_dir, &temp_dir)
+    } else {
+        scope::materialize_without_auth(agent_dir, &temp_dir)
+    }
+    .map_err(|error| {
         let _ = fs::remove_dir_all(&temp_dir);
         ExportFailure::new("export_failed", format!("复制受管文件失败：{error}"))
     })?;

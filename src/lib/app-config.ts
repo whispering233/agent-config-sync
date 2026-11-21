@@ -9,7 +9,11 @@ export type PathStatus =
 
 export type FindingLevel = 'error' | 'warning';
 
-export type ConfigField = 'syncRoot' | 'agentDir' | 'backupRetention';
+export type ConfigField =
+  | 'syncRoot'
+  | 'agentDir'
+  | 'backupRetention'
+  | 'autoSyncInterval';
 
 export type AgentDirSource = 'override' | 'env' | 'default' | 'unresolved';
 
@@ -23,6 +27,12 @@ export type AppConfig = {
   agentDirOverride: string | null;
   backupRetention: number;
   transport: Transport;
+  /** 定时自动上行只上传，不自动下载或应用。 */
+  autoSync: boolean;
+  autoSyncIntervalMinutes: number;
+  /** 默认关闭：避免把本机可能已轮换的 OAuth 凭据覆盖到云端。 */
+  autoSyncIncludeCredentials: boolean;
+  launchAtLogin: boolean;
 };
 
 export type ValidationFinding = {

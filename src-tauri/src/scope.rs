@@ -223,6 +223,22 @@ pub fn scan(agent_dir: &Path) -> Result<ScanOutcome, ScopeError> {
 /// 把受管范围物化复制到 `dest_dir`：符号链接写成真实内容，断链等跳过项不中断整体。
 /// `dest_dir` 必须不存在或为空；任何写入都落在 `dest_dir` 之内。
 pub fn materialize(agent_dir: &Path, dest_dir: &Path) -> Result<MaterializeOutcome, ScopeError> {
+    materialize_inner(agent_dir, dest_dir, true)
+}
+
+/// 与 [`materialize`] 相同，但不复制根级 `auth.json`；自动上行默认用它。
+pub fn materialize_without_auth(
+    agent_dir: &Path,
+    dest_dir: &Path,
+) -> Result<MaterializeOutcome, ScopeError> {
+    materialize_inner(agent_dir, dest_dir, false)
+}
+
+fn materialize_inner(
+    agent_dir: &Path,
+    dest_dir: &Path,
+    include_auth: bool,
+) -> Result<MaterializeOutcome, ScopeError> {
     let scanned = scan(agent_dir)?;
 
     if dest_dir.exists() {
@@ -235,6 +251,9 @@ pub fn materialize(agent_dir: &Path, dest_dir: &Path) -> Result<MaterializeOutco
 
     let mut written = Vec::with_capacity(scanned.entries.len());
     for entry in &scanned.entries {
+        if !include_auth && entry.relative_path == Path::new("auth.json") {
+            continue;
+        }
         let destination = resolve_within(dest_dir, &entry.relative_path)?;
         let source = resolve_within(agent_dir, &entry.relative_path)?;
         match entry.kind {
@@ -252,7 +271,11 @@ pub fn materialize(agent_dir: &Path, dest_dir: &Path) -> Result<MaterializeOutco
 
     Ok(MaterializeOutcome {
         written,
-        symlinks: scanned.symlinks(),
+        symlinks: scanned
+            .symlinks()
+            .into_iter()
+            .filter(|(path, _)| include_auth || path != Path::new("auth.json"))
+            .collect(),
         skipped: scanned.skipped,
     })
 }

@@ -294,12 +294,35 @@ pub fn upload<T: DavTransport>(
     versions: &snapshot::SourceVersions,
     overwrite: bool,
 ) -> Result<UploadOutcome, TransferError> {
+    upload_with(client, app_data, agent_dir, versions, true, overwrite)
+}
+
+/// 自动上行默认使用：不把根级 `auth.json` 传上云端，避免后台覆盖其他机器的登录态。
+pub fn upload_excluding_auth<T: DavTransport>(
+    client: &WebdavClient<T>,
+    app_data: &Path,
+    agent_dir: &Path,
+    versions: &snapshot::SourceVersions,
+    overwrite: bool,
+) -> Result<UploadOutcome, TransferError> {
+    upload_with(client, app_data, agent_dir, versions, false, overwrite)
+}
+
+fn upload_with<T: DavTransport>(
+    client: &WebdavClient<T>,
+    app_data: &Path,
+    agent_dir: &Path,
+    versions: &snapshot::SourceVersions,
+    include_auth: bool,
+    overwrite: bool,
+) -> Result<UploadOutcome, TransferError> {
     let workspace = prepare_upload_workspace(app_data)?;
     let input = UploadInput {
         app_data,
         agent_dir,
         versions,
         workspace: &workspace,
+        include_auth,
     };
     let outcome = upload_into(client, &input, overwrite);
     // 工作区只是本次搬运的中间产物：内容在 live 与远端都还在，留着只会占地方。
@@ -313,6 +336,7 @@ struct UploadInput<'a> {
     agent_dir: &'a Path,
     versions: &'a snapshot::SourceVersions,
     workspace: &'a Path,
+    include_auth: bool,
 }
 
 /// 远端 manifest 与它的 ETag。ETag 用来防止提交时盖掉别人刚推的版本。
@@ -326,9 +350,13 @@ fn upload_into<T: DavTransport>(
     input: &UploadInput<'_>,
     overwrite: bool,
 ) -> Result<UploadOutcome, TransferError> {
-    // 1. 导出：脱敏、明文扫描、manifest、指纹全部复用快照流水线，不另写一套。
-    snapshot::export_with(input.agent_dir, input.workspace, input.versions.clone())
-        .map_err(TransferError::Export)?;
+    // 1. 导出：明文扫描、manifest、指纹全部复用快照流水线，不另写一套。
+    if input.include_auth {
+        snapshot::export_with(input.agent_dir, input.workspace, input.versions.clone())
+    } else {
+        snapshot::export_without_auth(input.agent_dir, input.workspace, input.versions.clone())
+    }
+    .map_err(TransferError::Export)?;
     let manifest = read_workspace_manifest(input.workspace)?;
     let has_auth = manifest
         .files
@@ -1369,22 +1397,6 @@ mod tests {
         write_file(&root.join("prompts/review.md"), "# 评审\n");
     }
 
-    /// 单测不关心来源版本：默认空，调用点保持短。
-    fn upload_for_tests<T: DavTransport>(
-        client: &WebdavClient<T>,
-        app_data: &Path,
-        agent_dir: &Path,
-        overwrite: bool,
-    ) -> Result<UploadOutcome, TransferError> {
-        upload(
-            client,
-            app_data,
-            agent_dir,
-            &snapshot::SourceVersions::default(),
-            overwrite,
-        )
-    }
-
     fn write_state(app_data: &Path, manifest: &Manifest, seen_at: &str) {
         fs::create_dir_all(app_data).unwrap();
         let state = RemoteState {
@@ -2037,6 +2049,35 @@ mod tests {
         assert!(matches!(outcome, UploadOutcome::Uploaded { .. }));
         assert!(!app_data.join(UPLOAD_WORKSPACE_DIR_NAME).exists());
         assert!(app_data.join(REMOTE_STATE_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn upload_excluding_auth_omits_only_the_root_credential_file() {
+        let temp = TempDir::new("upload-without-auth");
+        let app_data = temp.path().join("data");
+        let agent = temp.path().join("agent");
+        fixture_agent(&agent);
+        write_file(
+            &agent.join("auth.json"),
+            "{\"openai\": {\"type\": \"api_key\", \"key\": \"sk-Zx7Qv2Lm9Rt4Bc8Wn3Yp6Kd1\"}}",
+        );
+        let (client, transport) = fake_client(first_upload_responses());
+
+        let outcome = upload_excluding_auth(
+            &client,
+            &app_data,
+            &agent,
+            &snapshot::SourceVersions::default(),
+            false,
+        )
+        .expect("不含 auth.json 的上传应成功");
+        assert!(matches!(outcome, UploadOutcome::Uploaded { .. }));
+        assert!(
+            !calls(&transport.requests())
+                .iter()
+                .any(|call| call.ends_with("snapshot/auth.json")),
+            "自动上行默认不能碰根级 auth.json"
+        );
     }
 
     #[test]

@@ -20,10 +20,14 @@ import {
 } from '../lib/app-config';
 import {
   isDesktop,
+  listenAutoSyncStatus,
+  loadAutoSyncStatus,
   loadWebdavSummary,
   pickDirectory,
   saveWebdavCredentials,
   testWebdavConnection,
+  triggerAutoSync,
+  type AutoSyncStatus,
   type WebdavProbe,
   type WebdavSummary,
 } from '../lib/desktop';
@@ -34,6 +38,10 @@ type SettingsForm = {
   syncRoot: string;
   agentDirOverride: string;
   transport: Transport;
+  autoSync: boolean;
+  autoSyncIntervalMinutes: number;
+  autoSyncIncludeCredentials: boolean;
+  launchAtLogin: boolean;
 };
 
 type LoadState =
@@ -46,6 +54,10 @@ const EMPTY_FORM: SettingsForm = {
   syncRoot: '',
   agentDirOverride: '',
   transport: 'local',
+  autoSync: false,
+  autoSyncIntervalMinutes: 30,
+  autoSyncIncludeCredentials: false,
+  launchAtLogin: false,
 };
 
 /** 坚果云是文档里唯一给出预填的服务商；其他家靠用户粘贴地址。 */
@@ -92,6 +104,10 @@ function formFromConfig(config: AppConfig): SettingsForm {
     syncRoot: config.syncRoot ?? '',
     agentDirOverride: config.agentDirOverride ?? '',
     transport: config.transport,
+    autoSync: config.autoSync,
+    autoSyncIntervalMinutes: config.autoSyncIntervalMinutes,
+    autoSyncIncludeCredentials: config.autoSyncIncludeCredentials,
+    launchAtLogin: config.launchAtLogin,
   };
 }
 
@@ -107,6 +123,10 @@ function configFromForm(base: AppConfig, form: SettingsForm): AppConfig {
     agentDirOverride: trimToNull(form.agentDirOverride),
     backupRetention: base.backupRetention,
     transport: form.transport,
+    autoSync: form.autoSync,
+    autoSyncIntervalMinutes: form.autoSyncIntervalMinutes,
+    autoSyncIncludeCredentials: form.autoSyncIncludeCredentials,
+    launchAtLogin: form.launchAtLogin,
   };
 }
 
@@ -114,7 +134,11 @@ function isDirty(base: AppConfig, form: SettingsForm): boolean {
   return (
     trimToNull(form.syncRoot) !== (base.syncRoot ?? null) ||
     trimToNull(form.agentDirOverride) !== (base.agentDirOverride ?? null) ||
-    form.transport !== base.transport
+    form.transport !== base.transport ||
+    form.autoSync !== base.autoSync ||
+    form.autoSyncIntervalMinutes !== base.autoSyncIntervalMinutes ||
+    form.autoSyncIncludeCredentials !== base.autoSyncIncludeCredentials ||
+    form.launchAtLogin !== base.launchAtLogin
   );
 }
 
@@ -406,6 +430,13 @@ export function SettingsPage() {
 
           {form.transport === 'webdav' && <WebdavCard />}
 
+          <AutoSyncCard
+            form={form}
+            onChange={updateField}
+            intervalFindings={findingsFor('autoSyncInterval')}
+            disabled={!isDesktop}
+          />
+
           <Card className="p-lg">
             <h2 className="text-sm font-semibold text-foreground">生效路径</h2>
             <dl className="mt-md flex flex-col gap-sm">
@@ -463,6 +494,221 @@ export function SettingsPage() {
 
       <AboutCard />
     </div>
+  );
+}
+
+type AutoSyncCardProps = {
+  form: SettingsForm;
+  onChange: <K extends keyof SettingsForm>(field: K, value: SettingsForm[K]) => void;
+  intervalFindings: ValidationFinding[];
+  disabled: boolean;
+};
+
+const autoSyncStateText: Record<AutoSyncStatus['state'], string> = {
+  idle: '等待下次自动上行',
+  running: '正在上传…',
+  success: '已上传',
+  conflict: '云端有更新，已停止',
+  failed: '失败',
+  skipped: '本次跳过',
+  paused: '已暂停',
+};
+
+/**
+ * 自动上行只上传，不自动下载或应用：下载后的删除确认与 plan_stale 校验不能绕过。
+ * 开关与间隔随配置一起保存；托盘菜单仍可临时暂停。
+ */
+function AutoSyncCard({
+  form,
+  onChange,
+  intervalFindings,
+  disabled,
+}: AutoSyncCardProps) {
+  const [status, setStatus] = useState<AutoSyncStatus | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!isDesktop) {
+      return;
+    }
+
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+
+    loadAutoSyncStatus()
+      .then((next) => {
+        if (!cancelled) {
+          setStatus(next);
+        }
+      })
+      .catch((failure: unknown) => {
+        if (!cancelled) {
+          setError(failureMessage(failure));
+        }
+      });
+
+    listenAutoSyncStatus((next) => setStatus(next))
+      .then((stop) => {
+        if (cancelled) {
+          stop();
+        } else {
+          unlisten = stop;
+        }
+      })
+      .catch((failure: unknown) => {
+        if (!cancelled) {
+          setError(failureMessage(failure));
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  async function handleSyncNow() {
+    if (!isDesktop || starting || form.transport !== 'webdav') {
+      return;
+    }
+
+    setStarting(true);
+    setError(null);
+    try {
+      setStatus(await triggerAutoSync());
+    } catch (failure) {
+      setError(failureMessage(failure));
+    } finally {
+      setStarting(false);
+    }
+  }
+
+  const running = starting || status?.state === 'running';
+  const intervalInvalid = intervalFindings.some(
+    (finding) => finding.level === 'error',
+  );
+
+  return (
+    <Card className="p-lg">
+      <h2 className="text-sm font-semibold text-foreground">后台同步</h2>
+      <p className="mt-xs text-sm text-muted-foreground">
+        关闭窗口后应用驻留托盘。开启自动上行后，按间隔把本机快照推到 WebDAV；只上传，不会自动下载或应用。
+      </p>
+
+      <div className="mt-lg flex flex-col gap-md">
+        <label className="flex items-start gap-sm text-sm text-foreground">
+          <input
+            type="checkbox"
+            className="mt-xs h-4 w-4 accent-accent"
+            checked={form.autoSync}
+            disabled={disabled}
+            onChange={(event) => onChange('autoSync', event.target.checked)}
+          />
+          <span>
+            定时自动上行
+            <span className="mt-xs block text-xs text-muted-foreground">
+              {form.transport === 'webdav'
+                ? '需要先保存可用的 WebDAV 凭据。'
+                : '当前是本地文件夹传输方式，自动上行不会执行。'}
+            </span>
+          </span>
+        </label>
+
+        <Field
+          id="auto-sync-interval"
+          label="自动上行间隔（分钟）"
+          hint="允许 10–1440 分钟；保存后后台线程会重新读取。"
+        >
+          <Input
+            id="auto-sync-interval"
+            type="number"
+            min={10}
+            max={1440}
+            step={1}
+            value={form.autoSyncIntervalMinutes}
+            disabled={disabled}
+            onChange={(event) =>
+              onChange('autoSyncIntervalMinutes', Number(event.target.value))
+            }
+            aria-invalid={intervalInvalid}
+            aria-describedby={
+              intervalFindings.length > 0 ? 'auto-sync-interval-feedback' : undefined
+            }
+          />
+          <FieldFeedback
+            id="auto-sync-interval-feedback"
+            findings={intervalFindings}
+          />
+        </Field>
+
+        <label className="flex items-start gap-sm text-sm text-foreground">
+          <input
+            type="checkbox"
+            className="mt-xs h-4 w-4 accent-accent"
+            checked={form.autoSyncIncludeCredentials}
+            disabled={disabled}
+            onChange={(event) =>
+              onChange('autoSyncIncludeCredentials', event.target.checked)
+            }
+          />
+          <span>
+            自动上行包含 auth.json
+            <span className="mt-xs block text-xs text-muted-foreground">
+              默认不含，避免把本机已轮换的 OAuth 凭据覆盖到云端；开启后凭据会以明文上传。
+            </span>
+          </span>
+        </label>
+
+        {form.autoSyncIncludeCredentials && (
+          <p className="rounded-md border border-warning/40 bg-warning/10 p-sm text-xs text-warning">
+            多台机器共用同一份 OAuth 凭据可能互相失效：一台刷新后，另一台仍是旧 token。只在明确知道后果时开启。
+          </p>
+        )}
+
+        <label className="flex items-start gap-sm text-sm text-foreground">
+          <input
+            type="checkbox"
+            className="mt-xs h-4 w-4 accent-accent"
+            checked={form.launchAtLogin}
+            disabled={disabled}
+            onChange={(event) => onChange('launchAtLogin', event.target.checked)}
+          />
+          <span>
+            开机自启
+            <span className="mt-xs block text-xs text-muted-foreground">
+              保存时向系统登记；Linux 依赖桌面环境的 autostart 支持。
+            </span>
+          </span>
+        </label>
+      </div>
+
+      <div className="mt-lg flex flex-wrap items-center gap-md">
+        <Button
+          variant="secondary"
+          onClick={handleSyncNow}
+          disabled={disabled || running || form.transport !== 'webdav'}
+        >
+          {running ? '正在同步…' : '立即上行'}
+        </Button>
+        <span className="text-sm text-muted-foreground" aria-live="polite">
+          {status === null
+            ? disabled
+              ? '仅桌面版可用'
+              : '读取状态…'
+            : autoSyncStateText[status.state]}
+          {status?.message !== null && status?.message !== undefined && (
+            <span className="ml-sm">{status.message}</span>
+          )}
+        </span>
+      </div>
+      {status?.lastAt !== null && status?.lastAt !== undefined && (
+        <p className="mt-xs text-xs text-muted-foreground">
+          最近尝试：{status.lastAt}
+        </p>
+      )}
+      {error !== null && <p className="mt-xs text-xs text-danger">{error}</p>}
+    </Card>
   );
 }
 

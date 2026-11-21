@@ -1,4 +1,5 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 
 /** 是否运行在 Tauri 桌面壳内。普通浏览器里为 false。 */
@@ -106,4 +107,37 @@ export type RemoteUpload =
  */
 export function uploadSnapshot(overwrite: boolean): Promise<RemoteUpload> {
   return invoke<RemoteUpload>('upload_snapshot', { overwrite });
+}
+
+
+/** 与 Rust 侧 `AutoSyncStatus` 一一对应。`state` 是有限状态机，不是自由文本。 */
+export type AutoSyncState =
+  | 'idle'
+  | 'running'
+  | 'success'
+  | 'conflict'
+  | 'failed'
+  | 'skipped'
+  | 'paused';
+
+export type AutoSyncStatus = {
+  state: AutoSyncState;
+  message: string | null;
+  /** 最近一次真正尝试上传的时间；从未尝试过为 null。 */
+  lastAt: string | null;
+};
+
+export function loadAutoSyncStatus(): Promise<AutoSyncStatus> {
+  return invoke<AutoSyncStatus>('auto_sync_status');
+}
+
+/** 唤醒后台线程立即上行；只返回当前状态，完成结果走 `auto-sync-status` 事件。 */
+export function triggerAutoSync(): Promise<AutoSyncStatus> {
+  return invoke<AutoSyncStatus>('trigger_auto_sync');
+}
+
+export function listenAutoSyncStatus(
+  handler: (status: AutoSyncStatus) => void,
+): Promise<UnlistenFn> {
+  return listen<AutoSyncStatus>('auto-sync-status', (event) => handler(event.payload));
 }

@@ -422,6 +422,7 @@ pub async fn restore_backup(
 }
 
 fn run(app: &AppHandle, backup_id: &str, confirm: bool) -> Result<RestoreReport, RestoreFailure> {
+    let _guard = crate::runtime::lock_operation();
     let app_data_dir = app_data_dir(app)
         .map_err(|message| RestoreFailure::new("app_data_unavailable", message))?;
     let config_dir = app.path().app_config_dir().map_err(|error| {

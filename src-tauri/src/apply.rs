@@ -982,6 +982,7 @@ fn run(
     delete_paths: &[String],
     root: Option<String>,
 ) -> Result<ApplyReport, ApplyFailure> {
+    let _guard = crate::runtime::lock_operation();
     let config_dir = app.path().app_config_dir().map_err(|error| {
         ApplyFailure::new(
             "app_config_unavailable",

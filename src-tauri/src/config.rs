@@ -20,6 +20,12 @@ pub const DEFAULT_BACKUP_RETENTION: u32 = 10;
 pub const MIN_BACKUP_RETENTION: u32 = 1;
 /// 备份保留数上限。
 pub const MAX_BACKUP_RETENTION: u32 = 100;
+/// 自动上行间隔下限（分钟）。
+pub const MIN_AUTO_SYNC_INTERVAL_MINUTES: u32 = 10;
+/// 自动上行间隔上限（分钟）。
+pub const MAX_AUTO_SYNC_INTERVAL_MINUTES: u32 = 1440;
+/// 默认自动上行间隔（分钟）。
+pub const DEFAULT_AUTO_SYNC_INTERVAL_MINUTES: u32 = 30;
 /// 宿主目录的第二优先级来源（优先级：配置覆盖 > 该环境变量 > `~/.pi/agent`）。
 pub const AGENT_DIR_ENV_VAR: &str = "PI_CODING_AGENT_DIR";
 
@@ -45,6 +51,18 @@ pub struct AppConfig {
     pub backup_retention: u32,
     #[serde(default)]
     pub transport: Transport,
+    /// 是否启用自动上行；只对 WebDAV 生效。
+    #[serde(default)]
+    pub auto_sync: bool,
+    /// 自动上行间隔（分钟）。
+    #[serde(default = "default_auto_sync_interval_minutes")]
+    pub auto_sync_interval_minutes: u32,
+    /// 自动上行是否包含 auth.json；默认不包含。
+    #[serde(default)]
+    pub auto_sync_include_credentials: bool,
+    /// 是否随用户登录启动应用。
+    #[serde(default)]
+    pub launch_at_login: bool,
 }
 
 impl Default for AppConfig {
@@ -55,6 +73,10 @@ impl Default for AppConfig {
             agent_dir_override: None,
             backup_retention: DEFAULT_BACKUP_RETENTION,
             transport: Transport::default(),
+            auto_sync: false,
+            auto_sync_interval_minutes: DEFAULT_AUTO_SYNC_INTERVAL_MINUTES,
+            auto_sync_include_credentials: false,
+            launch_at_login: false,
         }
     }
 }
@@ -68,12 +90,20 @@ impl AppConfig {
             agent_dir_override: normalize_optional_path(self.agent_dir_override.as_deref()),
             backup_retention: self.backup_retention,
             transport: self.transport,
+            auto_sync: self.auto_sync,
+            auto_sync_interval_minutes: self.auto_sync_interval_minutes,
+            auto_sync_include_credentials: self.auto_sync_include_credentials,
+            launch_at_login: self.launch_at_login,
         }
     }
 }
 
 fn default_backup_retention() -> u32 {
     DEFAULT_BACKUP_RETENTION
+}
+
+fn default_auto_sync_interval_minutes() -> u32 {
+    DEFAULT_AUTO_SYNC_INTERVAL_MINUTES
 }
 
 fn normalize_optional_path(value: Option<&Path>) -> Option<PathBuf> {
@@ -120,6 +150,7 @@ pub enum ConfigField {
     SyncRoot,
     AgentDir,
     BackupRetention,
+    AutoSyncInterval,
 }
 
 /// 一条校验结果。
@@ -416,6 +447,20 @@ pub fn validate(
             inspection.status
         }
     };
+
+    if !(MIN_AUTO_SYNC_INTERVAL_MINUTES..=MAX_AUTO_SYNC_INTERVAL_MINUTES)
+        .contains(&config.auto_sync_interval_minutes)
+    {
+        findings.push(ValidationFinding {
+            level: FindingLevel::Error,
+            field: ConfigField::AutoSyncInterval,
+            code: "auto_sync_interval_out_of_range",
+            message: format!(
+                "自动同步间隔必须在 {MIN_AUTO_SYNC_INTERVAL_MINUTES}–{MAX_AUTO_SYNC_INTERVAL_MINUTES} 分钟之间（当前 {}）",
+                config.auto_sync_interval_minutes
+            ),
+        });
+    }
 
     if let (Some(sync_root), Some(agent_dir)) =
         (config.sync_root.as_deref(), resolved.path.as_deref())
@@ -806,7 +851,11 @@ mod tests {
             .collect();
         let expected: BTreeSet<String> = [
             "agentDirOverride",
+            "autoSync",
+            "autoSyncIncludeCredentials",
+            "autoSyncIntervalMinutes",
             "backupRetention",
+            "launchAtLogin",
             "syncRoot",
             "transport",
             "version",
@@ -1068,6 +1117,46 @@ mod tests {
             assert!(
                 validate(&config, None, Some(&home)).ok,
                 "retention={value} 应允许"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_sync_interval_out_of_range_is_rejected() {
+        let dir = TempDir::new("auto-sync-interval");
+        let home = dir.join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        for value in [
+            MIN_AUTO_SYNC_INTERVAL_MINUTES - 1,
+            MAX_AUTO_SYNC_INTERVAL_MINUTES + 1,
+        ] {
+            let config = AppConfig {
+                auto_sync_interval_minutes: value,
+                ..AppConfig::default()
+            };
+            let validation = validate(&config, None, Some(&home));
+            assert!(!validation.ok, "interval={value} 应被拒绝");
+            assert!(find_code(&validation, "auto_sync_interval_out_of_range").is_some());
+
+            let error = save_config_checked(dir.path(), &config, None, Some(&home))
+                .expect_err("越界间隔不应被保存");
+            assert!(matches!(error, ConfigError::Validation(_)));
+            assert!(!dir.join(CONFIG_FILE_NAME).exists());
+        }
+
+        for value in [
+            MIN_AUTO_SYNC_INTERVAL_MINUTES,
+            DEFAULT_AUTO_SYNC_INTERVAL_MINUTES,
+            MAX_AUTO_SYNC_INTERVAL_MINUTES,
+        ] {
+            let config = AppConfig {
+                auto_sync_interval_minutes: value,
+                ..AppConfig::default()
+            };
+            assert!(
+                validate(&config, None, Some(&home)).ok,
+                "interval={value} 应允许"
             );
         }
     }
