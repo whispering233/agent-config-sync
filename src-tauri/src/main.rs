@@ -11,6 +11,9 @@ mod rollback;
 mod scope;
 mod secrets;
 mod snapshot;
+// 协议层先独立落地并与 UI 解耦：接线前没有调用方，先关掉 dead_code 噪音。
+#[allow(dead_code)]
+mod webdav;
 mod wizard;
 
 fn main() {
