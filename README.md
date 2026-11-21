@@ -10,9 +10,9 @@ Pi CLI 配置的换机交付工具：把配置导出成**可校验的快照**，
 | :--- | :--- |
 | 设置 | 选择传输方式（本地文件夹 / WebDAV）与宿主目录；WebDAV 凭据单独保存；路径校验 |
 | 环境检测 | 探测 node/npm/pi/凭据/包/断链；安装或升级 Pi（确认后执行） |
-| 快照 | 按受管范围导出、密钥引用化、写 manifest 与指纹 |
+| 快照 | 按受管范围导出、密钥引用化、写 manifest（含来源的 Pi/Node 版本）与指纹 |
 | 校验 | 校验 manifest 与逐文件哈希，生成新增/修改/删除计划 |
-| 应用 | 计划过期保护、删除逐项确认、备份、原子写、链接重建 |
+| 应用 | 计划过期保护、删除逐项确认、备份、原子写、链接重建；快照没声明的陈旧链接只删链接本身 |
 | 回滚 | 列出备份、还原前再备份、按 restore.json 反做 |
 | 密钥 | 列出 requiredSecrets、检查环境变量、写入本机字面值 |
 | 包对齐 | 比对 `settings.json` 声明与 `pi list` 实装，安装缺失项 |
@@ -34,7 +34,7 @@ chmod +x "src-tauri/target/release/bundle/appimage/Agent Config Sync_0.0.1_amd64
 
 Windows：运行 `src-tauri/target/release/bundle/nsis/Agent Config Sync_<版本>_x64-setup.exe`，按当前用户安装、不需要管理员。安装包未签名，首次运行会弹 SmartScreen：点「更多信息 → 仍要运行」。
 
-Windows 上命令执行走 `cmd /d /s /c`，环境检测与包对齐按逐命令探测；宿主安装仍只走 npm。
+Windows 上命令执行走 `cmd /d /s /c`，环境检测与包对齐按逐命令探测；宿主安装仍只走 npm。子进程不弹控制台窗口。
 
 ## 第一次使用
 
@@ -46,7 +46,7 @@ Windows 上命令执行走 `cmd /d /s /c`，环境检测与包对齐按逐命令
 
 ## 不做什么
 
-- 只支持 WebDAV 一种协议，不做 OAuth 云盘账号直连；WebDAV 凭据以 0600 明文存本机。
+- 只支持 WebDAV 一种协议，不做 OAuth 云盘账号直连；WebDAV 凭据明文单独存本机（Linux/macOS 为 0600 文件，Windows 依赖用户配置目录的继承 ACL）。
 - 不做后台常驻、文件监听、自动应用。
 - 不做冲突自动合并；云盘冲突副本只做只读扫描（处理动作在 backlog），WebDAV 冲突在应用内选「覆盖云端」或「从云端更新」。
 - 不做模型路由、代理、用量统计、会话管理。
@@ -56,8 +56,9 @@ Windows 上命令执行走 `cmd /d /s /c`，环境检测与包对齐按逐命令
 ## 价格与风险
 
 - 安装包未签名，只适合自己本机安装；转发前需补签名与正式图标。
-- WebDAV 凭据明文存于 `~/.local/share/dev.agentconfigsync.app/webdav.json`（权限 0600），不进快照。
-- 应用每次落地前都会备份；备份目录：`~/.local/share/dev.agentconfigsync.app/backups/`。
+- WebDAV 凭据明文存于应用数据目录的 `webdav.json`，不进快照。Linux 为 `~/.local/share/dev.agentconfigsync.app/`（0600），Windows 为 `%APPDATA%\dev.agentconfigsync.app\`（继承 ACL）。
+- 应用每次落地前都会备份；备份目录在同一个应用数据目录下（Linux 0700）。
+- 链接优先按快照重建；没有建链接权限时（Windows 默认权限）退化为把内容写成真实文件并提示。
 - 首次在真实配置上应用前，建议先用临时目录做一次演练。
 
 ## 开发

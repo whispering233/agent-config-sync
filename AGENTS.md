@@ -12,7 +12,7 @@ Pi CLI 配置的换机交付工具（手动快照交付，不做实时同步）�
 - 落地语义：快照为准，删除需逐项确认，覆盖前备份。
 - 触发方式：手动双向，不做实时监听。
 - 密钥：只允许宿主原生引用语法，`auth.json` 永不进入快照。
-- 符号链接：apply 时按 manifest 重建链接优先；目标缺失回退物化并告警；链接之下的写入/删除跳过。
+- 符号链接：apply 时按 manifest 重建链接优先；目标缺失回退物化并告警；链接之下的写入/删除跳过；快照没声明的链接只按链接本身列为删除候选，不读目标。
 - 技术栈：Tauri v2 + Rust + React + Tailwind，不引入 Node sidecar。
 - 配置套数：v1 单套，manifest 预留 `profileId`。
 - 平台顺序：Linux → Windows → macOS；Windows 安装宿主只走 npm。
@@ -36,7 +36,7 @@ Pi CLI 配置的换机交付工具（手动快照交付，不做实时同步）�
 - 快照、日志、备份、错误信息、manifest 中都不得出现明文密钥。
 - 只使用宿主原生引用：`models.json`/`web-search.json` 用 `$NAME`，`mcp.json` 用 `${NAME}`。
 - 补齐只写 `usedBy` 列出的本机文件；值不进入日志、错误或返回结构。
-- WebDAV 凭据单独存于应用数据目录的 0600 文件，不进快照、日志、错误信息与同步文件夹。
+- WebDAV 凭据单独存于应用数据目录（POSIX 0600；Windows 依赖用户配置目录的继承 ACL），不进快照、日志、错误信息与同步文件夹。
 - 不发明私有占位语法，不对快照整体加密，不自动写 shell 启动文件。
 
 ## 代码与注释纪律
@@ -68,7 +68,7 @@ npm run build
 - UI 验证交给子代理，条目数给定上限，只报不修。
 - 每个任务卡必须能独立验证、独立回滚。
 - 打包：`npm run tauri -- build --bundles deb,appimage`（AppImage 需要能访问 GitHub release 下载 runtime）；Windows 上 `npm run tauri -- build --bundles nsis`，CI 的 `windows-latest` job 会先跑 `cargo test` 再出包。
-- 平台差异收在 `src-tauri/src/platform.rs`：权限位、链接判定与创建、`cmd /d /s /c` 命令行、进程树终止。调用点不直接写 `cfg(windows)`，命令形态由注入的宿主平台分支。
+- 平台差异收在 `src-tauri/src/platform.rs`：权限位、链接判定与创建、`cmd /d /s /c` 命令行、`CREATE_NO_WINDOW`、进程树终止。调用点不直接写 `cfg(windows)`，命令形态由注入的宿主平台分支。
 
 ## 提交
 

@@ -61,7 +61,7 @@
 | :--- | :--- | :--- |
 | 快照与 manifest | 用户指定的云盘同步文件夹 | ✅ |
 | 应用配置 | 系统应用配置目录（Windows 上与数据目录同为 `%APPDATA%\<identifier>`） | ❌ |
-| WebDAV 凭据 | 系统应用数据目录下的 `webdav.json`（0600） | ❌ |
+| WebDAV 凭据 | 系统应用数据目录下的 `webdav.json`（POSIX 0600，Windows 继承 ACL） | ❌ |
 | 远端同步状态 | 系统应用数据目录下的 `remote-state.json`（上次看到的远端 manifest，非密钥） | ❌ |
 | 暂存与上传工作区 | 系统应用数据目录下的 `staging/` 与 `upload-workspace/`（中间产物，用完即清） | ❌ |
 | 备份与还原清单 | 系统应用数据目录下的备份目录 | ❌ |

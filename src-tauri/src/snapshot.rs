@@ -4,8 +4,8 @@
 //! 顺序固定为：预检 → 物化到临时目录 → 密钥引用化/扫描 → 原子替换 → 最后写 manifest。
 //! 任一步失败都删掉临时目录，原快照与 manifest 保持原样。
 //!
-//! `export_snapshot` 是 command 层入口；核心逻辑 [`export`] 不碰进程环境之外的东西，
-//! 可直接用临时目录单测。command 定义在本文件是因为并行开发约束下不能改 `commands.rs`。
+//! `export_snapshot` 是 command 层入口；核心逻辑 [`export_with`] 只碰文件系统与给定的版本号，
+//! 可直接用临时目录单测。
 
 use crate::config::{self, AGENT_DIR_ENV_VAR};
 use crate::doctor::{self, ShellRunner};
