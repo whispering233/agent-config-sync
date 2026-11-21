@@ -344,7 +344,7 @@ fn valid_package_name(name: &str) -> bool {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     };
-    package.contains('/') == false && valid(package) && scope.is_none_or(valid)
+    !package.contains('/') && valid(package) && scope.is_none_or(valid)
 }
 
 /// 缓存 key 来自用户文件：含 userinfo、空白、`=` 或已知密钥标记的来源直接跳过。
