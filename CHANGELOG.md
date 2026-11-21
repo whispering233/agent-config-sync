@@ -29,5 +29,6 @@
 ### Note
 
 - 仅面向 Linux；Windows/macOS 未打包。分享包尚未实现。
+- WebDAV 凭据明文存于本机 0600 文件；更换地址或用户名后需重新输入应用密码。
 - 安装包未签名；图标为占位图。
 - AppImage 打包需要从 GitHub 下载 type2 runtime，网络受限时会失败（deb 不受影响）。

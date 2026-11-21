@@ -42,7 +42,7 @@ chmod +x "src-tauri/target/release/bundle/appimage/Agent Config Sync_0.0.1_amd64
 
 - 只支持 WebDAV 一种协议，不做 OAuth 云盘账号直连；WebDAV 凭据以 0600 明文存本机。
 - 不做后台常驻、文件监听、自动应用。
-- 不做冲突自动合并；冲突目前只读扫描，处理动作在 backlog。
+- 不做冲突自动合并；云盘冲突副本只做只读扫描（处理动作在 backlog），WebDAV 冲突在应用内选「覆盖云端」或「从云端更新」。
 - 不做模型路由、代理、用量统计、会话管理。
 - 不自动安装 Node，不修改 shell 启动文件，不代写 OAuth。
 - 不把密钥写入快照：只保留 `$NAME` / `${NAME}` 引用，`auth.json` 永不进入快照。
@@ -50,6 +50,7 @@ chmod +x "src-tauri/target/release/bundle/appimage/Agent Config Sync_0.0.1_amd64
 ## 价格与风险
 
 - 安装包未签名，只适合自己本机安装；转发前需补签名与正式图标。
+- WebDAV 凭据明文存于 `~/.local/share/dev.agentconfigsync.app/webdav.json`（权限 0600），不进快照。
 - 应用每次落地前都会备份；备份目录：`~/.local/share/dev.agentconfigsync.app/backups/`。
 - 首次在真实配置上应用前，建议先用临时目录做一次演练。
 
@@ -74,6 +75,7 @@ npm run tauri build -- --bundles deb,appimage
 - 快照与落地：`docs/design/10-snapshot-sync.md`
 - 环境医生与安装：`docs/design/20-env-doctor.md`
 - 密钥策略：`docs/design/30-secrets.md`
+- WebDAV 传输：`docs/design/40-webdav.md`
 - 架构：`docs/design/architecture.md`
 - 构建与分发：`docs/design/build.md`
 - 遗留项：`docs/design/backlog.md`

@@ -1572,7 +1572,6 @@ mod tests {
                         other => panic!("期望 Uploaded，得到 {other:?}"),
                     }
                 }
-                other => panic!("期望 Uploaded 或 Conflict，得到 {other:?}"),
             };
 
         // 同一份内容再传一次：不应该冲突，也不该重传任何文件。

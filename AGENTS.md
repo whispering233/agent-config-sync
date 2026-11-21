@@ -2,7 +2,7 @@
 
 ## 定位
 
-Pi CLI 配置的换机交付工具（不是同步客户端）。设计与决策以 `docs/` 为准，索引见 `docs/docs-map.md`。
+Pi CLI 配置的换机交付工具（手动快照交付，不做实时同步）。设计与决策以 `docs/` 为准，索引见 `docs/docs-map.md`。
 
 ## 不可擅自变更的决策
 
@@ -56,10 +56,13 @@ Pi CLI 配置的换机交付工具（不是同步客户端）。设计与决策�
 ## 验证
 
 ```bash
-cd src-tauri && cargo test      # 期望全绿（当前 163）
+cd src-tauri && cargo test      # 期望全绿（239 通过 + 2 个 ignored 的真机测试）
 cd src-tauri && cargo check
+cd src-tauri && cargo fmt -- --check
 npm run build
 ```
+
+- WebDAV 互通检查需要真实服务器：`DAV_URL=… DAV_USER=… DAV_PASS=… cargo test interop -- --ignored --nocapture`（会覆盖该地址下 `PiAgentSync/` 的内容，只对测试账号跑）。
 
 - 文件遍历、manifest、哈希、密钥扫描、应用/回滚、包/安装必须有单元测试与临时目录夹具。
 - UI 验证交给子代理，条目数给定上限，只报不修。

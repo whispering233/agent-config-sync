@@ -237,8 +237,8 @@ impl<T: DavTransport> WebdavClient<T> {
     }
 
     /// 覆盖超时：生产用常量，单测要毫秒级。
-    // 只有单测调用；生产路径直接走常量，不保留配置入口。
-    #[allow(dead_code)]
+    // 只在测试里存在：生产路径直接用常量，不保留配置入口。
+    #[cfg(test)]
     pub fn with_timeouts(mut self, control: Duration, transfer: Duration) -> Self {
         self.control_timeout = control;
         self.transfer_timeout = transfer;

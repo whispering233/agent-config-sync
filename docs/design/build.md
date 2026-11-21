@@ -66,7 +66,7 @@ release 配置：`strip = true`、`lto = "thin"`（`src-tauri/Cargo.toml`）。�
 
 ```bash
 # 1. deb 依赖声明（应含 libwebkit2gtk-4.1-0）
-dpkg-deb -I "src-tauri/target/release/bundle/deb/Agent Config Sync_0.1.0_amd64.deb" | grep Depends
+dpkg-deb -I "src-tauri/target/release/bundle/deb/Agent Config Sync_0.0.1_amd64.deb" | grep Depends
 
 # 2. 已去符号（应显示 stripped / no symbols）
 file src-tauri/target/release/agent-config-sync

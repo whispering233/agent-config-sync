@@ -409,14 +409,6 @@ mod tests {
         fn path(&self) -> &Path {
             &self.0
         }
-
-        fn write(&self, relative: &str, contents: &str) {
-            let path = self.0.join(relative);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).expect("创建父目录");
-            }
-            fs::write(path, contents).expect("写入夹具文件");
-        }
     }
 
     impl Drop for TempDir {
