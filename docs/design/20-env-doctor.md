@@ -20,7 +20,7 @@
 | `pi.path` | `where`/`command -v pi` + `<agent_dir>/bin/pi` + npm 全局前缀下的入口（POSIX `bin/pi`，Windows `pi.cmd`） | 找到/未找到 | 安装宿主 |
 | `pi.version` | `pi --version`（输出裸版本号，如 `1.5.2`） | 可解析 | 升级宿主 |
 | `pi.install_kind` | 是否存在 `<agent_dir>/install/managed-install.json`；路径是否在 `node_modules` 下 | 托管安装 / npm 安装 / 未知 | 决定升级命令 |
-| `pi.latest` | `npm view @earendil-works/pi-coding-agent version`（需网络，可关闭） | 与本地比较 | 提示升级 |
+| `pi.latest` | 仅点「检查更新」时执行 `npm view @earendil-works/pi-coding-agent version`；10 秒超时，最多 2 并发 | 可解析/未发布/未知 | 提示升级 |
 | `auth` | 对已配置的 provider 执行 `pi auth check --provider <id> --json` | `ready` / `not_ready` / `invalid` | 在终端执行 `pi auth login <provider>` |
 | `packages` | 读 `settings.json` 的 `packages` + 解析 `pi list` 文本；实装条目带版本号（读**宿主目录内**安装目录 `package.json` 的 `version` 字段，读不到或落在宿主目录之外则留空） | 声明与实装一致/缺包 | 一键重装 |
 | `skills.links` | 统计 `skills/` 下的链接类条目与断链（POSIX 符号链接；Windows 符号链接与 junction） | 有断链 | 提示重建 |
@@ -39,7 +39,9 @@
 - **超时**：普通命令 5 秒；`pi auth check` 15 秒；`npm view` 10 秒。超时即判 `unknown`，不重试。超时终止整棵进程树：Windows 用 `taskkill /T /F`（`child.kill()` 只杀 `cmd.exe`，npm 的子进程会残留），POSIX 安装命令按进程组终止。
 - **区分状态**：`found` / `not_found` / `broken`（存在但执行失败）/ `unknown`（超时或输出不可解析）。
 - **不打印密钥**：命令输出在落日志前统一过滤（`sk-`、`Bearer`、`token=` 等模式）。
-- **不并发狂扫**：同时最多 2 个子进程，避免在低配机器上拖慢宿主。
+- **不并发狂扫**：同时最多 2 个子进程，避免在低配机器上拖慢宿主。版本查询也只在这个上限内并发。
+- **最新版本缓存**：结果写入应用配置目录的 `versions-cache.json`，TTL 6 小时；「开始检查」只读缓存，只有「检查更新」才联网。刷新全部失败时保留旧缓存并提示；404/401 记为未发布/未知，不算失败。
+- **只查 npm 源**：`npm:包名` 才查询；git/URL/本地路径标「不适用」；带范围或非精确版本的来源标「未固定」，不拿远端 latest 冒充。
 - **不弹控制台**：GUI 进程起子进程时带 `CREATE_NO_WINDOW`；否则从 Explorer 启动后每次探测都会闪出终端窗口。
 
 ## 4. 报告结构
@@ -56,7 +58,16 @@
       "detail": "from /home/u/.nvm/versions/node/v22.23.0/bin/node",
       "action": null
     }
-  ]
+  ],
+  "latest": {
+    "checkedAt": "2026-11-20T05:30:00Z",
+    "stale": false,
+    "pi": { "version": "1.6.0", "note": null },
+    "packages": {
+      "npm:pi-lens": { "version": "2.1.0", "note": null }
+    },
+    "error": null
+  }
 }
 ```
 

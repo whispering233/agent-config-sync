@@ -24,11 +24,27 @@ type DoctorCheck = {
   action: string | null;
 };
 
+/** 与 Rust 侧 `versions::LatestVersion` 一一对应。 */
+type LatestVersion = {
+  version: string | null;
+  note: string | null;
+};
+
+/** 与 Rust 侧 `versions::LatestVersions` 一一对应。 */
+type LatestVersions = {
+  checkedAt: string | null;
+  stale: boolean;
+  pi: LatestVersion | null;
+  packages: Record<string, LatestVersion>;
+  error: string | null;
+};
+
 /** 与 Rust 侧 `doctor::DoctorReport` 一一对应。 */
 type DoctorReport = {
   generatedAt: string;
   platform: { os: string; arch: string };
   checks: DoctorCheck[];
+  latest: LatestVersions;
 };
 
 type RunState =
@@ -117,8 +133,8 @@ type InstallRunState =
   | { kind: 'done'; result: InstallResult }
   | { kind: 'failed'; message: string };
 
-function runDoctorCheck(): Promise<DoctorReport> {
-  return invoke<DoctorReport>('run_check');
+function runDoctorCheck(refreshVersions = false): Promise<DoctorReport> {
+  return invoke<DoctorReport>('run_check', { refreshVersions });
 }
 
 function loadInstallPreview(): Promise<InstallPreview> {
@@ -148,6 +164,7 @@ const checkLabels: Record<string, string> = {
   npm: 'npm',
   'pi.path': 'Pi 路径',
   'pi.version': 'Pi 版本',
+  'pi.latest': 'Pi 最新版本',
   'pi.install_kind': '安装方式',
   packages: '扩展包',
   'skills.links': '技能链接',
@@ -291,10 +308,10 @@ export function DoctorPage() {
     }
   }, []);
 
-  async function handleRun() {
+  async function handleRun(refreshVersions = false) {
     setState({ kind: 'running' });
     try {
-      const report = await runDoctorCheck();
+      const report = await runDoctorCheck(refreshVersions);
       setState({ kind: 'ready', report });
     } catch (error) {
       setState({ kind: 'failed', message: errorMessage(error) });
@@ -317,7 +334,7 @@ export function DoctorPage() {
       const result = await runInstallCommand(command.action);
       setInstallRun({ kind: 'done', result });
       if (result.status === 'succeeded') {
-        await handleRun();
+        await handleRun(false);
         await refreshPreview();
       }
     } catch (error) {
@@ -336,8 +353,18 @@ export function DoctorPage() {
 
       <Card className="p-lg">
         <div className="flex flex-wrap items-center gap-md">
-          <Button onClick={handleRun} disabled={!isDesktop || state.kind === 'running'}>
+          <Button
+            onClick={() => void handleRun(false)}
+            disabled={!isDesktop || state.kind === 'running'}
+          >
             {state.kind === 'running' ? '检查中…' : '开始检查'}
+          </Button>
+          <Button
+            variant="secondary"
+            onClick={() => void handleRun(true)}
+            disabled={!isDesktop || state.kind === 'running'}
+          >
+            检查更新
           </Button>
           {!isDesktop && (
             <span className="text-sm text-muted-foreground">仅桌面版可用</span>
@@ -366,6 +393,15 @@ export function DoctorPage() {
             {state.report.generatedAt}
           </p>
         )}
+        {state.kind === 'ready' && state.report.latest.error !== null && (
+          <p className="mt-xs text-xs text-warning">{state.report.latest.error}</p>
+        )}
+        {state.kind === 'ready' && state.report.latest.checkedAt !== null && (
+          <p className="mt-xs text-xs text-muted-foreground">
+            最新版本缓存于 {state.report.latest.checkedAt}
+            {state.report.latest.stale && '（已超过 6 小时，点“检查更新”刷新）'}
+          </p>
+        )}
       </Card>
 
       <InstallCard
@@ -377,7 +413,7 @@ export function DoctorPage() {
         onConfirm={(command) => void handleInstall(command)}
       />
 
-      <PackagesCard />
+      <PackagesCard latest={state.kind === 'ready' ? state.report.latest : null} />
 
       {state.kind === 'idle' && (
         <Card className="p-lg text-center">
@@ -609,7 +645,7 @@ function InstallCard({
   );
 }
 
-function PackagesCard() {
+function PackagesCard({ latest }: { latest: LatestVersions | null }) {
   const [view, setView] = useState<PackageViewState>(
     isDesktop ? { kind: 'loading' } : { kind: 'browser' },
   );
@@ -702,14 +738,25 @@ function PackagesCard() {
           {status.installed.length > 0 && (
             <PackageList
               title="实装"
-              items={status.installed.map((item, index) => ({
-                key: `${index}-${item.source}`,
-                text:
-                  item.version === null
-                    ? item.source
-                    : `${item.source} · ${item.version}`,
-                sub: item.path === '' ? undefined : item.path,
-              }))}
+              items={status.installed.map((item, index) => {
+                const remote = latest?.packages[item.source];
+                const remoteText =
+                  remote === undefined
+                    ? ''
+                    : remote.version !== null
+                      ? ` · 最新 ${remote.version}`
+                      : remote.note !== null
+                        ? ` · ${remote.note}`
+                        : '';
+                return {
+                  key: `${index}-${item.source}`,
+                  text:
+                    (item.version === null
+                      ? item.source
+                      : `${item.source} · ${item.version}`) + remoteText,
+                  sub: item.path === '' ? undefined : item.path,
+                };
+              })}
             />
           )}
 

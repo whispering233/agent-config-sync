@@ -6,6 +6,7 @@
 
 use crate::config::{self, AGENT_DIR_ENV_VAR};
 use crate::platform::{self, HostOs, ProgramPath};
+use crate::versions::{self, LatestVersions};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -64,6 +65,8 @@ pub struct DoctorReport {
     pub generated_at: String,
     pub platform: Platform,
     pub checks: Vec<Check>,
+    /// 最新版本只在用户点「检查更新」时刷新；其余时间来自缓存。
+    pub latest: LatestVersions,
 }
 
 /// 一次 shell 命令的执行结果。`Failed` 也保留 stdout，便于取回已打印的探测段。
@@ -1348,7 +1351,18 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 /// 执行一次完整检查。只读：只有读文件与读命令输出。`host` 由调用方给定：
 /// 生产传 [`HostOs::current`]，单测显式指定，这样两条命令形态在任意平台上都能断言。
+#[cfg(test)]
 pub fn check(agent_dir: Option<&Path>, runner: &dyn CommandRunner, host: HostOs) -> DoctorReport {
+    check_with_latest(agent_dir, runner, host, LatestVersions::default())
+}
+
+/// 与 [`check`] 相同，但把缓存/新查到的版本写进报告。
+pub fn check_with_latest(
+    agent_dir: Option<&Path>,
+    runner: &dyn CommandRunner,
+    host: HostOs,
+    latest: LatestVersions,
+) -> DoctorReport {
     let mut checks = vec![platform_check(), agent_dir_check(agent_dir)];
 
     // 子进程串行执行：同时最多 2 个的上限自然满足，也不会拖慢宿主。
@@ -1358,6 +1372,9 @@ pub fn check(agent_dir: Option<&Path>, runner: &dyn CommandRunner, host: HostOs)
     checks.extend(npm_checks(&probes.npm));
     let (pi, pi_path, pi_list) = pi_checks(&probes.pi);
     checks.extend(pi);
+    if let Some(check) = latest_pi_check(&latest) {
+        checks.push(check);
+    }
     checks.push(install_kind_check(agent_dir, pi_path.as_deref()));
     checks.extend(auth_checks(agent_dir, pi_path.as_deref(), runner, host));
     checks.push(packages_check(agent_dir, pi_list.as_deref()));
@@ -1367,11 +1384,26 @@ pub fn check(agent_dir: Option<&Path>, runner: &dyn CommandRunner, host: HostOs)
         generated_at: iso8601_now(),
         platform: platform(),
         checks,
+        latest,
+    }
+}
+
+fn latest_pi_check(latest: &LatestVersions) -> Option<Check> {
+    match latest.pi.as_ref() {
+        Some(item) => Some(match item.version.as_deref() {
+            Some(version) => pass("pi.latest", Some(version.to_string()), item.note.clone()),
+            None => unknown("pi.latest", item.note.as_deref().unwrap_or("最新版本未知")),
+        }),
+        // 没有缓存时不冒出一行「未知」，避免把「还没查过」算进环境异常。
+        None => latest
+            .error
+            .as_deref()
+            .map(|error| unknown("pi.latest", error)),
     }
 }
 
 /// command 层入口：解析出生效宿主目录后跑一次检查。
-fn probe(app: &tauri::AppHandle) -> Result<DoctorReport, String> {
+fn probe(app: &tauri::AppHandle, refresh_versions: bool) -> Result<DoctorReport, String> {
     use tauri::Manager;
 
     let config_dir = app
@@ -1383,18 +1415,46 @@ fn probe(app: &tauri::AppHandle) -> Result<DoctorReport, String> {
     let home_dir = app.path().home_dir().ok();
     let resolved =
         config::resolve_agent_dir(&config, env_agent_dir.as_deref(), home_dir.as_deref());
+    let runner = ShellRunner::from_env();
+    let host = HostOs::current();
+    let cache_path = config_dir.join(versions::CACHE_FILE_NAME);
 
-    Ok(check(
+    // 默认只读缓存；只有 refresh_versions 为真时才启动最多两个 npm 查询。
+    let latest = if refresh_versions {
+        let mut sources = BTreeSet::new();
+        if let Some(agent_dir) = resolved.path.as_deref() {
+            if let Ok(status) = crate::packages::status(agent_dir, &runner, host) {
+                sources.extend(
+                    status
+                        .declared
+                        .iter()
+                        .filter(|item| item.enabled)
+                        .map(|item| item.source.clone()),
+                );
+                sources.extend(status.installed.iter().map(|item| item.source.clone()));
+            }
+        }
+        let sources: Vec<String> = sources.into_iter().collect();
+        versions::load_or_query(&cache_path, &sources, &runner, host, true)
+    } else {
+        versions::load_cache(&cache_path).unwrap_or_default()
+    };
+
+    Ok(check_with_latest(
         resolved.path.as_deref(),
-        &ShellRunner::from_env(),
-        HostOs::current(),
+        &runner,
+        host,
+        latest,
     ))
 }
 
 /// 子进程会阻塞 5 到 15 秒，放阻塞线程池，别占住 UI 线程。
 #[tauri::command]
-pub async fn run_check(app: tauri::AppHandle) -> Result<DoctorReport, String> {
-    tauri::async_runtime::spawn_blocking(move || probe(&app))
+pub async fn run_check(
+    app: tauri::AppHandle,
+    refresh_versions: bool,
+) -> Result<DoctorReport, String> {
+    tauri::async_runtime::spawn_blocking(move || probe(&app, refresh_versions))
         .await
         .map_err(|error| format!("环境检测失败：{error}"))?
 }
@@ -1784,6 +1844,35 @@ mod tests {
 
         assert_eq!(find(&report, "auth").status, CheckStatus::Unknown);
         assert!(find(&report, "auth").detail.is_some());
+    }
+
+    #[test]
+    fn latest_pi_check_uses_available_version_and_notes() {
+        let available = LatestVersions {
+            pi: Some(crate::versions::LatestVersion {
+                version: Some("9.9.9".to_string()),
+                note: None,
+            }),
+            ..LatestVersions::default()
+        };
+        let check = latest_pi_check(&available).expect("有最新版时应输出检查项");
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(check.value.as_deref(), Some("9.9.9"));
+
+        let unavailable = LatestVersions {
+            pi: Some(crate::versions::LatestVersion {
+                version: None,
+                note: Some("查询超时（10 秒），未知".to_string()),
+            }),
+            ..LatestVersions::default()
+        };
+        let unavailable = latest_pi_check(&unavailable).expect("查询失败时应输出检查项");
+        assert_eq!(unavailable.status, CheckStatus::Unknown);
+        assert_eq!(
+            unavailable.detail.as_deref(),
+            Some("查询超时（10 秒），未知")
+        );
+        assert!(latest_pi_check(&LatestVersions::default()).is_none());
     }
 
     #[test]

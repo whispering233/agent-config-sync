@@ -17,6 +17,7 @@ mod scope;
 mod secrets;
 mod snapshot;
 mod tray;
+mod versions;
 mod webdav;
 mod webdav_transfer;
 
