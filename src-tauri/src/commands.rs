@@ -4,6 +4,7 @@ use crate::config::{
     self, AppConfig, ConfigError, ConfigValidation, AGENT_DIR_ENV_VAR, CONFIG_FILE_NAME,
 };
 use crate::credentials::{self, CredentialError, WebdavCredentials};
+use crate::webdav::{self, DavError, ReqwestTransport, WebdavClient};
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
@@ -107,6 +108,59 @@ pub fn save_webdav_credentials(
         .map_err(credential_error)?;
 
     Ok(webdav_summary(Some(&saved)))
+}
+
+/// 连接探测的结论。只回答「目录是否本次新建」与「写测试文件是否残留」。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebdavProbeView {
+    created: bool,
+    leftover_write_test_file: bool,
+}
+
+/// 协议错误 → 设置页能用的一句话。设置页只展示文字，不再造一层错误码。
+fn dav_error(error: DavError) -> String {
+    match error {
+        DavError::AuthFailed => "认证失败：凭据无效或权限不足".to_string(),
+        DavError::Unreachable(detail) => format!("无法连接：{detail}"),
+        DavError::Quota => "远端空间或流量不足，无法写入测试文件".to_string(),
+        DavError::Other(detail) => detail,
+    }
+}
+
+/// 凭据模块的文案是给保存流程写的：探测时用户可能只是还没填，换成测试场景的说法。
+fn probe_credential_error(error: CredentialError) -> String {
+    match error {
+        CredentialError::MissingPassword => "还没有保存过 WebDAV 密码，请填写后再测试".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// 用当前表单值试一次：不保存凭据；密码留空时借用已存值，与保存语义一致。
+#[tauri::command]
+pub async fn test_webdav_connection(
+    app: AppHandle,
+    url: String,
+    username: String,
+    password: Option<String>,
+) -> Result<WebdavProbeView, String> {
+    // 控制超时 30s、传输超时 120s 都是阻塞等待，留在 UI 线程会冻住窗口。
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = app_data_dir(&app)?;
+        let credentials = credentials::resolve(&dir, &url, &username, password.as_deref())
+            .map_err(probe_credential_error)?;
+        let transport = ReqwestTransport::new(&credentials.username, &credentials.password)
+            .map_err(dav_error)?;
+        let outcome =
+            webdav::probe(&WebdavClient::new(transport, &credentials.url)).map_err(dav_error)?;
+
+        Ok(WebdavProbeView {
+            created: outcome.created,
+            leftover_write_test_file: outcome.leftover_write_test_file,
+        })
+    })
+    .await
+    .map_err(|error| format!("测试连接失败：{error}"))?
 }
 
 #[tauri::command]

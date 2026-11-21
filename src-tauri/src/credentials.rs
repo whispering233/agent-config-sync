@@ -80,7 +80,10 @@ impl fmt::Display for CredentialError {
             }
             CredentialError::MissingUsername => write!(formatter, "WebDAV 用户名不能为空"),
             CredentialError::MissingPassword => {
-                write!(formatter, "还没有保存过 WebDAV 密码，请填写后再保存")
+                write!(
+                    formatter,
+                    "没有可沿用的 WebDAV 密码，请填写应用密码（更换地址或用户名后需重新填写）"
+                )
             }
         }
     }
@@ -185,6 +188,42 @@ fn is_http_url(url: &str) -> bool {
     !host.is_empty() && !host.contains(char::is_whitespace)
 }
 
+/// 解析一次网络请求要用的凭据：空密码等于沿用已存值，与 [`upsert`] 的保存语义一致。
+///
+/// 与 `upsert` 分开是因为探测不该落盘：它只借已存密码，不写文件。
+/// 端点等价：只忽略尾部斜杠；地址或用户名变了就不能沿用旧密码。
+fn same_endpoint(left: &str, right: &str) -> bool {
+    left.trim_end_matches('/') == right.trim_end_matches('/')
+}
+
+pub fn resolve(
+    dir: &Path,
+    url: &str,
+    username: &str,
+    password: Option<&str>,
+) -> Result<WebdavCredentials, CredentialError> {
+    let (url, username) = validate(url, username)?;
+
+    let password = match password.map(str::trim) {
+        Some(value) if !value.is_empty() => value.to_string(),
+        _ => match load(dir)? {
+            // 只在端点未变时沿用旧密码：否则“换个地址 + 密码留空”会把旧密码发给新主机。
+            Some(stored)
+                if same_endpoint(&stored.url, &url) && stored.username == username =>
+            {
+                stored.password
+            }
+            _ => return Err(CredentialError::MissingPassword),
+        },
+    };
+
+    Ok(WebdavCredentials {
+        url,
+        username,
+        password,
+    })
+}
+
 /// 保存或更新凭据：空密码等于保留原值，避免只改地址就把密码清掉。
 pub fn upsert(
     dir: &Path,
@@ -192,22 +231,7 @@ pub fn upsert(
     username: &str,
     password: Option<&str>,
 ) -> Result<WebdavCredentials, CredentialError> {
-    let (url, username) = validate(url, username)?;
-    let existing = load(dir)?;
-
-    let password = match password.map(str::trim) {
-        Some(value) if !value.is_empty() => value.to_string(),
-        _ => match existing.as_ref() {
-            Some(credentials) => credentials.password.clone(),
-            None => return Err(CredentialError::MissingPassword),
-        },
-    };
-
-    let credentials = WebdavCredentials {
-        url,
-        username,
-        password,
-    };
+    let credentials = resolve(dir, url, username, password)?;
     save(dir, &credentials)?;
 
     Ok(credentials)
@@ -353,14 +377,9 @@ mod tests {
         save(dir.path(), &sample()).expect("保存应成功");
 
         for password in [None, Some(""), Some("   ")] {
-            let saved = upsert(
-                dir.path(),
-                "https://example.com/dav",
-                "someone",
-                password,
-            )
-            .expect("保存应成功");
-            assert_eq!(saved.url, "https://example.com/dav");
+            let saved = upsert(dir.path(), &sample().url, &sample().username, password)
+                .expect("保存应成功");
+            assert_eq!(saved.url, sample().url);
             assert_eq!(saved.password, sample().password);
         }
     }
@@ -373,6 +392,75 @@ mod tests {
         upsert(dir.path(), "https://example.com/dav", "someone", Some("next"))
             .expect("保存应成功");
         assert_eq!(load(dir.path()).unwrap().unwrap().password, "next");
+    }
+
+    #[test]
+    fn resolve_borrows_the_saved_password_without_writing() {
+        let dir = TempDir::new("resolve-keep");
+        save(dir.path(), &sample()).expect("保存应成功");
+
+        let resolved = resolve(dir.path(), " https://dav.jianguoyun.com/dav ", " someone@example.com ", Some("  "))
+            .expect("应沿用已存密码");
+
+        assert_eq!(resolved.url, "https://dav.jianguoyun.com/dav");
+        assert_eq!(resolved.username, "someone@example.com");
+        assert_eq!(resolved.password, sample().password);
+        // 探测不落盘：文件仍是探测前的内容。
+        assert_eq!(load(dir.path()).unwrap(), Some(sample()));
+    }
+
+    #[test]
+    fn resolve_does_not_reuse_password_for_another_host() {
+        let dir = TempDir::new("resolve-host");
+        save(dir.path(), &sample()).expect("保存应成功");
+
+        let error = resolve(dir.path(), "https://evil.example/dav", "someone@example.com", None)
+            .expect_err("换了主机就不能沿用旧密码");
+        assert!(matches!(error, CredentialError::MissingPassword));
+    }
+
+    #[test]
+    fn resolve_does_not_reuse_password_for_another_username() {
+        let dir = TempDir::new("resolve-user");
+        save(dir.path(), &sample()).expect("保存应成功");
+
+        let error = resolve(dir.path(), "https://dav.jianguoyun.com/dav", "another@example.com", None)
+            .expect_err("换了用户名就不能沿用旧密码");
+        assert!(matches!(error, CredentialError::MissingPassword));
+    }
+
+    #[test]
+    fn resolve_tolerates_trailing_slash_when_reusing_password() {
+        let dir = TempDir::new("resolve-slash");
+        save(dir.path(), &sample()).expect("保存应成功");
+
+        let resolved = resolve(dir.path(), "https://dav.jianguoyun.com/dav/", "someone@example.com", None)
+            .expect("仅尾斜杠不同应沿用旧密码");
+        assert_eq!(resolved.password, sample().password);
+    }
+
+    #[test]
+    fn resolve_prefers_the_given_password() {
+        let dir = TempDir::new("resolve-new");
+        save(dir.path(), &sample()).expect("保存应成功");
+
+        let resolved = resolve(dir.path(), "https://example.com/dav", "someone", Some(" next "))
+            .expect("应使用传入密码");
+
+        assert_eq!(resolved.password, "next");
+        assert_eq!(load(dir.path()).unwrap(), Some(sample()));
+    }
+
+    #[test]
+    fn resolve_without_any_password_is_rejected() {
+        let dir = TempDir::new("resolve-missing");
+
+        for password in [None, Some("")] {
+            let error = resolve(dir.path(), "https://example.com/dav", "someone", password)
+                .expect_err("无密码应报错");
+            assert!(matches!(error, CredentialError::MissingPassword));
+        }
+        assert!(!dir.join(WEBDAV_FILE_NAME).exists());
     }
 
     #[test]

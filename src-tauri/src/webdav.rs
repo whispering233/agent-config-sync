@@ -224,6 +224,8 @@ impl<T: DavTransport> WebdavClient<T> {
     }
 
     /// 覆盖超时：生产用常量，单测要毫秒级。
+    // 只有单测调用；生产路径直接走常量，不保留配置入口。
+    #[allow(dead_code)]
     pub fn with_timeouts(mut self, control: Duration, transfer: Duration) -> Self {
         self.control_timeout = control;
         self.transfer_timeout = transfer;
@@ -319,6 +321,8 @@ impl<T: DavTransport> WebdavClient<T> {
     }
 
     /// 下载文件：404 → `Ok(None)`；成功时连响应头的 ETag 一起返回。
+    // 下载还没接到 UI（当前只有上传方向的探测与导出）；接线时连同 header_value 一并启用。
+    #[allow(dead_code)]
     pub fn get(&self, rel: &str) -> Result<Option<(Vec<u8>, Option<String>)>, DavError> {
         let response = self.transport.send(DavRequest {
             method: "GET".to_string(),
@@ -365,6 +369,47 @@ impl<T: DavTransport> WebdavClient<T> {
     }
 }
 
+/// 写权限测试用的临时文件名。落在工作根下，探测结束即删。
+const WRITE_TEST_FILE: &str = ".tmp-writetest";
+
+/// 一次连接探测的结论：地址、凭据、读权限、写权限是否都可用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeOutcome {
+    /// 本次探测新建了工作根目录。
+    pub created: bool,
+    /// 写权限测试文件没能删掉：只读账号常见，但读写本身已经验证，所以不算失败。
+    pub leftover_write_test_file: bool,
+}
+
+/// 探测地址、凭据与写权限：工作根存在（必要时创建）→ 写测试文件 → 删测试文件。
+///
+/// 只读不写的账号在删除这一步失败，仍返回成功并标记残留：
+/// 用户需要知道「能连、但删不掉东西」，而不是被一句认证失败挡住。
+pub fn probe<T: DavTransport>(client: &WebdavClient<T>) -> Result<ProbeOutcome, DavError> {
+    let created = match client.propfind("")? {
+        Some(_) => false,
+        None => {
+            let created = client.mkcol("")?;
+            // 有的服务端对 MKCOL 回 2xx 却没建出来：不在这里拦住，后面的 PUT 会以 404 失败，
+            // 用户看到的就是一个对不上原因的错误。
+            if client.propfind("")?.is_none() {
+                return Err(DavError::Other(format!(
+                    "工作目录不存在且创建失败：{}",
+                    client.root()
+                )));
+            }
+            created
+        }
+    };
+
+    client.put(WRITE_TEST_FILE, b"ok", &[])?;
+
+    Ok(ProbeOutcome {
+        created,
+        leftover_write_test_file: client.delete(WRITE_TEST_FILE).is_err(),
+    })
+}
+
 /// `PROPFIND` 只说清楚要哪几项，免得服务端回一大堆用不上的属性。
 const PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getcontentlength/></d:prop></d:propfind>"#;
@@ -391,6 +436,8 @@ fn looks_like_quota(body: &[u8]) -> bool {
 }
 
 /// 响应头按名字取值，大小写不敏感。
+// 只服务 get：两处会在下载接线时一起启用。
+#[allow(dead_code)]
 fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
     headers
         .iter()
@@ -796,6 +843,12 @@ mod tests {
     const EMPTY_MULTISTATUS: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:multistatus xmlns:d="DAV:"></d:multistatus>"#;
 
+    /// 存在但没有子项的工作根：服务端仍会把集合自身列出来。
+    const ROOT_ONLY_MULTISTATUS: &str = r#"<d:multistatus xmlns:d="DAV:"><d:response>
+    <d:href>/dav/PiAgentSync/</d:href>
+    <d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop></d:propstat>
+</d:response></d:multistatus>"#;
+
     const MIXED_MULTISTATUS: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:multistatus xmlns:d="DAV:">
   <d:response>
@@ -1151,6 +1204,127 @@ mod tests {
             transport.last().url,
             "https://dav.example.com/dav/PiAgentSync/snapshot/%E9%85%8D%E7%BD%AE%20%E6%96%87%E4%BB%B6.json"
         );
+    }
+
+    fn probe_responses_with_delete(delete: u16) -> Vec<Result<DavResponse, DavError>> {
+        vec![
+            Ok(response_with(207, Vec::new(), MIXED_MULTISTATUS.as_bytes())),
+            Ok(response(201)),
+            Ok(response(delete)),
+        ]
+    }
+
+    #[test]
+    fn probe_creates_missing_work_root() {
+        let (client, transport) = client(vec![
+            Ok(response(404)),
+            Ok(response(201)),
+            Ok(response_with(207, Vec::new(), ROOT_ONLY_MULTISTATUS.as_bytes())),
+            Ok(response(201)),
+            Ok(response(204)),
+        ]);
+
+        let outcome = probe(&client).expect("探测应成功");
+
+        assert_eq!(
+            outcome,
+            ProbeOutcome {
+                created: true,
+                leftover_write_test_file: false,
+            }
+        );
+
+        let requests = transport.requests();
+        let methods: Vec<&str> = requests
+            .iter()
+            .map(|request| request.method.as_str())
+            .collect();
+        assert_eq!(methods, vec!["PROPFIND", "MKCOL", "PROPFIND", "PUT", "DELETE"]);
+        assert_eq!(
+            requests[1].url,
+            "https://dav.example.com/dav/PiAgentSync"
+        );
+        assert_eq!(
+            requests[3].url,
+            "https://dav.example.com/dav/PiAgentSync/.tmp-writetest"
+        );
+        assert_eq!(requests[3].body.as_deref(), Some(&b"ok"[..]));
+        assert!(requests[3].headers.is_empty(), "写测试文件不该带条件头");
+    }
+
+    #[test]
+    fn probe_reuses_existing_work_root_without_mkcol() {
+        let (client, transport) = client(probe_responses_with_delete(204));
+
+        let outcome = probe(&client).expect("探测应成功");
+
+        assert_eq!(
+            outcome,
+            ProbeOutcome {
+                created: false,
+                leftover_write_test_file: false,
+            }
+        );
+
+        let methods: Vec<String> = transport
+            .requests()
+            .into_iter()
+            .map(|request| request.method)
+            .collect();
+        assert_eq!(methods, vec!["PROPFIND", "PUT", "DELETE"]);
+    }
+
+    #[test]
+    fn probe_reports_leftover_write_test_file_when_delete_is_forbidden() {
+        let (client, _) = client(probe_responses_with_delete(403));
+
+        let outcome = probe(&client).expect("删除失败不该整体失败");
+
+        assert_eq!(
+            outcome,
+            ProbeOutcome {
+                created: false,
+                leftover_write_test_file: true,
+            }
+        );
+    }
+
+    #[test]
+    fn probe_maps_401_to_auth_failed() {
+        let (client, _) = client(vec![Ok(response(401))]);
+
+        assert_eq!(probe(&client), Err(DavError::AuthFailed));
+    }
+
+    #[test]
+    fn probe_fails_when_created_root_is_still_missing() {
+        let (client, _) = client(vec![
+            Ok(response(404)),
+            Ok(response(201)),
+            Ok(response_with(207, Vec::new(), EMPTY_MULTISTATUS.as_bytes())),
+        ]);
+
+        match probe(&client) {
+            Err(DavError::Other(detail)) => {
+                assert!(detail.contains("工作目录不存在且创建失败"), "{detail}");
+            }
+            other => panic!("期望 Other，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_does_not_claim_creation_when_mkcol_says_it_exists() {
+        let (client, _) = client(vec![
+            Ok(response(404)),
+            Ok(response(405)),
+            Ok(response_with(207, Vec::new(), ROOT_ONLY_MULTISTATUS.as_bytes())),
+            Ok(response(201)),
+            Ok(response(204)),
+        ]);
+
+        let outcome = probe(&client).expect("探测应成功");
+
+        assert!(!outcome.created);
     }
 
     #[test]
