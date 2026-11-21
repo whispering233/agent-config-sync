@@ -13,6 +13,9 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+# WebDAV 必须是后台线程里的同步调用：阻塞客户端最贴合，默认 feature 已是 rustls +
+# 平台根证书 + 系统代理，不引 native-tls。
+reqwest = { version = "0.13", features = ["blocking"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
