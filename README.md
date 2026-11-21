@@ -79,3 +79,7 @@ npm run tauri build -- --bundles deb,appimage
 - 架构：`docs/design/architecture.md`
 - 构建与分发：`docs/design/build.md`
 - 遗留项：`docs/design/backlog.md`
+
+## 许可证
+
+MIT，见 [LICENSE](LICENSE)。
