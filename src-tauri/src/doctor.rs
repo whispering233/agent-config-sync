@@ -1112,7 +1112,7 @@ fn probe(app: &tauri::AppHandle) -> Result<DoctorReport, String> {
 pub async fn run_check(app: tauri::AppHandle) -> Result<DoctorReport, String> {
     tauri::async_runtime::spawn_blocking(move || probe(&app))
         .await
-        .map_err(|error| format!("医生检查失败：{error}"))?
+        .map_err(|error| format!("环境检测失败：{error}"))?
 }
 
 #[cfg(test)]
