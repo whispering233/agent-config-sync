@@ -1372,14 +1372,15 @@ mod tests {
         fs::create_dir_all(&sync_root).expect("创建同步目录");
         crate::snapshot::export(&agent, &sync_root).expect("导出快照");
         // 导出之后才出现的链接：快照里没有它，只能删链接本身。
-        symlink(temp.path().join("outside"), agent.join("extra")).expect("创建目录链接");
+        fs::create_dir_all(agent.join("skills")).expect("创建 skills");
+        symlink(temp.path().join("outside"), agent.join("skills/extra")).expect("创建目录链接");
 
         let expected = fingerprint(&agent, &sync_root);
         let report = apply(
             &agent,
             &sync_root,
             &expected,
-            &["extra".to_string()],
+            &["skills/extra".to_string()],
             &data,
             &FakeRunner::ok(),
             &PlatformLinkCreator,
@@ -1388,7 +1389,7 @@ mod tests {
 
         assert_eq!(report.deleted, 1);
         assert!(
-            fs::symlink_metadata(agent.join("extra")).is_err(),
+            fs::symlink_metadata(agent.join("skills/extra")).is_err(),
             "链接本身被删掉"
         );
         assert_eq!(
@@ -1401,14 +1402,14 @@ mod tests {
             crate::rollback::restore(&agent, &data, &report.backup_id, true).expect("回滚应成功");
         assert!(restore.warnings.is_empty(), "{:?}", restore.warnings);
         assert!(
-            fs::symlink_metadata(agent.join("extra"))
+            fs::symlink_metadata(agent.join("skills/extra"))
                 .expect("链接回来了")
                 .file_type()
                 .is_symlink(),
             "回滚按记录重建链接"
         );
         assert_eq!(
-            fs::read_link(agent.join("extra")).expect("读链接"),
+            fs::read_link(agent.join("skills/extra")).expect("读链接"),
             temp.path().join("outside"),
             "链接目标不变"
         );
