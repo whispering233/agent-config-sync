@@ -68,7 +68,7 @@ pub fn is_excluded_relative(relative: &Path) -> bool {
 }
 
 /// 根级纳入判定：白名单文件、白名单目录、其余根级 `*.json`。
-pub fn is_included_root_name(name: &str) -> bool {
+fn is_included_root_name(name: &str) -> bool {
     INCLUDED_ROOT_FILES.contains(&name)
         || INCLUDED_ROOT_DIRS.contains(&name)
         || Path::new(name).extension().is_some_and(|ext| ext == "json")
