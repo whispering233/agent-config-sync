@@ -66,7 +66,7 @@ pub struct AlignReport {
 /// 比对声明与实装。只读：读 `settings.json` 并执行一次 `pi list`。
 pub fn status(agent_dir: &Path, runner: &dyn CommandRunner) -> Result<PackageStatus, String> {
     let declared = declared_packages(agent_dir)?;
-    let installed = installed_packages(runner)?;
+    let installed = installed_packages(agent_dir, runner)?;
 
     // 只有启用的声明算「应当装」；disabled 的包只展示，不自动装回来。
     let installed_sources: BTreeSet<&str> =
@@ -143,7 +143,10 @@ fi"#
     .to_string()
 }
 
-fn installed_packages(runner: &dyn CommandRunner) -> Result<Vec<InstalledPackage>, String> {
+fn installed_packages(
+    agent_dir: &Path,
+    runner: &dyn CommandRunner,
+) -> Result<Vec<InstalledPackage>, String> {
     let stdout = match runner.run(&pi_list_script(), doctor::PROBE_TIMEOUT, &[]) {
         CommandOutcome::Ok { stdout, .. } | CommandOutcome::Failed { stdout, .. } => stdout,
         CommandOutcome::Timeout => {
@@ -160,20 +163,27 @@ fn installed_packages(runner: &dyn CommandRunner) -> Result<Vec<InstalledPackage
 
     parse_user_packages(&stdout).map(|mut installed| {
         for item in &mut installed {
-            item.version = installed_package_version(&item.path);
+            item.version = installed_package_version(agent_dir, &item.path);
         }
         installed
     })
 }
 
-/// 版本号读自安装目录的 `package.json`；路径为空、文件缺失、解析失败或字段缺失都返回 `None`。
+/// 版本号读自安装目录的 `package.json`。
 ///
+/// `pi list` 也会列出 git 源等落在宿主目录之外的包，而受管范围之外的文件不读取内容，
+/// 所以先确认安装路径在宿主目录内，否则版本留空。
 /// 单个包读不到版本不应让整次状态读取失败，因此这里把错误全部折成 `None`。
-fn installed_package_version(path: &str) -> Option<String> {
+fn installed_package_version(agent_dir: &Path, path: &str) -> Option<String> {
     if path.is_empty() {
         return None;
     }
-    let text = fs::read_to_string(Path::new(path).join("package.json")).ok()?;
+    let root = fs::canonicalize(agent_dir).ok()?;
+    let install_dir = fs::canonicalize(path).ok()?;
+    if !install_dir.starts_with(&root) {
+        return None;
+    }
+    let text = fs::read_to_string(install_dir.join("package.json")).ok()?;
     let manifest: serde_json::Value = serde_json::from_str(&text).ok()?;
     manifest
         .get("version")
@@ -572,7 +582,7 @@ mod tests {
         let install_dir = manifest_path.parent().unwrap().to_str().unwrap();
         let list = user_list(&[("npm:pi-lens", install_dir)]);
 
-        let installed = installed_packages(&FakeProbe::list(&list)).unwrap();
+        let installed = installed_packages(dir.path(), &FakeProbe::list(&list)).unwrap();
 
         assert_eq!(installed.len(), 1);
         assert_eq!(installed[0].version.as_deref(), Some("1.4.2"));
@@ -586,7 +596,7 @@ mod tests {
         fs::create_dir_all(&install_dir).unwrap();
         let list = user_list(&[("npm:pi-lens", install_dir.to_str().unwrap())]);
 
-        let installed = installed_packages(&FakeProbe::list(&list)).unwrap();
+        let installed = installed_packages(dir.path(), &FakeProbe::list(&list)).unwrap();
 
         assert_eq!(installed[0].version, None);
     }
@@ -601,18 +611,44 @@ mod tests {
         let install_dir = manifest_path.parent().unwrap().to_str().unwrap();
         let list = user_list(&[("npm:pi-lens", install_dir)]);
 
-        let installed = installed_packages(&FakeProbe::list(&list)).unwrap();
+        let installed = installed_packages(dir.path(), &FakeProbe::list(&list)).unwrap();
 
         assert_eq!(installed[0].version, None);
     }
 
     #[test]
     fn installed_version_with_empty_path_is_none() {
+        let dir = TempDir::new("installed-empty-path");
         let list = user_list(&[("npm:pi-lens", "")]);
 
-        let installed = installed_packages(&FakeProbe::list(&list)).unwrap();
+        let installed = installed_packages(dir.path(), &FakeProbe::list(&list)).unwrap();
 
         assert_eq!(installed[0].path, "");
+        assert_eq!(installed[0].version, None);
+    }
+
+    #[test]
+    fn installed_version_outside_agent_dir_is_none() {
+        let agent = TempDir::new("installed-agent-scope");
+        let elsewhere = TempDir::new("installed-elsewhere");
+        let manifest_path = elsewhere.write("package.json", r#"{"version":"9.9.9"}"#);
+        let install_dir = manifest_path.parent().unwrap().to_str().unwrap();
+        let list = user_list(&[("git:elsewhere", install_dir)]);
+
+        let installed = installed_packages(agent.path(), &FakeProbe::list(&list)).unwrap();
+
+        assert_eq!(installed[0].version, None, "宿主目录之外的包不读内容");
+    }
+
+    #[test]
+    fn installed_version_with_invalid_manifest_is_none() {
+        let dir = TempDir::new("installed-bad-json");
+        let manifest_path = dir.write("npm/node_modules/pi-lens/package.json", "{");
+        let install_dir = manifest_path.parent().unwrap().to_str().unwrap();
+        let list = user_list(&[("npm:pi-lens", install_dir)]);
+
+        let installed = installed_packages(dir.path(), &FakeProbe::list(&list)).unwrap();
+
         assert_eq!(installed[0].version, None);
     }
 

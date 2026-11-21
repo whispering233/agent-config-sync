@@ -22,7 +22,7 @@
 | `pi.install_kind` | 是否存在 `<agent_dir>/install/managed-install.json`；路径是否在 `node_modules` 下 | 托管安装 / npm 安装 / 未知 | 决定升级命令 |
 | `pi.latest` | `npm view @earendil-works/pi-coding-agent version`（需网络，可关闭） | 与本地比较 | 提示升级 |
 | `auth` | 对已配置的 provider 执行 `pi auth check --provider <id> --json` | `ready` / `not_ready` / `invalid` | 打开密钥向导 |
-| `packages` | 读 `settings.json` 的 `packages` + 解析 `pi list` 文本；实装条目带版本号（读各包安装目录 `package.json` 的 `version` 字段，读不到则留空） | 声明与实装一致/缺包 | 一键重装 |
+| `packages` | 读 `settings.json` 的 `packages` + 解析 `pi list` 文本；实装条目带版本号（读**宿主目录内**安装目录 `package.json` 的 `version` 字段，读不到或落在宿主目录之外则留空） | 声明与实装一致/缺包 | 一键重装 |
 | `skills.links` | 统计 `skills/` 下的链接类条目与断链（POSIX 符号链接；Windows 符号链接与 junction） | 有断链 | 提示重建 |
 | `conflicts` | 受管范围内匹配 `*-冲突*` / `*-NSConflict*` | 有冲突 | 打开冲突处理 |
 | `snapshot` | 快照目录与 `manifest.json` 存在性、格式版本、哈希、创建时间 | 可用/不完整/不存在 | 重新上传或检查云盘 |
