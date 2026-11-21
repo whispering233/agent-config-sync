@@ -1499,6 +1499,65 @@ mod tests {
         assert!(load_state(&app_data).expect("读状态").is_some());
     }
 
+    /// 真机互通检查：需要一个真实 WebDAV 服务器（本地 `webdav-server` 或坚果云均可）。
+    /// 手动跑：`DAV_URL=… DAV_USER=… DAV_PASS=… cargo test interop -- --ignored --nocapture`
+    /// 它验证的是假 transport 覆盖不到的部分：Basic 认证、真实 XML、中文路径编码、条件写入。
+    #[test]
+    #[ignore = "需要真实 WebDAV 服务器与凭据（DAV_URL / DAV_USER / DAV_PASS）"]
+    fn interop_roundtrip_against_a_real_server() {
+        let url = std::env::var("DAV_URL").expect("需要 DAV_URL");
+        let user = std::env::var("DAV_USER").expect("需要 DAV_USER");
+        let pass = std::env::var("DAV_PASS").expect("需要 DAV_PASS");
+
+        let transport = crate::webdav::ReqwestTransport::new(&user, &pass).expect("构造 transport");
+        let client = WebdavClient::new(transport, &url);
+
+        let temp = TempDir::new("interop");
+        let app_data = temp.path().join("data");
+        let agent = temp.path().join("agent");
+        fixture_agent(&agent);
+        // 中文文件名：真实服务器上最容易出问题的一类路径。
+        fs::write(agent.join("prompts/提案.md"), "中文文件名").expect("写中文文件");
+
+        let probe = crate::webdav::probe(&client).expect("探测应通过");
+        assert!(!probe.leftover_write_test_file, "测试服务器应允许 DELETE");
+
+        let first = upload(&client, &app_data, &agent, false, false).expect("首次上传应成功");
+        let fingerprint = match first {
+            UploadOutcome::Uploaded {
+                fingerprint,
+                uploaded,
+                ..
+            } => {
+                assert!(uploaded > 0);
+                fingerprint
+            }
+            other => panic!("期望 Uploaded，得到 {other:?}"),
+        };
+
+        // 同一份内容再传一次：不应该冲突，也不该重传任何文件。
+        let again = upload(&client, &app_data, &agent, false, false).expect("二次上传应成功");
+        match again {
+            UploadOutcome::Uploaded {
+                uploaded, skipped, ..
+            } => {
+                assert_eq!(uploaded, 0, "内容没变就不该再 PUT 文件");
+                assert!(skipped > 0);
+            }
+            other => panic!("期望 Uploaded，得到 {other:?}"),
+        }
+
+        // 换一个应用数据目录当作新机器：下载、校验、指纹一致。
+        let other_machine = temp.path().join("data2");
+        let downloaded = download(&client, &other_machine).expect("下载应成功");
+        assert_eq!(downloaded.manifest.fingerprint, fingerprint);
+        let staged = downloaded.staging_root.join("snapshot/prompts/提案.md");
+        assert_eq!(
+            fs::read_to_string(staged).expect("读暂存文件"),
+            "中文文件名"
+        );
+    }
+
     #[test]
     fn upload_puts_only_files_that_differ_from_the_remote_manifest() {
         let temp = TempDir::new("upload-incremental");
