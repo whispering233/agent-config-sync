@@ -1,17 +1,21 @@
-//! 从 WebDAV 取回快照到本机暂存目录。
+//! 快照在 WebDAV 与本机之间的搬运。
 //!
-//! 规则来源：`docs/design/40-webdav.md` 第 6、7 节。这里只做搬运与校验：读远端 manifest，
-//! 逐文件下载到 `<应用数据目录>/staging/<时间戳>/`，逐个核对字节数与 sha256，全部通过后
-//! 才写 manifest 与远端状态。计划、备份与落地仍走 `plan` / `apply`，本模块不碰 live。
+//! 规则来源：`docs/design/40-webdav.md` 第 5、6、7 节。这里只做搬运与校验，不决定快照内容：
+//! 下行（[`download`]）读远端 manifest，逐文件下载到 `<应用数据目录>/staging/<时间戳>/`，
+//! 逐个核对字节数与 sha256，全部通过后才写 manifest 与远端状态；上行（[`upload`]）先用
+//! `snapshot::export` 把 live 导出到本机工作区（脱敏、扫描、manifest、指纹完全复用），
+//! 再按远端 manifest 只补变化的文件，最后条件写 manifest。计划、备份与落地仍走
+//! `plan` / `apply`，本模块不碰 live。
 //!
 //! 远端 manifest 是不可信输入：路径必须落在暂存目录内、文件有体积上限、内容必须与哈希一致。
 //! 任一失败都删掉本次暂存目录，远端状态保持原样。
 
 use crate::config;
 use crate::scope;
-use crate::snapshot::{self, Manifest, FORMAT_VERSION, MANIFEST_FILE_NAME};
+use crate::snapshot::{self, ExportFailure, Manifest, FORMAT_VERSION, MANIFEST_FILE_NAME};
 use crate::webdav::{DavError, DavTransport, WebdavClient};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, DirBuilder};
 use std::io;
@@ -21,6 +25,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 暂存目录名：位于应用数据目录下，与 `backups/` 同级，不进云盘也不进快照。
 pub const STAGING_DIR_NAME: &str = "staging";
+/// 上传用的临时工作区：只活在一次上传期间，成功或失败都整份删掉。
+///
+/// 不能放进 `staging/`：那里保留着「下载下来的、可能正要被应用」的快照，混在一起会被误当成本机型快照。
+pub const UPLOAD_WORKSPACE_DIR_NAME: &str = "upload-workspace";
 /// 远端状态文件名。
 pub const REMOTE_STATE_FILE_NAME: &str = "remote-state.json";
 /// 远端 manifest 上限：正常快照的 manifest 只有几 KB，超过即视为不可信。
@@ -49,7 +57,31 @@ pub struct DownloadOutcome {
     pub previous_seen_at: Option<String>,
 }
 
-/// 下载失败。网络类错误保留 [`DavError`]，command 层统一翻译成一句话。
+/// 一次上传的结局。冲突不是错误：用户还没决定用哪一边，远端一个字节都没动。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadOutcome {
+    Uploaded {
+        fingerprint: String,
+        /// 真正 PUT 上去的文件数。
+        uploaded: usize,
+        /// 与远端已一致、跳过的文件数。
+        skipped: usize,
+        /// 本次上传后记录的远端状态时间。
+        seen_at: String,
+    },
+    Conflict {
+        remote_fingerprint: String,
+        /// 下面三个清单描述**远端相对上次记录**的变化（新增 / 修改 / 删除的路径）。
+        /// 本机没有记录时三个清单都是空的：没有基准，算不出差异。
+        added: Vec<String>,
+        modified: Vec<String>,
+        removed: Vec<String>,
+        /// 远端清单存在但无法解析：只能覆盖，没法先下载。
+        remote_corrupt: bool,
+    },
+}
+
+/// 传输失败（上行与下行共用）。网络类错误保留 [`DavError`]，command 层统一翻译成一句话。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferError {
     /// 远端没有 manifest：还没上传过快照，或地址填错了。
@@ -76,6 +108,12 @@ pub enum TransferError {
     },
     /// 协议层失败（无凭据、不可达、认证、配额等）。
     Network(DavError),
+    /// 导出当前 live 失败：宿主目录不可用、明文密钥未确认等。
+    ///
+    /// 保留原结构是为了让前端能把 `secrets_unconfirmed` 的确认流程接上去。
+    Export(ExportFailure),
+    /// 提交 manifest 时条件请求未通过：远端在本次上传期间被改写过。
+    RemoteChanged,
     /// 本机暂存目录或远端状态文件读写失败。
     Storage(String),
 }
@@ -106,6 +144,11 @@ impl fmt::Display for TransferError {
                 write!(formatter, "{path} 的内容与 manifest 记录的 sha256 不一致")
             }
             Self::Network(error) => write!(formatter, "{error}"),
+            Self::Export(failure) => write!(formatter, "{}", failure.message),
+            Self::RemoteChanged => write!(
+                formatter,
+                "远端 manifest 在本次上传期间被改写过，条件写未通过；请重新上传，让两边先对齐"
+            ),
         }
     }
 }
@@ -165,7 +208,8 @@ pub fn load_state(app_data: &Path) -> Result<Option<RemoteState>, String> {
 /// 写远端状态：同目录临时文件 + rename 原子替换，文件创建即 0600。
 ///
 /// 内容是非密钥的远端 manifest 副本，但里面列着文件路径，仍然只有本用户可读。
-pub fn save_state(app_data: &Path, manifest: &Manifest) -> Result<(), String> {
+/// 返回本次记录的时间，上传成功时直接报给前端，省一次读取。
+pub fn save_state(app_data: &Path, manifest: &Manifest) -> Result<String, String> {
     let target = app_data.join(REMOTE_STATE_FILE_NAME);
     let temp = app_data.join(format!("{REMOTE_STATE_FILE_NAME}.tmp"));
 
@@ -188,7 +232,7 @@ pub fn save_state(app_data: &Path, manifest: &Manifest) -> Result<(), String> {
         return Err(format!("无法替换远端状态 {}：{error}", target.display()));
     }
 
-    Ok(())
+    Ok(state.seen_at)
 }
 
 /// 下载整份快照到新的暂存目录。
@@ -217,7 +261,11 @@ pub fn download<T: DavTransport>(
     let staging_root = create_staging_dir(app_data)?;
     let staged = fill_staging(client, &manifest, &staging_root)
         .and_then(|()| write_staged_manifest(&staging_root, &bytes))
-        .and_then(|()| save_state(app_data, &manifest).map_err(TransferError::Storage));
+        .and_then(|()| {
+            save_state(app_data, &manifest)
+                .map(|_| ())
+                .map_err(TransferError::Storage)
+        });
     if let Err(error) = staged {
         let _ = fs::remove_dir_all(&staging_root);
         return Err(error);
@@ -230,6 +278,288 @@ pub fn download<T: DavTransport>(
         manifest,
         previous_seen_at: previous.map(|state| state.seen_at),
     })
+}
+
+/// 把当前 live 导出并上传到 WebDAV。
+///
+/// 顺序固定：导出到本机工作区 → 读远端 manifest → 冲突判定 → 建目录 → 传变化文件 →
+/// 条件写 manifest → 记录远端状态。manifest 之前的任何失败都不更新远端状态：远端旧
+/// manifest 仍指向旧快照，不会出现「半套快照被应用」。冲突且未确认时一个字节都不写远端。
+pub fn upload<T: DavTransport>(
+    client: &WebdavClient<T>,
+    app_data: &Path,
+    agent_dir: &Path,
+    allow_plaintext: bool,
+    overwrite: bool,
+) -> Result<UploadOutcome, TransferError> {
+    let workspace = prepare_upload_workspace(app_data)?;
+    let input = UploadInput {
+        app_data,
+        agent_dir,
+        workspace: &workspace,
+    };
+    let outcome = upload_into(client, &input, allow_plaintext, overwrite);
+    // 工作区只是本次搬运的中间产物：内容在 live 与远端都还在，留着只会占地方。
+    let _ = fs::remove_dir_all(app_data.join(UPLOAD_WORKSPACE_DIR_NAME));
+    outcome
+}
+
+/// 上传的固定输入。打包起来是为了让核心函数保持在五个入参以内。
+struct UploadInput<'a> {
+    app_data: &'a Path,
+    agent_dir: &'a Path,
+    workspace: &'a Path,
+}
+
+/// 远端 manifest 与它的 ETag。ETag 用来防止提交时盖掉别人刚推的版本。
+struct RemoteManifest {
+    etag: Option<String>,
+    manifest: Manifest,
+}
+
+fn upload_into<T: DavTransport>(
+    client: &WebdavClient<T>,
+    input: &UploadInput<'_>,
+    allow_plaintext: bool,
+    overwrite: bool,
+) -> Result<UploadOutcome, TransferError> {
+    // 1. 导出：脱敏、明文扫描、manifest、指纹全部复用快照流水线，不另写一套。
+    snapshot::export(input.agent_dir, input.workspace, allow_plaintext)
+        .map_err(TransferError::Export)?;
+    let manifest = read_workspace_manifest(input.workspace)?;
+
+    // 2. 读远端 manifest：不存在表示首次上传，可解析则拿它判冲突、做条件写。
+    let (remote, corrupt_etag) = match read_remote_manifest(client)? {
+        RemoteManifestState::Missing => (None, None),
+        RemoteManifestState::Parsed(remote) => (Some(remote), None),
+        // 清单坏了就没有可比的基准：没确认覆盖就停下来，别把远端越修越坏。
+        RemoteManifestState::Corrupt { .. } if !overwrite => {
+            return Ok(UploadOutcome::Conflict {
+                remote_fingerprint: String::new(),
+                added: Vec::new(),
+                modified: Vec::new(),
+                removed: Vec::new(),
+                remote_corrupt: true,
+            });
+        }
+        RemoteManifestState::Corrupt { etag } => (None, etag),
+    };
+    // 状态文件损坏时先停：它记着「上次看到的远端」，忽略它就等于放行任何覆盖。
+    let recorded = load_state(input.app_data).map_err(TransferError::Storage)?;
+
+    // 3. 冲突判定：只认 fingerprint（40-webdav §7）。
+    if let Some(remote) = &remote {
+        let changed = match &recorded {
+            // 没有记录（换机器、换地址、删过状态文件）按保守冲突处理。
+            None => true,
+            Some(state) => state.manifest.fingerprint != remote.manifest.fingerprint,
+        };
+        if changed && !overwrite {
+            let (added, modified, removed) = match &recorded {
+                Some(state) => diff_manifests(&remote.manifest, &state.manifest),
+                // 没有基准就算不出差异，清单留空，由前端文案解释。
+                None => (Vec::new(), Vec::new(), Vec::new()),
+            };
+            return Ok(UploadOutcome::Conflict {
+                remote_fingerprint: remote.manifest.fingerprint.clone(),
+                added,
+                modified,
+                removed,
+                remote_corrupt: false,
+            });
+        }
+    }
+
+    // 4. 建目录：工作根幂等确保，再按文件的父目录从浅到深逐个建。
+    client.mkcol("").map_err(TransferError::Network)?;
+    for dir in parent_dirs(&manifest) {
+        client.mkcol(&dir).map_err(TransferError::Network)?;
+    }
+
+    // 5. 传文件：与远端 manifest 逐项比 path + sha256，只 PUT 变化的。
+    let known = remote
+        .as_ref()
+        .map(|remote| hash_index(&remote.manifest))
+        .unwrap_or_default();
+    let mut uploaded = 0;
+    let mut skipped = 0;
+    for file in &manifest.files {
+        if known.get(&file.path) == Some(&file.sha256) {
+            skipped += 1;
+            continue;
+        }
+        let bytes = fs::read(input.workspace.join(&file.path)).map_err(|error| {
+            TransferError::Storage(format!("读取待上传文件 {} 失败：{error}", file.path))
+        })?;
+        client
+            .put(&file.path, &bytes, &[])
+            .map_err(TransferError::Network)?;
+        uploaded += 1;
+    }
+
+    // 6. 提交 manifest。条件头缺一不可：无条件写就会盖掉别人刚推的版本。
+    let body = fs::read(input.workspace.join(MANIFEST_FILE_NAME)).map_err(|error| {
+        TransferError::Storage(format!("读取待上传 manifest 失败：{error}"))
+    })?;
+    client
+        .put(
+            MANIFEST_FILE_NAME,
+            &body,
+            &commit_headers(remote.as_ref(), corrupt_etag.as_deref()),
+        )
+        .map_err(|error| match error {
+            DavError::PreconditionFailed => TransferError::RemoteChanged,
+            other => TransferError::Network(other),
+        })?;
+
+    // 7. manifest 落盘即代表本次上传完整：到这里才敢更新本机记录。
+    let seen_at = save_state(input.app_data, &manifest).map_err(TransferError::Storage)?;
+
+    Ok(UploadOutcome::Uploaded {
+        fingerprint: manifest.fingerprint,
+        uploaded,
+        skipped,
+        seen_at,
+    })
+}
+
+/// 读回刚导出的 manifest：上传的路径清单以它为准，不再从目录重新拼一遍。
+fn read_workspace_manifest(workspace: &Path) -> Result<Manifest, TransferError> {
+    let bytes = fs::read(workspace.join(MANIFEST_FILE_NAME))
+        .map_err(|error| TransferError::Storage(format!("读取临时 manifest 失败：{error}")))?;
+    parse_manifest(&bytes)
+}
+
+/// 读远端 manifest。404 → 首次上传；其余仍按不可信输入解析。
+/// 远端清单的三种形态：不存在、可解析、存在但坏了（仍带着它的 ETag）。
+enum RemoteManifestState {
+    Missing,
+    Parsed(RemoteManifest),
+    Corrupt { etag: Option<String> },
+}
+
+fn read_remote_manifest<T: DavTransport>(
+    client: &WebdavClient<T>,
+) -> Result<RemoteManifestState, TransferError> {
+    let Some((bytes, etag)) = client
+        .get(MANIFEST_FILE_NAME)
+        .map_err(TransferError::Network)?
+    else {
+        return Ok(RemoteManifestState::Missing);
+    };
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(TransferError::TooLarge(format!(
+            "远端 manifest 有 {} 字节，超过 {MAX_MANIFEST_BYTES} 字节上限",
+            bytes.len()
+        )));
+    }
+
+    match parse_manifest(&bytes) {
+        Ok(manifest) => Ok(RemoteManifestState::Parsed(RemoteManifest { etag, manifest })),
+        // 清单坏了但 ETag 还在：覆盖时仍能靠条件请求确认“坏的就是我读到的那一版”。
+        Err(_) => Ok(RemoteManifestState::Corrupt { etag }),
+    }
+}
+
+/// 提交 manifest 的条件头。
+/// - 远端清单损坏：ETag 若在则仍然条件写，避免盖掉别人刚修好的版本
+/// - 远端原本有清单：用它读到的 ETag（服务端不给 ETag 时只能无条件写）
+/// - 远端没有清单：`If-None-Match: *`，防止两台机器同时“首次上传”
+fn commit_headers(
+    remote: Option<&RemoteManifest>,
+    corrupt_etag: Option<&str>,
+) -> Vec<(String, String)> {
+    if let Some(etag) = corrupt_etag {
+        return vec![("If-Match".to_string(), etag.to_string())];
+    }
+    match remote {
+        Some(remote) => match &remote.etag {
+            Some(etag) => vec![("If-Match".to_string(), etag.clone())],
+            // 服务端没给 ETag 就没有可比对的版本，只能无条件写。
+            None => Vec::new(),
+        },
+        None => vec![("If-None-Match".to_string(), "*".to_string())],
+    }
+}
+
+/// path → sha256，用于「只传变化文件」的比对。
+fn hash_index(manifest: &Manifest) -> BTreeMap<String, String> {
+    manifest
+        .files
+        .iter()
+        .map(|file| (file.path.clone(), file.sha256.clone()))
+        .collect()
+}
+
+/// 远端相对上次记录的变化：新增 / 修改 / 删除的路径。
+///
+/// 方向是「远端 vs 记录」，因为这正是用户要判断的那件事：云端被别人改了什么。
+fn diff_manifests(remote: &Manifest, recorded: &Manifest) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let recorded_index = hash_index(recorded);
+    let remote_index = hash_index(remote);
+
+    let mut added = Vec::new();
+    let mut modified = Vec::new();
+    for (path, sha256) in &remote_index {
+        match recorded_index.get(path) {
+            None => added.push(path.clone()),
+            Some(previous) if previous != sha256 => modified.push(path.clone()),
+            Some(_) => {}
+        }
+    }
+    let removed = recorded_index
+        .keys()
+        .filter(|path| !remote_index.contains_key(*path))
+        .cloned()
+        .collect();
+
+    (added, modified, removed)
+}
+
+/// manifest 里出现过的全部父目录：去重后按层数从浅到深排列。
+fn parent_dirs(manifest: &Manifest) -> Vec<String> {
+    let mut dirs: BTreeSet<String> = BTreeSet::new();
+    for file in &manifest.files {
+        let mut current = Path::new(&file.path).parent();
+        while let Some(dir) = current {
+            let text = dir.to_string_lossy().replace('\\', "/");
+            if text.is_empty() {
+                break;
+            }
+            dirs.insert(text);
+            current = dir.parent();
+        }
+    }
+
+    let mut ordered: Vec<String> = dirs.into_iter().collect();
+    // 父目录必须先于子目录建出来；同层按名字排序，请求顺序可复现。
+    ordered.sort_by(|left, right| {
+        left.matches('/')
+            .count()
+            .cmp(&right.matches('/').count())
+            .then_with(|| left.cmp(right))
+    });
+    ordered
+}
+
+/// 建本次上传的临时工作区。上次进程崩溃留下的半成品没有复用价值，整棵树先清掉。
+fn prepare_upload_workspace(app_data: &Path) -> Result<PathBuf, TransferError> {
+    let root = app_data.join(UPLOAD_WORKSPACE_DIR_NAME);
+    if root.exists() {
+        fs::remove_dir_all(&root).map_err(storage_error)?;
+    }
+    fs::create_dir_all(&root).map_err(storage_error)?;
+    // create_dir_all 按 umask 建，补一次显式权限：工作区里可能有明文密钥。
+    fs::set_permissions(&root, fs::Permissions::from_mode(STAGING_DIR_MODE))
+        .map_err(storage_error)?;
+
+    let dir = root.join(snapshot::format_timestamp(now_seconds()).replace(':', "-"));
+    DirBuilder::new()
+        .mode(STAGING_DIR_MODE)
+        .create(&dir)
+        .map_err(storage_error)?;
+
+    Ok(dir)
 }
 
 /// 解析远端 manifest。版本单独先看：结构不认识时也要报「版本不支持」而不是「文件损坏」。
@@ -974,5 +1304,457 @@ mod tests {
             settings
         );
         assert!(applied.backup_dir.starts_with(app_data.join("backups")));
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        fs::create_dir_all(path.parent().expect("文件必须有父目录")).unwrap();
+        fs::write(path, content).unwrap();
+    }
+
+    /// 真实 live 夹具：上传要真的跑一遍导出流水线，不能拿假 manifest 顶替。
+    fn fixture_agent(root: &Path) {
+        write_file(&root.join("settings.json"), "{\"theme\":\"dark\"}");
+        write_file(&root.join("skills/antd/SKILL.md"), "# 技能\n");
+        write_file(&root.join("prompts/review.md"), "# 评审\n");
+    }
+
+    fn write_state(app_data: &Path, manifest: &Manifest, seen_at: &str) {
+        fs::create_dir_all(app_data).unwrap();
+        let state = RemoteState {
+            seen_at: seen_at.to_string(),
+            manifest: manifest.clone(),
+        };
+        fs::write(
+            app_data.join(REMOTE_STATE_FILE_NAME),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn with_etag(bytes: &[u8], etag: &str) -> Result<DavResponse, DavError> {
+        Ok(DavResponse {
+            status: 200,
+            headers: vec![("ETag".to_string(), etag.to_string())],
+            body: bytes.to_vec(),
+        })
+    }
+
+    /// 首次上传的响应序列：404 后给足 201；多出来的响应不会被消费，不影响断言。
+    fn first_upload_responses() -> Vec<Result<DavResponse, DavError>> {
+        let mut responses = vec![response(404)];
+        responses.extend((0..24).map(|_| response(201)));
+        responses
+    }
+
+    /// 请求压成 `方法 相对路径`，方便整体断言顺序。
+    fn calls(requests: &[DavRequest]) -> Vec<String> {
+        let base = format!("{BASE}/");
+        requests
+            .iter()
+            .map(|request| {
+                let path = request
+                    .url
+                    .strip_prefix(&base)
+                    .unwrap_or(&request.url)
+                    .to_string();
+                format!("{} {path}", request.method)
+            })
+            .collect()
+    }
+
+    fn header(request: &DavRequest, name: &str) -> Option<String> {
+        request
+            .headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    }
+
+    #[test]
+    fn upload_first_time_creates_dirs_and_commits_manifest_last() {
+        let temp = TempDir::new("upload-first");
+        let app_data = temp.path().join("data");
+        let agent = temp.path().join("agent");
+        fixture_agent(&agent);
+        let (client, transport) = fake_client(first_upload_responses());
+
+        let outcome = upload(&client, &app_data, &agent, false, false).expect("首次上传应成功");
+
+        let fingerprint = match &outcome {
+            UploadOutcome::Uploaded {
+                fingerprint,
+                uploaded,
+                skipped,
+                seen_at,
+            } => {
+                assert_eq!(*uploaded, 3);
+                assert_eq!(*skipped, 0);
+                assert_eq!(fingerprint.len(), 12);
+                assert_eq!(seen_at.len(), 20);
+                fingerprint.clone()
+            }
+            other => panic!("期望 Uploaded，得到 {other:?}"),
+        };
+
+        // 顺序：读远端 → 建根 → 建父目录（浅到深）→ 传文件 → 最后写 manifest。
+        assert_eq!(
+            calls(&transport.requests()),
+            vec![
+                "GET PiAgentSync/manifest.json",
+                "MKCOL PiAgentSync",
+                "MKCOL PiAgentSync/snapshot",
+                "MKCOL PiAgentSync/snapshot/prompts",
+                "MKCOL PiAgentSync/snapshot/skills",
+                "MKCOL PiAgentSync/snapshot/skills/antd",
+                "PUT PiAgentSync/snapshot/prompts/review.md",
+                "PUT PiAgentSync/snapshot/settings.json",
+                "PUT PiAgentSync/snapshot/skills/antd/SKILL.md",
+                "PUT PiAgentSync/manifest.json",
+            ]
+        );
+
+        let requests = transport.requests();
+        let commit = requests.last().expect("最后一次请求是提交 manifest");
+        assert_eq!(header(commit, "If-None-Match").as_deref(), Some("*"));
+        assert_eq!(header(commit, "If-Match"), None);
+        let committed: Manifest = serde_json::from_slice(commit.body.as_deref().unwrap())
+            .expect("提交的 manifest 应能解析");
+        assert_eq!(committed.fingerprint, fingerprint);
+
+        let settings = requests
+            .iter()
+            .find(|request| request.url.ends_with("snapshot/settings.json"))
+            .expect("应 PUT settings.json");
+        assert_eq!(settings.body.as_deref(), Some(&b"{\"theme\":\"dark\"}"[..]));
+
+        // 远端状态记的是本次上传的 manifest；上传工作区不留在盘上。
+        let state = load_state(&app_data).expect("读状态").expect("状态应存在");
+        assert_eq!(state.manifest.fingerprint, fingerprint);
+        assert!(!app_data.join(UPLOAD_WORKSPACE_DIR_NAME).exists());
+        assert!(!app_data.join(STAGING_DIR_NAME).exists(), "上传不碰下载暂存目录");
+    }
+
+    #[test]
+    fn upload_stops_when_the_remote_manifest_is_corrupt() {
+        let temp = TempDir::new("upload-corrupt-stop");
+        let app_data = temp.path().join("data");
+        let agent = temp.path().join("agent");
+        fixture_agent(&agent);
+        let corrupt = Ok(DavResponse {
+            status: 200,
+            headers: vec![("ETag".to_string(), "\"abc\"".to_string())],
+            body: b"{ not json".to_vec(),
+        });
+        let (client, transport) = fake_client(vec![corrupt]);
+
+        let outcome = upload(&client, &app_data, &agent, false, false).expect("应返回冲突而不是报错");
+
+        match outcome {
+            UploadOutcome::Conflict {
+                remote_corrupt,
+                added,
+                modified,
+                removed,
+                ..
+            } => {
+                assert!(remote_corrupt);
+                assert!(added.is_empty() && modified.is_empty() && removed.is_empty());
+            }
+            other => panic!("期望 Conflict，得到 {other:?}"),
+        }
+        // 只读了 manifest：其余内容一字节都没写。
+        assert_eq!(calls(&transport.requests()).len(), 1);
+        assert!(load_state(&app_data).expect("读状态").is_none());
+    }
+
+    #[test]
+    fn upload_overwrites_a_corrupt_manifest_only_when_confirmed() {
+        let temp = TempDir::new("upload-corrupt-overwrite");
+        let app_data = temp.path().join("data");
+        let agent = temp.path().join("agent");
+        fixture_agent(&agent);
+        let mut responses = vec![Ok(DavResponse {
+            status: 200,
+            headers: vec![("ETag".to_string(), "\"abc\"".to_string())],
+            body: b"{ not json".to_vec(),
+        })];
+        responses.extend((0..24).map(|_| response(201)));
+        let (client, transport) = fake_client(responses);
+
+        let outcome = upload(&client, &app_data, &agent, false, true).expect("确认覆盖后应成功");
+
+        match outcome {
+            // 清单坏了就没法增量：全部重传。
+            UploadOutcome::Uploaded { uploaded, skipped, .. } => {
+                assert_eq!(uploaded, 3);
+                assert_eq!(skipped, 0);
+            }
+            other => panic!("期望 Uploaded，得到 {other:?}"),
+        }
+
+        let requests = transport.requests();
+        let commit = requests.last().expect("最后一次请求是提交 manifest");
+        assert_eq!(header(commit, "If-Match").as_deref(), Some("\"abc\""));
+        assert_eq!(header(commit, "If-None-Match"), None);
+        assert!(load_state(&app_data).expect("读状态").is_some());
+    }
+
+    #[test]
+    fn upload_puts_only_files_that_differ_from_the_remote_manifest() {
+        let temp = TempDir::new("upload-incremental");
+        let app_data = temp.path().join("data");
+        let agent = temp.path().join("agent");
+        fixture_agent(&agent);
+
+        // 先完整上传一次，拿到远端真实存在的 manifest（状态里存的就是它）。
+        let (first_client, _) = fake_client(first_upload_responses());
+        upload(&first_client, &app_data, &agent, false, false).expect("首次上传应成功");
+        let remote = load_state(&app_data).unwrap().unwrap().manifest;
+
+        write_file(&agent.join("settings.json"), "{\"theme\":\"light\"}");
+        let mut responses = vec![with_etag(&manifest_bytes(&remote), "\"v1\"")];
+        responses.extend((0..24).map(|_| response(201)));
+        let (client, transport) = fake_client(responses);
+
+        let outcome = upload(&client, &app_data, &agent, false, false).expect("增量上传应成功");
+
+        match &outcome {
+            UploadOutcome::Uploaded {
+                uploaded, skipped, ..
+            } => {
+                assert_eq!(*uploaded, 1, "只有 settings.json 变了");
+                assert_eq!(*skipped, 2, "没变的文件不该重传");
+            }
+            other => panic!("期望 Uploaded，得到 {other:?}"),
+        }
+
+        let requests = transport.requests();
+        assert_eq!(
+            calls(&requests),
+            vec![
+                "GET PiAgentSync/manifest.json",
+                "MKCOL PiAgentSync",
+                "MKCOL PiAgentSync/snapshot",
+                "MKCOL PiAgentSync/snapshot/prompts",
+                "MKCOL PiAgentSync/snapshot/skills",
+                "MKCOL PiAgentSync/snapshot/skills/antd",
+                "PUT PiAgentSync/snapshot/settings.json",
+                "PUT PiAgentSync/manifest.json",
+            ]
+        );
+        // 远端原本有清单：提交时要带它的 ETag。
+        assert_eq!(
+            header(requests.last().unwrap(), "If-Match").as_deref(),
+            Some("\"v1\"")
+        );
+
+        let state = load_state(&app_data).unwrap().unwrap();
+        assert_ne!(state.manifest.fingerprint, remote.fingerprint);
+    }
+
+    #[test]
+    fn upload_without_record_conflicts_and_writes_nothing() {
+        let temp = TempDir::new("upload-no-record");
+        let app_data = temp.path().join("data");
+        let agent = temp.path().join("agent");
+        fixture_agent(&agent);
+        let remote = manifest_with(vec![manifest_file(
+            "snapshot/settings.json",
+            "{\"theme\":\"dark\"}",
+        )]);
+        let (client, transport) = fake_client(vec![with_etag(&manifest_bytes(&remote), "\"v1\"")]);
+
+        let outcome = upload(&client, &app_data, &agent, false, false).expect("冲突不是错误");
+
+        // 没有基准就算不出差异：三个清单给空，由前端文案解释。
+        assert_eq!(
+            outcome,
+            UploadOutcome::Conflict {
+                remote_fingerprint: remote.fingerprint.clone(),
+                added: Vec::new(),
+                modified: Vec::new(),
+                removed: Vec::new(),
+                remote_corrupt: false,
+            }
+        );
+        assert_eq!(
+            transport.requests().len(),
+            1,
+            "冲突且未确认时不得写入任何远端内容"
+        );
+        assert!(!app_data.join(REMOTE_STATE_FILE_NAME).exists());
+        assert!(!app_data.join(UPLOAD_WORKSPACE_DIR_NAME).exists());
+    }
+
+    #[test]
+    fn upload_conflicts_when_the_recorded_fingerprint_differs() {
+        let temp = TempDir::new("upload-conflict");
+        let app_data = temp.path().join("data");
+        let agent = temp.path().join("agent");
+        fixture_agent(&agent);
+        let recorded = manifest_with(vec![
+            manifest_file("snapshot/settings.json", "{\"theme\":\"dark\"}"),
+            manifest_file("snapshot/gone.md", "旧\n"),
+        ]);
+        let remote = manifest_with(vec![
+            manifest_file("snapshot/settings.json", "{\"theme\":\"light\"}"),
+            manifest_file("snapshot/new.md", "新\n"),
+        ]);
+        write_state(&app_data, &recorded, "2026-11-01T08:00:00Z");
+        let (client, transport) = fake_client(vec![with_etag(&manifest_bytes(&remote), "\"v2\"")]);
+
+        let outcome = upload(&client, &app_data, &agent, false, false).expect("冲突不是错误");
+
+        assert_eq!(
+            outcome,
+            UploadOutcome::Conflict {
+                remote_fingerprint: remote.fingerprint.clone(),
+                added: vec!["snapshot/new.md".to_string()],
+                modified: vec!["snapshot/settings.json".to_string()],
+                removed: vec!["snapshot/gone.md".to_string()],
+                remote_corrupt: false,
+            }
+        );
+        assert_eq!(transport.requests().len(), 1, "冲突不建目录也不传文件");
+        // 状态仍是上次记录：记录只能在成功提交 manifest 之后更新。
+        let state = load_state(&app_data).unwrap().unwrap();
+        assert_eq!(state.seen_at, "2026-11-01T08:00:00Z");
+        assert_eq!(state.manifest, recorded);
+    }
+
+    #[test]
+    fn upload_overwrite_replaces_the_remote_snapshot() {
+        let temp = TempDir::new("upload-overwrite");
+        let app_data = temp.path().join("data");
+        let agent = temp.path().join("agent");
+        fixture_agent(&agent);
+        let recorded = manifest_with(vec![manifest_file("snapshot/gone.md", "旧\n")]);
+        let remote = manifest_with(vec![manifest_file("snapshot/new.md", "新\n")]);
+        write_state(&app_data, &recorded, "2026-11-01T08:00:00Z");
+        let mut responses = vec![with_etag(&manifest_bytes(&remote), "\"v7\"")];
+        responses.extend((0..24).map(|_| response(201)));
+        let (client, transport) = fake_client(responses);
+
+        let outcome = upload(&client, &app_data, &agent, false, true).expect("覆盖上传应成功");
+
+        let fingerprint = match &outcome {
+            UploadOutcome::Uploaded {
+                fingerprint,
+                uploaded,
+                ..
+            } => {
+                assert_eq!(*uploaded, 3, "覆盖也要逐个补文件");
+                fingerprint.clone()
+            }
+            other => panic!("期望 Uploaded，得到 {other:?}"),
+        };
+        // 覆盖写仍以远端 ETag 为条件：期间别人又改过就还是 412。
+        assert_eq!(
+            header(transport.requests().last().unwrap(), "If-Match").as_deref(),
+            Some("\"v7\"")
+        );
+        let state = load_state(&app_data).unwrap().unwrap();
+        assert_eq!(state.manifest.fingerprint, fingerprint);
+        assert_ne!(fingerprint, remote.fingerprint);
+    }
+
+    #[test]
+    fn upload_reports_remote_changed_on_412_and_keeps_the_state() {
+        let temp = TempDir::new("upload-412");
+        let app_data = temp.path().join("data");
+        let agent = temp.path().join("agent");
+        fixture_agent(&agent);
+        let (first_client, _) = fake_client(first_upload_responses());
+        upload(&first_client, &app_data, &agent, false, false).expect("首次上传应成功");
+        let before = load_state(&app_data).unwrap().unwrap();
+
+        // 无损内容变：文件全部跳过，直接提交 manifest，服务端回 412。
+        // 根 MKCOL + 4 个父目录 MKCOL 之后才是提交。
+        let mut responses = vec![with_etag(&manifest_bytes(&before.manifest), "\"v9\"")];
+        responses.extend((0..5).map(|_| response(201)));
+        responses.push(response(412));
+        let (client, transport) = fake_client(responses);
+
+        let error = upload(&client, &app_data, &agent, false, false).expect_err("412 应失败");
+
+        assert_eq!(error, TransferError::RemoteChanged);
+        assert_eq!(
+            calls(&transport.requests()).last().unwrap(),
+            "PUT PiAgentSync/manifest.json"
+        );
+        // 失败停在原地：记录与远端状态都不变。
+        let after = load_state(&app_data).unwrap().unwrap();
+        assert_eq!(after.seen_at, before.seen_at);
+        assert_eq!(after.manifest, before.manifest);
+        assert!(!app_data.join(UPLOAD_WORKSPACE_DIR_NAME).exists());
+    }
+
+    #[test]
+    fn parent_dirs_are_deduplicated_and_ordered_shallow_first() {
+        let manifest = manifest_with(vec![
+            manifest_file("snapshot/skills/antd/SKILL.md", "a"),
+            manifest_file("snapshot/skills/other/SKILL.md", "b"),
+            manifest_file("snapshot/settings.json", "c"),
+            manifest_file("manifest.json", "d"),
+        ]);
+
+        assert_eq!(
+            parent_dirs(&manifest),
+            vec![
+                "snapshot".to_string(),
+                "snapshot/skills".to_string(),
+                "snapshot/skills/antd".to_string(),
+                "snapshot/skills/other".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn upload_stops_before_the_network_when_export_fails() {
+        let temp = TempDir::new("upload-export-fail");
+        let app_data = temp.path().join("data");
+        let agent = temp.path().join("agent");
+
+        // 宿主目录不存在：导出预检就失败，一个请求都不该发出去。
+        let (client, transport) = fake_client(Vec::new());
+        let error = upload(&client, &app_data, &agent, false, false).expect_err("导出失败应停下");
+        match error {
+            TransferError::Export(failure) => assert_eq!(failure.code, "agent_dir_missing"),
+            other => panic!("期望 Export，得到 {other:?}"),
+        }
+        assert!(transport.requests().is_empty(), "导出失败不写远端");
+        assert!(!app_data.join(REMOTE_STATE_FILE_NAME).exists());
+        assert!(!app_data.join(UPLOAD_WORKSPACE_DIR_NAME).exists());
+    }
+
+    #[test]
+    fn upload_blocks_on_plaintext_secrets_before_the_network() {
+        let temp = TempDir::new("upload-plaintext");
+        let app_data = temp.path().join("data");
+        let agent = temp.path().join("agent");
+        fixture_agent(&agent);
+        // 范围外的普通脚本里出现已知前缀：不改写，只阻断，等用户确认。
+        write_file(
+            &agent.join("extensions/demo/index.ts"),
+            "const apiKey = \"sk-Zx7Qv2Lm9Rt4Bc8Wn3Yp6Kd1\";\n",
+        );
+
+        let (client, transport) = fake_client(Vec::new());
+        let error = upload(&client, &app_data, &agent, false, false)
+            .expect_err("明文密钥未确认时不能上传");
+        match error {
+            TransferError::Export(failure) => {
+                assert_eq!(failure.code, "secrets_unconfirmed");
+                assert!(!failure.findings.is_empty(), "要带上待确认条目");
+            }
+            other => panic!("期望 Export，得到 {other:?}"),
+        }
+        assert!(transport.requests().is_empty());
+
+        // 用户确认后同一个入口能继续：复用导出的 allow_plaintext 语义。
+        let (confirming_client, _) = fake_client(first_upload_responses());
+        let outcome = upload(&confirming_client, &app_data, &agent, true, false)
+            .expect("确认后应上传成功");
+        assert!(matches!(outcome, UploadOutcome::Uploaded { .. }));
     }
 }

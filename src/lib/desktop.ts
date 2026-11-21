@@ -75,3 +75,39 @@ export type RemoteDownload = {
 export function downloadRemoteSnapshot(): Promise<RemoteDownload> {
   return invoke<RemoteDownload>('download_remote_snapshot');
 }
+
+/** 一次上传的结局。冲突不是错误：远端一个字节都没写，等用户选一边。 */
+export type RemoteUpload =
+  | {
+      kind: 'uploaded';
+      fingerprint: string;
+      /** 真正 PUT 上去的文件数。 */
+      uploaded: number;
+      /** 与远端已一致、跳过的文件数。 */
+      skipped: number;
+      /** 本次上传后记录的同步时间。 */
+      seenAt: string;
+    }
+  | {
+      kind: 'conflict';
+      remoteFingerprint: string;
+      /** 下面三个清单描述远端相对上次记录的变化；本机无记录时都是空数组。 */
+      added: string[];
+      modified: string[];
+      removed: string[];
+      /** 远端清单损坏：只能覆盖，无法先下载。 */
+      remoteCorrupt: boolean;
+    };
+
+/**
+ * 把当前配置导出并推到 WebDAV。
+ *
+ * `overwrite` 只在用户看过冲突清单后点「覆盖云端」时为 true；`allowPlaintext`
+ * 与导出同名参数同义：用户已确认带明文密钥上传。
+ */
+export function uploadSnapshot(
+  overwrite: boolean,
+  allowPlaintext = false,
+): Promise<RemoteUpload> {
+  return invoke<RemoteUpload>('upload_snapshot', { overwrite, allowPlaintext });
+}

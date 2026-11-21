@@ -4,8 +4,9 @@ use crate::config::{
     self, AppConfig, ConfigError, ConfigValidation, AGENT_DIR_ENV_VAR, CONFIG_FILE_NAME,
 };
 use crate::credentials::{self, CredentialError, WebdavCredentials};
+use crate::secrets::SecretFinding;
 use crate::webdav::{self, DavError, ReqwestTransport, WebdavClient};
-use crate::webdav_transfer::{self, TransferError};
+use crate::webdav_transfer::{self, TransferError, UploadOutcome};
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
@@ -125,6 +126,9 @@ fn dav_error(error: DavError) -> String {
         DavError::AuthFailed => "认证失败：凭据无效或权限不足".to_string(),
         DavError::Unreachable(detail) => format!("无法连接：{detail}"),
         DavError::Quota => "远端空间或流量不足，无法写入测试文件".to_string(),
+        DavError::PreconditionFailed => {
+            "远端在本次操作期间被改写：条件请求未通过，请重新尝试".to_string()
+        }
         DavError::Other(detail) => detail,
     }
 }
@@ -223,6 +227,156 @@ pub async fn download_remote_snapshot(app: AppHandle) -> Result<DownloadView, St
     .map_err(|error| format!("下载失败：{error}"))?
 }
 
+/// 一次上传的结局。前端按 `kind` 区分「已上传」与「需要用户先选一边」。
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum UploadView {
+    #[serde(rename_all = "camelCase")]
+    Uploaded {
+        fingerprint: String,
+        uploaded: usize,
+        skipped: usize,
+        /// 本次上传后记录的远端状态时间；前端直接拿它刷「上次同步时间」。
+        seen_at: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    Conflict {
+        remote_fingerprint: String,
+        added: Vec<String>,
+        modified: Vec<String>,
+        removed: Vec<String>,
+        /// 远端清单损坏：只能覆盖，无法先下载。
+        remote_corrupt: bool,
+    },
+}
+
+/// 上传失败。码沿用 `40-webdav.md` §8；`secrets_unconfirmed` 与导出流程同义。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadFailure {
+    code: &'static str,
+    message: String,
+    /// 只有明文密钥阻断才会带待确认条目。
+    findings: Vec<SecretFinding>,
+}
+
+fn upload_failure(code: &'static str, message: String) -> UploadFailure {
+    UploadFailure {
+        code,
+        message,
+        findings: Vec::new(),
+    }
+}
+
+/// 失败码：先定码，再取文案（导出失败有自己的码，其余按传输层分类）。
+fn upload_failure_code(error: &TransferError) -> &'static str {
+    match error {
+        TransferError::Export(failure) => failure.code,
+        TransferError::NotFound => "remote_not_found",
+        TransferError::Corrupt(_) => "remote_manifest_corrupt",
+        TransferError::RemoteChanged => "remote_changed",
+        TransferError::Network(DavError::AuthFailed) => "remote_auth_failed",
+        TransferError::Network(DavError::Quota) => "remote_quota",
+        TransferError::Network(_) => "remote_unreachable",
+        _ => "upload_failed",
+    }
+}
+
+fn upload_failure_from(error: TransferError) -> UploadFailure {
+    let code = upload_failure_code(&error);
+    match error {
+        TransferError::Export(failure) => UploadFailure {
+            code,
+            message: failure.message,
+            findings: failure.findings,
+        },
+        other => upload_failure(code, transfer_error(other)),
+    }
+}
+
+/// 把当前 live 导出并推到 WebDAV。冲突时远端一个字节都不写，等用户选「覆盖」或「从云端更新」。
+#[tauri::command]
+pub async fn upload_snapshot(
+    app: AppHandle,
+    overwrite: bool,
+    allow_plaintext: Option<bool>,
+) -> Result<UploadView, UploadFailure> {
+    // 导出、逐文件 PUT 与 120s 单文件超时都是阻塞等待，留在 UI 线程会冻住窗口。
+    tauri::async_runtime::spawn_blocking(move || {
+        let config_dir = app.path().app_config_dir().map_err(|error| {
+            upload_failure(
+                "app_config_unavailable",
+                format!("无法定位应用配置目录：{error}"),
+            )
+        })?;
+        let config = config::load_config(&config_dir).map_err(|error| {
+            upload_failure("app_config_unavailable", error.to_string())
+        })?;
+        // 只读取这一个文档化的变量；错误信息里不回显其内容。
+        let env_agent_dir = std::env::var_os(AGENT_DIR_ENV_VAR).map(PathBuf::from);
+        let home_dir = app.path().home_dir().ok();
+        let agent_dir = config::resolve_agent_dir(
+            &config,
+            env_agent_dir.as_deref(),
+            home_dir.as_deref(),
+        )
+        .path
+        .ok_or_else(|| {
+            upload_failure("agent_dir_missing", "无法确定宿主目录，请先在设置页填写".to_string())
+        })?;
+
+        let dir = app_data_dir(&app)
+            .map_err(|error| upload_failure("app_data_unavailable", error))?;
+        let credentials = credentials::load(&dir)
+            .map_err(|error| upload_failure("remote_not_configured", download_credential_error(error)))?
+            .ok_or_else(|| {
+                upload_failure(
+                    "remote_not_configured",
+                    "还没有配置 WebDAV：请先在设置页填写地址、用户名与密码".to_string(),
+                )
+            })?;
+        let transport = ReqwestTransport::new(&credentials.username, &credentials.password)
+            .map_err(|error| upload_failure("remote_unreachable", dav_error(error)))?;
+        let outcome = webdav_transfer::upload(
+            &WebdavClient::new(transport, &credentials.url),
+            &dir,
+            &agent_dir,
+            allow_plaintext.unwrap_or(false),
+            overwrite,
+        )
+        .map_err(upload_failure_from)?;
+
+        Ok(match outcome {
+            UploadOutcome::Uploaded {
+                fingerprint,
+                uploaded,
+                skipped,
+                seen_at,
+            } => UploadView::Uploaded {
+                fingerprint,
+                uploaded,
+                skipped,
+                seen_at,
+            },
+            UploadOutcome::Conflict {
+                remote_fingerprint,
+                added,
+                modified,
+                removed,
+                remote_corrupt,
+            } => UploadView::Conflict {
+                remote_fingerprint,
+                added,
+                modified,
+                removed,
+                remote_corrupt,
+            },
+        })
+    })
+    .await
+    .map_err(|error| upload_failure("upload_failed", format!("上传失败：{error}")))?
+}
+
 #[tauri::command]
 pub fn load_app_config(app: AppHandle) -> Result<AppConfigView, String> {
     let context = context(&app)?;
@@ -261,4 +415,63 @@ pub fn save_app_config(app: AppHandle, config: AppConfig) -> Result<AppConfigVie
     .map_err(readable)?;
 
     Ok(view(saved, validation, &context.config_file))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 前端按 `kind` 与 camelCase 字段消费；形状一变就会静默拿不到数据。
+    #[test]
+    fn upload_view_serializes_with_kind_and_camel_case() {
+        let uploaded = UploadView::Uploaded {
+            fingerprint: "abc123".to_string(),
+            uploaded: 2,
+            skipped: 3,
+            seen_at: "2026-11-20T05:30:00Z".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&uploaded).unwrap(),
+            serde_json::json!({
+                "kind": "uploaded",
+                "fingerprint": "abc123",
+                "uploaded": 2,
+                "skipped": 3,
+                "seenAt": "2026-11-20T05:30:00Z",
+            })
+        );
+
+        let conflict = UploadView::Conflict {
+            remote_fingerprint: "def456".to_string(),
+            added: vec!["snapshot/a.md".to_string()],
+            modified: Vec::new(),
+            removed: Vec::new(),
+            remote_corrupt: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&conflict).unwrap(),
+            serde_json::json!({
+                "kind": "conflict",
+                "remoteFingerprint": "def456",
+                "added": ["snapshot/a.md"],
+                "modified": [],
+                "removed": [],
+                "remoteCorrupt": false,
+            })
+        );
+    }
+
+    /// 明文密钥阻断要能过 IPC：码与待确认条目都得带上。
+    #[test]
+    fn upload_failure_carries_code_and_findings() {
+        let failure = upload_failure("remote_changed", "远端被改写".to_string());
+        assert_eq!(
+            serde_json::to_value(&failure).unwrap(),
+            serde_json::json!({
+                "code": "remote_changed",
+                "message": "远端被改写",
+                "findings": [],
+            })
+        );
+    }
 }
