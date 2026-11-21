@@ -6,28 +6,20 @@
 
 | 卡 | 内容 | 依赖 | 可并行 |
 | :--- | :--- | :--- | :--- |
-| T1 | CI：提交与 PR 验证 | — | 与 T4、T5 |
-| T2 | Release：tag 建发布 | T1 | 否 |
+| T2 | Release：tag 建发布 | — | 否 |
 | T3 | Linux 打包与资产上传 | T2 | 否 |
-| T4 | 传输方式与 WebDAV 凭据 | — | 与 T1、T5 |
-| T5 | WebDAV 客户端 | — | 与 T1、T4 |
+| T4 | 传输方式与 WebDAV 凭据 | — | 与 T5 |
+| T5 | WebDAV 客户端 | — | 与 T4 |
 | T6 | 连通性探测 | T4、T5 | 否 |
 | T7 | 上传与冲突判定 | T4、T5 | 与 T8 |
 | T8 | 下载与暂存 | T4、T5 | 与 T7 |
-
-## T1 CI：提交与 PR 验证
-
-- 目标：每次提交与 PR 在 3 分钟内给出"能否编译、测试是否通过"。
-- 范围：`.github/workflows/ci.yml`；触发 `push`（main）与 `pull_request`；`ubuntu-22.04`；步骤 `npm ci` → `npm run build` → `cargo check` → `cargo test`。
-- 验收：故意改坏一个测试 → 流水线红；还原 → 绿；不加缓存、不打包。
-- 回滚：删除该文件。
 
 ## T2 Release：tag 建发布
 
 - 目标：push `v*` tag 后生成带正文的 GitHub Release。
 - 范围：`.github/workflows/release.yml`；第一步校验三处版本号（`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`）与 tag 一致；正文取 `CHANGELOG.md` 对应 `## [vX.Y.Z]` 段；`permissions: contents: write`。同时把 `CHANGELOG.md` 的 `[Unreleased]` 内容整理成 `## [v0.0.1] - <日期>` 段。
 - 验收：版本不一致时失败且不建 Release；在仓库推一个临时 tag 后 Release 正文与 CHANGELOG 段一致。
-- 依赖：T1。回滚：删除工作流；Release 手工删除。
+- 依赖：无。回滚：删除工作流；Release 手工删除。
 
 ## T3 Linux 打包与资产上传
 
