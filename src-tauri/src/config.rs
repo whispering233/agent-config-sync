@@ -889,6 +889,10 @@ mod tests {
                 "agentDirOverride": serde_json::Value::Null,
                 "backupRetention": DEFAULT_BACKUP_RETENTION,
                 "transport": "local",
+                "autoSync": false,
+                "autoSyncIntervalMinutes": DEFAULT_AUTO_SYNC_INTERVAL_MINUTES,
+                "autoSyncIncludeCredentials": false,
+                "launchAtLogin": false,
             })
         );
     }

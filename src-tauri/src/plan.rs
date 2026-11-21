@@ -8,7 +8,7 @@
 
 use crate::config;
 use crate::doctor::{self, CommandOutcome, CommandRunner, ShellRunner, Version, PROBE_TIMEOUT};
-use crate::platform::{HostOs, ProgramPath};
+use crate::platform::{self, HostOs, ProgramPath};
 use crate::scope::{self, EntryKind};
 use crate::snapshot::{
     self, Manifest, ManifestFile, Requirements, SourceInfo, FORMAT_VERSION, MANIFEST_FILE_NAME,
@@ -344,12 +344,13 @@ fn live_scan(agent_dir: &Path, manifest: &Manifest) -> Result<LiveScan, PlanFail
         .collect();
     declared.sort();
 
-    let links: Vec<String> = scanned
+    let mut links: Vec<String> = scanned
         .entries
         .iter()
         .filter(|entry| entry.link_target.is_some())
         .map(|entry| slash(&entry.relative_path))
         .collect();
+    links.extend(root_level_links(agent_dir));
     let undeclared_links = undeclared_links(&links, &declared);
 
     let mut files = BTreeMap::new();
@@ -377,6 +378,28 @@ fn live_scan(agent_dir: &Path, manifest: &Manifest) -> Result<LiveScan, PlanFail
         files,
         undeclared_links,
     })
+}
+
+/// 根级白名单之外的链接：`scope::scan` 按受管范围不收它们（导出也不该收），
+/// 但导出之后新出现的这类链接是陈旧残留，必须能在计划里看见并被删掉。
+/// 只做 `symlink_metadata`，不读目标、不进目录。
+fn root_level_links(agent_dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(agent_dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let relative = Path::new(&name);
+            if scope::is_included_root_name(&name) || scope::is_excluded_relative(relative) {
+                return None;
+            }
+            platform::is_link_like(&agent_dir.join(&name)).then_some(name)
+        })
+        .collect();
+    found.sort();
+    found
 }
 
 /// 没被 manifest 提到的链接是陈旧残留：不进去读，列为可删除项（只删链接本身）。
