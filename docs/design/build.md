@@ -77,7 +77,7 @@ npm run tauri -- build --bundles nsis
 
 | 工作流 | 触发 | 做什么 |
 | :--- | :--- | :--- |
-| `ci.yml` | push main / PR | `cargo test`、`cargo check`、`npm run build`；不打包 |
+| `ci.yml` | push main / PR | Linux：`cargo test`、`cargo check`、`npm run build`；Windows：`cargo test`（含平台分支）；不打包 |
 | `release.yml` | push tag `v*` | 校验三处版本号一致 → 从 `CHANGELOG.md` 对应版本段建 GitHub Release |
 | `desktop.yml` | push tag `v*` / 手动 | 在 `ubuntu-22.04` 构建 deb 与 AppImage；在 `windows-latest` 跑 `cargo test` 并构建 NSIS；两者都挂到该 tag 的 Release。手动入口可补包到已有 Release |
 
@@ -88,6 +88,7 @@ npm run tauri -- build --bundles nsis
 - 首个 tag 之前必须先在 `CHANGELOG.md` 落 `## [vX.Y.Z] - <日期>` 段，否则 Release 没有正文。
 - 打包依赖 GitHub release 资产（`appimagetool` 的 type2 runtime）；runner 无法出网时 AppImage 会失败，deb 不受影响。
 - Release 正文只由 `release.yml` 负责；资产上传不改正文。
+- Windows 的 PR 检查只编译并跑测试，不构建 NSIS；NSIS 仍由 `desktop.yml` 在 tag 或手动触发时构建。
 
 ## 发布前验证
 

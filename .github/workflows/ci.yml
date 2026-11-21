@@ -49,3 +49,24 @@ jobs:
 
       - name: Cargo test
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  windows:
+    # PR 阶段提前暴露 Windows 编译/测试问题；真正的 NSIS 出包在 desktop.yml
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # 带 #[cfg(unix)] 的用例在 Windows 上不编译，正好验证平台分支
+      - name: Cargo test
+        run: cargo test --manifest-path src-tauri/Cargo.toml
