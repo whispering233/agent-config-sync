@@ -991,7 +991,7 @@ function WebdavCard() {
     <Card className="p-lg">
       <h2 className="text-sm font-semibold text-foreground">WebDAV 凭据</h2>
       <p className="mt-xs text-xs text-muted-foreground">
-        保存在本机应用数据目录（权限 600），不进入快照、备份、日志与同步文件夹。
+        保存在本机应用数据目录（仅本用户可读），不进入快照、备份、日志与同步文件夹。
         明文落盘，建议使用可单独吊销的应用密码，而不是账号登录密码。
       </p>
 
