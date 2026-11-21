@@ -362,7 +362,7 @@ impl ProgramProbe {
 }
 
 /// 快速组的三个探测结果。POSIX 从一条登录 shell 脚本的哨兵段里取；Windows 每个探测点
-/// 单独起进程（`.cmd` 中间层经 `cmd /C`），不再拼批处理。
+/// 单独起进程（`.cmd` 中间层经 `cmd /d /s /c`），不再拼批处理。
 struct FastProbes {
     node: SectionData,
     npm: SectionData,
@@ -373,8 +373,9 @@ fn fast_probes(
     runner: &dyn CommandRunner,
     agent_dir: Option<&Path>,
     search: &ProgramPath,
+    host: HostOs,
 ) -> FastProbes {
-    if HostOs::current() == HostOs::Windows {
+    if host == HostOs::Windows {
         return windows_probes(runner, search, agent_dir);
     }
 
@@ -863,6 +864,7 @@ fn auth_checks(
     agent_dir: Option<&Path>,
     pi_path: Option<&str>,
     runner: &dyn CommandRunner,
+    host: HostOs,
 ) -> Vec<Check> {
     let providers = match provider_ids(agent_dir) {
         Ok(providers) => providers,
@@ -874,14 +876,19 @@ fn auth_checks(
 
     providers
         .into_iter()
-        .map(|provider| auth_check(&provider, auth_probe(pi_path, &provider, runner)))
+        .map(|provider| auth_check(&provider, auth_probe(pi_path, &provider, runner, host)))
         .collect()
 }
 
 /// 一次凭据探测。POSIX 走登录 shell 脚本；Windows 直接跑 `pi auth check`，provider id
 /// 来自用户配置，必须经 [`platform::program_argv`] 按平台转义后再拼。
-fn auth_probe(pi_path: Option<&str>, provider: &str, runner: &dyn CommandRunner) -> SectionData {
-    if HostOs::current() == HostOs::Windows {
+fn auth_probe(
+    pi_path: Option<&str>,
+    provider: &str,
+    runner: &dyn CommandRunner,
+    host: HostOs,
+) -> SectionData {
+    if host == HostOs::Windows {
         return auth_probe_windows(pi_path, provider, runner);
     }
 
@@ -1305,19 +1312,20 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
-/// 执行一次完整检查。只读：只有读文件与读命令输出。
-pub fn check(agent_dir: Option<&Path>, runner: &dyn CommandRunner) -> DoctorReport {
+/// 执行一次完整检查。只读：只有读文件与读命令输出。`host` 由调用方给定：
+/// 生产传 [`HostOs::current`]，单测显式指定，这样两条命令形态在任意平台上都能断言。
+pub fn check(agent_dir: Option<&Path>, runner: &dyn CommandRunner, host: HostOs) -> DoctorReport {
     let mut checks = vec![platform_check(), agent_dir_check(agent_dir)];
 
     // 子进程串行执行：同时最多 2 个的上限自然满足，也不会拖慢宿主。
-    let probes = fast_probes(runner, agent_dir, &ProgramPath::from_env());
+    let probes = fast_probes(runner, agent_dir, &ProgramPath::from_env(), host);
 
     checks.extend(node_checks(&probes.node));
     checks.extend(npm_checks(&probes.npm));
     let (pi, pi_path, pi_list) = pi_checks(&probes.pi);
     checks.extend(pi);
     checks.push(install_kind_check(agent_dir, pi_path.as_deref()));
-    checks.extend(auth_checks(agent_dir, pi_path.as_deref(), runner));
+    checks.extend(auth_checks(agent_dir, pi_path.as_deref(), runner, host));
     checks.push(packages_check(agent_dir, pi_list.as_deref()));
     checks.push(skills_check(agent_dir));
 
@@ -1342,7 +1350,11 @@ fn probe(app: &tauri::AppHandle) -> Result<DoctorReport, String> {
     let resolved =
         config::resolve_agent_dir(&config, env_agent_dir.as_deref(), home_dir.as_deref());
 
-    Ok(check(resolved.path.as_deref(), &ShellRunner::from_env()))
+    Ok(check(
+        resolved.path.as_deref(),
+        &ShellRunner::from_env(),
+        HostOs::current(),
+    ))
 }
 
 /// 子进程会阻塞 5 到 15 秒，放阻塞线程池，别占住 UI 线程。
@@ -1481,16 +1493,12 @@ mod tests {
         )
     }
 
-    /// 逐命令调用里的 `cmd /C` 命令行原文；POSIX 替身上拿到的是程序与参数。
+    /// 逐命令调用里的 `cmd /d /s /c` 整行原文；POSIX 替身上拿到的是程序与参数。
     fn command_lines(runner: &FakeRunner) -> Vec<String> {
         runner
             .programs()
             .into_iter()
-            .map(|(argv, _)| {
-                assert_eq!(argv[0], "cmd", "Windows 上程序名必须是 cmd");
-                assert_eq!(argv[1], "/C", "Windows 上参数必须是 /C");
-                argv[2].clone()
-            })
+            .map(|(argv, _)| platform::cmd_line_of(&argv))
             .collect()
     }
 
@@ -1506,6 +1514,12 @@ mod tests {
             fake_section("npm", npm),
             fake_section("pi", pi)
         ))
+    }
+
+    /// 单测统一按 POSIX 形态检查：命令形态用替身，不碰真实进程，
+    /// 这样同一组用例在 Windows 上跑也走登录 shell 那条路。
+    fn check_posix(agent_dir: Option<&Path>, runner: &dyn CommandRunner) -> DoctorReport {
+        check(agent_dir, runner, HostOs::Posix)
     }
 
     fn find<'a>(report: &'a DoctorReport, id: &str) -> &'a Check {
@@ -1568,7 +1582,7 @@ mod tests {
     #[test]
     fn timeout_marks_probes_unknown() {
         let runner = FakeRunner::single(CommandOutcome::Timeout);
-        let report = check(None, &runner);
+        let report = check_posix(None, &runner);
 
         for id in ["node.path", "node.version", "npm", "pi.path", "pi.version"] {
             let check = find(&report, id);
@@ -1594,7 +1608,7 @@ mod tests {
 
     #[test]
     fn missing_command_differs_from_broken_command() {
-        let missing = check(
+        let missing = check_posix(
             None,
             &FakeRunner::new(vec![fast_ok(
                 MISSING_MARKER,
@@ -1610,7 +1624,7 @@ mod tests {
             .contains("tool_not_found"));
         assert_eq!(find(&missing, "pi.path").status, CheckStatus::Fail);
 
-        let broken = check(
+        let broken = check_posix(
             None,
             &FakeRunner::new(vec![fast_ok(
                 "path:/usr/bin/node\nversion:",
@@ -1631,7 +1645,7 @@ mod tests {
 
     #[test]
     fn node_below_minimum_fails_with_upgrade_hint() {
-        let report = check(
+        let report = check_posix(
             None,
             &FakeRunner::new(vec![fast_ok(
                 "path:/usr/bin/node\nversion:20.11.1",
@@ -1649,7 +1663,7 @@ mod tests {
 
     #[test]
     fn unparsable_version_is_unknown() {
-        let report = check(
+        let report = check_posix(
             None,
             &FakeRunner::new(vec![fast_ok(
                 "path:/usr/bin/node\nversion:twenty-two",
@@ -1688,7 +1702,7 @@ mod tests {
             )),
         ]);
 
-        let report = check(Some(dir.path()), &runner);
+        let report = check_posix(Some(dir.path()), &runner);
 
         // provider id 按字典序检查：local 先于 openrouter。
         assert_eq!(find(&report, "auth:local").status, CheckStatus::Fail);
@@ -1710,7 +1724,7 @@ mod tests {
     #[test]
     fn auth_without_models_file_is_unknown() {
         let dir = TempDir::new("auth-missing");
-        let report = check(
+        let report = check_posix(
             Some(dir.path()),
             &FakeRunner::single(CommandOutcome::Timeout),
         );
@@ -1729,7 +1743,7 @@ mod tests {
         let list =
             "User packages:\n  npm:pi-lens\n    /tmp/pi-lens\n  npm:extra-pkg\n    /tmp/extra-pkg";
 
-        let report = check(
+        let report = check_posix(
             Some(dir.path()),
             &FakeRunner::new(vec![fast_ok(
                 "path:/usr/bin/node\nversion:22.23.0",
@@ -1775,7 +1789,7 @@ mod tests {
         assert_eq!(links, 2);
         assert_eq!(broken, vec!["bad".to_string()]);
 
-        let report = check(
+        let report = check_posix(
             Some(dir.path()),
             &FakeRunner::single(CommandOutcome::Timeout),
         );
@@ -1794,7 +1808,7 @@ mod tests {
         let dir = TempDir::new("install-kind");
         dir.write("install/managed-install.json", "{}");
 
-        let report = check(
+        let report = check_posix(
             Some(dir.path()),
             &FakeRunner::new(vec![fast_ok(
                 "path:/usr/bin/node\nversion:22.23.0",
@@ -1815,7 +1829,7 @@ mod tests {
 
     #[test]
     fn install_kind_falls_back_to_npm_layout() {
-        let report = check(
+        let report = check_posix(
             None,
             &FakeRunner::new(vec![fast_ok(
                 "path:/usr/bin/node\nversion:22.23.0",
@@ -1835,7 +1849,7 @@ mod tests {
         let dir = TempDir::new("agent-dir");
         let missing = dir.path().join("not-there");
 
-        let report = check(Some(&missing), &FakeRunner::single(CommandOutcome::Timeout));
+        let report = check_posix(Some(&missing), &FakeRunner::single(CommandOutcome::Timeout));
         let check = find(&report, "agent_dir");
 
         assert_eq!(check.status, CheckStatus::Fail);
@@ -1870,7 +1884,7 @@ mod tests {
         );
         let list = "User packages:\n  npm:pi-lens\n    /tmp/pi-lens";
 
-        let report = check(
+        let report = check_posix(
             Some(dir.path()),
             &FakeRunner::new(vec![fast_ok(
                 "path:/usr/bin/node\nversion:22.23.0",
@@ -1891,7 +1905,7 @@ mod tests {
 
     #[test]
     fn report_serializes_documented_field_names() {
-        let report = check(
+        let report = check_posix(
             None,
             &FakeRunner::new(vec![fast_ok(
                 "path:/usr/bin/node\nversion:22.23.0",
@@ -1922,7 +1936,7 @@ mod tests {
     #[test]
     fn posix_probes_keep_the_single_login_shell_script() {
         let runner = FakeRunner::single(CommandOutcome::Timeout);
-        check(None, &runner);
+        check_posix(None, &runner);
 
         // POSIX 仍是一条脚本跑完全部探测：没有逐命令调用。
         assert!(runner.programs().is_empty());
@@ -1958,11 +1972,11 @@ mod tests {
         assert_eq!(
             command_lines(&runner),
             vec![
-                format!("\"{node}\" \"-p\" \"process.versions.node\""),
-                format!("\"{npm}\" \"-v\""),
-                format!("\"{npm}\" \"prefix\" \"-g\""),
-                format!("\"{pi}\" \"--version\""),
-                format!("\"{pi}\" \"list\""),
+                platform::cmd_line(&node, &["-p", "process.versions.node"]),
+                platform::cmd_line(&npm, &["-v"]),
+                platform::cmd_line(&npm, &["prefix", "-g"]),
+                platform::cmd_line(&pi, &["--version"]),
+                platform::cmd_line(&pi, &["list"]),
             ]
         );
         // 每个探测点单独 5 秒超时，不拼脚本。
@@ -2081,7 +2095,10 @@ mod tests {
             matches!(found, SectionData::Body { .. }),
             "agent_dir/bin 兜底生效"
         );
-        assert_eq!(command_lines(&runner)[0], format!("\"{pi}\" \"--version\""));
+        assert_eq!(
+            command_lines(&runner)[0],
+            platform::cmd_line(&pi, &["--version"])
+        );
 
         // npm 全局前缀下的 `pi.cmd`：PATH 与 agent_dir 都找不到时才算数。
         let prefix = TempDir::new("windows-prefix");
@@ -2110,9 +2127,9 @@ mod tests {
         assert_eq!(check.status, CheckStatus::Pass);
         assert_eq!(
             command_lines(&runner),
-            vec![format!(
-                "\"{}\" \"auth\" \"check\" \"--provider\" \"openrouter\" \"--json\"",
-                pi.display()
+            vec![platform::cmd_line(
+                &pi.display().to_string(),
+                &["auth", "check", "--provider", "openrouter", "--json"]
             )]
         );
     }

@@ -154,8 +154,12 @@ pub(crate) fn quote_arg(os: HostOs, value: &str) -> Result<String, String> {
 }
 
 /// 拼一次「逐命令」调用。POSIX 直接给程序与参数；Windows 上 `npm` / `pi` 是 `.cmd` 中间层，
-/// 只能经 `cmd /C` 启动，于是每个元素按 Windows 规则加引号后拼成整条命令行，
-/// 由 [`build_command`] 用 `raw_arg` 交给 cmd。
+/// 只能经 `cmd /d /s /c` 启动：程序路径与参数各自加引号后拼成整行，整行再套一层引号，
+/// 由 [`build_command`] 用 `raw_arg` 原样交给 cmd。
+///
+/// 外层这对引号不能省：`/c` 之后引号数 ≥ 3 时 cmd 会剥掉首个引号再删掉最后一个，
+/// `cmd /c "C:\node\pi.cmd" "list"` 于是变成 `C:\node\pi.cmd" "list`；`/s` 只去掉最外层
+/// 一对引号，内部原样交给程序——这是 `cmd.exe` 的标准形状。
 pub(crate) fn program_argv(
     os: HostOs,
     program: &str,
@@ -174,13 +178,20 @@ pub(crate) fn program_argv(
             for arg in args {
                 parts.push(quote_arg(os, arg)?);
             }
-            Ok(vec!["cmd".to_string(), "/C".to_string(), parts.join(" ")])
+            Ok(vec![
+                "cmd".to_string(),
+                "/d".to_string(),
+                "/s".to_string(),
+                "/c".to_string(),
+                format!("\"{}\"", parts.join(" ")),
+            ])
         }
     }
 }
 
-/// 把 argv 变成可启动的 `Command`。`cmd /C` 形式的整条命令行必须走 `raw_arg`：
-/// 若先交给 `Command` 的常规参数序列化，cmd 接手后还会再解析一遍，引号会被拆坏。
+/// 把 argv 变成可启动的 `Command`。`cmd /d /s /c <整行>` 必须走 `raw_arg`：
+/// 若先交给 `Command` 的常规参数序列化，Rust 会再补一层引号转义，cmd 收到的
+/// 就不再是准备好的那条命令行。
 pub(crate) fn build_command(argv: &[String]) -> Result<Command, String> {
     let Some((program, args)) = argv.split_first() else {
         return Err("命令为空".to_string());
@@ -190,17 +201,50 @@ pub(crate) fn build_command(argv: &[String]) -> Result<Command, String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        let through_cmd = program.eq_ignore_ascii_case("cmd")
-            && args
-                .first()
-                .is_some_and(|flag| flag.eq_ignore_ascii_case("/c"));
-        if through_cmd {
-            command.arg("/C").raw_arg(args[1..].join(" "));
+        if is_cmd_line(program, args) {
+            command.args(&args[..3]).raw_arg(args[3].clone());
             return Ok(command);
         }
     }
     command.args(args);
     Ok(command)
+}
+
+/// 是不是 [`program_argv`] 拼出来的 `cmd /d /s /c <整行>`。
+#[cfg(windows)]
+fn is_cmd_line(program: &str, args: &[String]) -> bool {
+    const FLAGS: [&str; 3] = ["/d", "/s", "/c"];
+    program.eq_ignore_ascii_case("cmd")
+        && args.len() == 4
+        && args[..3]
+            .iter()
+            .zip(FLAGS)
+            .all(|(arg, flag)| arg.eq_ignore_ascii_case(flag))
+}
+
+/// 单测拼期望值：`cmd /d /s /c` 整行 = 外层一对引号包住内部逐个加引号的元素。
+#[cfg(test)]
+pub(crate) fn cmd_line(program: &str, args: &[&str]) -> String {
+    let mut parts = vec![format!("\"{program}\"")];
+    parts.extend(args.iter().map(|arg| format!("\"{arg}\"")));
+    format!("\"{}\"", parts.join(" "))
+}
+
+/// 单测校验一条 argv 是 `cmd /d /s /c` 形态，并取出整行原文。
+#[cfg(test)]
+pub(crate) fn cmd_line_of(argv: &[String]) -> String {
+    assert_eq!(argv[0], "cmd", "Windows 上程序名必须是 cmd");
+    assert_eq!(
+        argv[1..4],
+        ["/d", "/s", "/c"],
+        "Windows 上必须是 cmd /d /s /c"
+    );
+    let line = argv[4].clone();
+    assert!(
+        line.starts_with('"') && line.ends_with('"'),
+        "整行必须由外层引号包住：{line}"
+    );
+    line
 }
 
 /// 安装命令在 POSIX 下独立成进程组，超时按组终止，避免 `curl | sh` 的孙进程残留。
@@ -437,13 +481,17 @@ mod tests {
     #[test]
     fn windows_commands_go_through_cmd_with_one_quoted_line() {
         let argv = program_argv(HostOs::Windows, "C:\\nodejs\\pi.cmd", &["--version"]).unwrap();
+        assert_eq!(&argv[..4], ["cmd", "/d", "/s", "/c"]);
+        // 整行以引号开头、以引号结尾：/s 只去这一对外层引号，内部引号原样交给程序。
+        let line = &argv[4];
+        assert!(
+            line.starts_with('"') && line.ends_with('"'),
+            "整行必须由外层引号包住：{line}"
+        );
         assert_eq!(
-            argv,
-            vec![
-                "cmd".to_string(),
-                "/C".to_string(),
-                "\"C:\\nodejs\\pi.cmd\" \"--version\"".to_string(),
-            ]
+            line,
+            &cmd_line("C:\\nodejs\\pi.cmd", &["--version"]),
+            "外层引号 + 内部逐个加引号的元素"
         );
 
         // POSIX 不经 shell：逐命令直接给程序与参数。

@@ -149,9 +149,14 @@ echo "{PROBE_PREFIX}pi_version:$([ -n "$p" ] && "$p" --version 2>/dev/null | hea
     )
 }
 
-/// 前置探测：POSIX 用一条登录 shell 脚本，Windows 逐命令跑。
-fn probe(agent_dir: Option<&Path>, runner: &dyn CommandRunner) -> Result<Probe, String> {
-    if HostOs::current() == HostOs::Windows {
+/// 前置探测：POSIX 用一条登录 shell 脚本，Windows 逐命令跑。`host` 由调用方给定：
+/// 生产传 [`HostOs::current`]，单测显式指定。
+fn probe(
+    agent_dir: Option<&Path>,
+    runner: &dyn CommandRunner,
+    host: HostOs,
+) -> Result<Probe, String> {
+    if host == HostOs::Windows {
         return probe_windows(agent_dir, runner, &ProgramPath::from_env());
     }
 
@@ -177,7 +182,7 @@ fn probe_from_script(outcome: &CommandOutcome) -> Result<Probe, String> {
     }
 }
 
-/// Windows 的逐命令探测：node、npm、pi 各起一个进程，`.cmd` 中间层经 `cmd /C`。
+/// Windows 的逐命令探测：node、npm、pi 各起一个进程，`.cmd` 中间层经 `cmd /d /s /c`。
 /// 程序按 PATH 与 PATHEXT 解析，pi 再兜底 `<agent_dir>/bin`；解析不到就是没装。
 fn probe_windows(
     agent_dir: Option<&Path>,
@@ -324,8 +329,12 @@ fn install_kind(agent_dir: Option<&Path>, pi_path: &str) -> InstallKind {
 }
 
 /// 探测前置条件并给出命令，不执行。
-pub fn preview(agent_dir: Option<&Path>, runner: &dyn CommandRunner) -> InstallPreview {
-    let probe = probe(agent_dir, runner);
+pub fn preview(
+    agent_dir: Option<&Path>,
+    runner: &dyn CommandRunner,
+    host: HostOs,
+) -> InstallPreview {
+    let probe = probe(agent_dir, runner, host);
     build_preview(agent_dir, std::env::consts::OS, probe)
 }
 
@@ -419,12 +428,13 @@ pub fn execute(
     confirm: bool,
     probes: &dyn CommandRunner,
     runner: &dyn InstallRunner,
+    host: HostOs,
 ) -> Result<InstallResult, String> {
     if !confirm {
         return Err("install_declined：未确认，未执行任何命令".to_string());
     }
 
-    let preview = preview(agent_dir, probes);
+    let preview = preview(agent_dir, probes, host);
     if !preview.blocking.is_empty() {
         return Err(preview.blocking.join("；"));
     }
@@ -527,7 +537,11 @@ pub(crate) fn resolve_agent_dir(app: &tauri::AppHandle) -> Result<Option<PathBuf
 pub async fn preview_install(app: tauri::AppHandle) -> Result<InstallPreview, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let agent_dir = resolve_agent_dir(&app)?;
-        Ok(preview(agent_dir.as_deref(), &ShellRunner::from_env()))
+        Ok(preview(
+            agent_dir.as_deref(),
+            &ShellRunner::from_env(),
+            HostOs::current(),
+        ))
     })
     .await
     .map_err(|error| format!("预览安装命令失败：{error}"))?
@@ -548,6 +562,7 @@ pub async fn install_or_upgrade(
             confirm,
             &ShellRunner::from_env(),
             &GroupRunner,
+            HostOs::current(),
         )
     })
     .await
@@ -603,13 +618,23 @@ mod tests {
         }
     }
 
-    /// 假探测执行器：只回放预置结果，不跑进程。
+    /// 假探测执行器：只回放预置结果，不跑进程。两个入口回放同一条结果，
+    /// 与 doctor / packages 的替身一致，两条命令形态都能接住。
     struct FakeProbe(CommandOutcome);
 
     impl CommandRunner for FakeProbe {
         fn run(
             &self,
             _script: &str,
+            _timeout: Duration,
+            _env: &[(&str, String)],
+        ) -> CommandOutcome {
+            self.0.clone()
+        }
+
+        fn run_program(
+            &self,
+            _argv: &[String],
             _timeout: Duration,
             _env: &[(&str, String)],
         ) -> CommandOutcome {
@@ -719,16 +744,12 @@ mod tests {
             }
         }
 
-        /// 记下来的 `cmd /C` 命令行原文。
+        /// 记下来的 `cmd /d /s /c` 整行原文。
         fn lines(&self) -> Vec<String> {
             self.calls
                 .borrow()
                 .iter()
-                .map(|argv| {
-                    assert_eq!(argv[0], "cmd", "Windows 上程序名必须是 cmd");
-                    assert_eq!(argv[1], "/C", "Windows 上参数必须是 /C");
-                    argv[2].clone()
-                })
+                .map(|argv| platform::cmd_line_of(argv))
                 .collect()
         }
     }
@@ -790,9 +811,9 @@ mod tests {
         assert_eq!(
             runner.lines(),
             vec![
-                format!("\"{node}\" \"-p\" \"process.versions.node\""),
-                format!("\"{npm}\" \"-v\""),
-                format!("\"{pi}\" \"--version\""),
+                platform::cmd_line(&node, &["-p", "process.versions.node"]),
+                platform::cmd_line(&npm, &["-v"]),
+                platform::cmd_line(&pi, &["--version"]),
             ]
         );
         assert_eq!(probe.node_path, node);
@@ -804,8 +825,11 @@ mod tests {
         let preview = build_preview(None, "windows", Ok(probe));
         assert_eq!(preview.install_kind, Some(InstallKind::Npm));
         assert_eq!(
-            preview.command.expect("已装 pi 给出升级命令").argv[2],
-            "\"npm\" \"i\" \"-g\" \"@earendil-works/pi-coding-agent@latest\""
+            preview.command.expect("已装 pi 给出升级命令").argv[4],
+            platform::cmd_line(
+                "npm",
+                &["i", "-g", "@earendil-works/pi-coding-agent@latest"]
+            )
         );
     }
 
@@ -852,20 +876,21 @@ mod tests {
     fn windows_always_uses_npm_through_cmd() {
         let install = select_command("windows", false, InstallKind::Unknown).unwrap();
         assert_eq!(install.action, InstallAction::Install);
+        assert_eq!(&install.argv[..4], ["cmd", "/d", "/s", "/c"]);
         assert_eq!(
-            install.argv,
-            vec![
-                "cmd".to_string(),
-                "/C".to_string(),
-                "\"npm\" \"i\" \"-g\" \"@earendil-works/pi-coding-agent\"".to_string()
-            ]
+            install.argv[4],
+            platform::cmd_line("npm", &["i", "-g", "@earendil-works/pi-coding-agent"]),
+            "整行以外层引号包住，内部逐元素加引号"
         );
 
         let upgrade = select_command("windows", true, InstallKind::Npm).unwrap();
         assert_eq!(upgrade.action, InstallAction::Upgrade);
         assert_eq!(
-            upgrade.argv[2],
-            "\"npm\" \"i\" \"-g\" \"@earendil-works/pi-coding-agent@latest\""
+            upgrade.argv[4],
+            platform::cmd_line(
+                "npm",
+                &["i", "-g", "@earendil-works/pi-coding-agent@latest"]
+            )
         );
     }
 
@@ -1049,7 +1074,15 @@ mod tests {
         let probes = FakeProbe(healthy("/usr/bin/node", "", ""));
         let runner = FakeInstall::new(ok(""));
 
-        let error = execute(None, InstallAction::Install, false, &probes, &runner).unwrap_err();
+        let error = execute(
+            None,
+            InstallAction::Install,
+            false,
+            &probes,
+            &runner,
+            HostOs::Posix,
+        )
+        .unwrap_err();
         assert!(error.contains("install_declined"));
         assert!(runner.calls().is_empty());
     }
@@ -1059,7 +1092,15 @@ mod tests {
         let probes = FakeProbe(healthy("", "", ""));
         let runner = FakeInstall::new(ok(""));
 
-        let error = execute(None, InstallAction::Install, true, &probes, &runner).unwrap_err();
+        let error = execute(
+            None,
+            InstallAction::Install,
+            true,
+            &probes,
+            &runner,
+            HostOs::Posix,
+        )
+        .unwrap_err();
         assert!(error.contains("Node"));
         assert!(runner.calls().is_empty());
     }
@@ -1069,7 +1110,15 @@ mod tests {
         let probes = FakeProbe(healthy("/usr/bin/node", "", ""));
         let runner = FakeInstall::new(ok(""));
 
-        let error = execute(None, InstallAction::Upgrade, true, &probes, &runner).unwrap_err();
+        let error = execute(
+            None,
+            InstallAction::Upgrade,
+            true,
+            &probes,
+            &runner,
+            HostOs::Posix,
+        )
+        .unwrap_err();
         assert!(error.contains("安装"));
         assert!(runner.calls().is_empty());
     }
@@ -1079,7 +1128,15 @@ mod tests {
         let probes = FakeProbe(healthy("/usr/bin/node", "", ""));
         let runner = FakeInstall::new(ok("installed\n"));
 
-        let result = execute(None, InstallAction::Install, true, &probes, &runner).unwrap();
+        let result = execute(
+            None,
+            InstallAction::Install,
+            true,
+            &probes,
+            &runner,
+            HostOs::Posix,
+        )
+        .unwrap();
         assert_eq!(result.status, InstallStatus::Succeeded);
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(result.output, "installed");
