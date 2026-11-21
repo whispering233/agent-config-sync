@@ -21,11 +21,11 @@ Pi CLI 配置的换机交付工具：把配置导出成**可校验的快照**，
 
 ```bash
 # deb（推荐）
-sudo dpkg -i "src-tauri/target/release/bundle/deb/Agent Config Sync_0.1.0_amd64.deb"
+sudo dpkg -i "src-tauri/target/release/bundle/deb/Agent Config Sync_0.0.1_amd64.deb"
 
 # AppImage（不安装）
-chmod +x "src-tauri/target/release/bundle/appimage/Agent Config Sync_0.1.0_amd64.AppImage"
-"./Agent Config Sync_0.1.0_amd64.AppImage"
+chmod +x "src-tauri/target/release/bundle/appimage/Agent Config Sync_0.0.1_amd64.AppImage"
+"./Agent Config Sync_0.0.1_amd64.AppImage"
 ```
 
 文件名含空格，命令需要引号。deb 依赖 `libwebkit2gtk-4.1-0` 与 `libgtk-3-0`。
