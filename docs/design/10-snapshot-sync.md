@@ -208,6 +208,7 @@ idle → reading → verifying → planning → previewing → backing-up → ap
 | `restore_failed` / `backup_invalid` / `backup_missing` | 回滚失败或备份不可用 |
 | `host_version_unsatisfied` | 宿主版本低于要求（警告） |
 | `secret_residue` | 快照内仍有字面密钥（警告） |
+| `root_not_allowed` | 计划或应用指定的目录既不是同步文件夹，也不在本机暂存目录内 |
 | `remote_not_configured` | 未填地址/用户名/密码 |
 | `remote_unreachable` | DNS、TLS、超时或 5xx |
 | `remote_auth_failed` | 远端 401/403（凭据无效或权限不足） |
