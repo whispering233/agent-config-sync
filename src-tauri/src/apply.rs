@@ -2,21 +2,22 @@
 //!
 //! 规则来源：`docs/design/10-snapshot-sync.md` 第 6、7 节。
 //! 顺序固定：重算计划 → 核对指纹与删除清单 → 备份 → 重建链接 → 写入/删除 → 清理旧备份。
-//! 符号链接优先按 manifest 的 `symlinks` 重建；目标不存在（含断链）才退回物化写入。
+//! 符号链接优先按 manifest 的 `symlinks` 重建；目标不存在（含断链）或平台不允许建链接时
+//! 退回物化写入，后者要整棵子树写出：计划是按链接视角算的，只写新增/修改项会丢内容。
 //! 失败停在原地：写入中途失败即停，已完成的部分留在原地，备份目录保留（回滚是 T8），
 //! 不自动回滚、不重试、不静默修复。核心 [`apply`] 不依赖 Tauri，可直接临时目录单测。
 
 use crate::config;
 use crate::doctor::{CommandRunner, ShellRunner};
 use crate::plan;
+use crate::platform::{self, HostOs};
 use crate::scope;
 use crate::snapshot::{ManifestSymlink, MANIFEST_FILE_NAME, SNAPSHOT_DIR_NAME};
 use crate::webdav_transfer;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
@@ -31,12 +32,10 @@ pub const RESTORE_FILE_NAME: &str = "restore.json";
 pub const RESTORE_VERSION: u32 = 1;
 /// 保留最近几份备份。
 pub const BACKUP_RETENTION: usize = 10;
-/// 备份目录权限：只允许本用户读。
+/// 备份目录权限：只允许本用户读（Windows 没有权限位，建目录时不设）。
 const BACKUP_DIR_MODE: u32 = 0o700;
 /// 新增文件的权限；覆盖已有文件时沿用原 mode。
 const NEW_FILE_MODE: u32 = 0o644;
-/// 符号链接只在 Unix 上重建；其他平台退回物化写入并给出提示。
-const SYMLINK_SUPPORTED: bool = cfg!(unix);
 
 /// 一次应用的输出。失败时改由 [`ApplyFailure`] 返回，`failed_at` 因此总是 `None`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -45,7 +44,7 @@ pub struct ApplyReport {
     pub fingerprint: String,
     pub backup_dir: PathBuf,
     pub backup_id: String,
-    /// 新增 + 修改的条数。
+    /// 实际写出的文件数：新增 + 修改的条数；链接建不成而整棵物化时，按该子树写出的文件数计。
     pub written: usize,
     /// 实际删除的条数。
     pub deleted: usize,
@@ -53,7 +52,7 @@ pub struct ApplyReport {
     pub skipped: usize,
     /// 按 manifest 记录重建的符号链接条数。
     pub linked: usize,
-    /// 已勾选、但落在重建链接之下因此没有删除的条数。
+    /// 已勾选、但落在链接路径之下因此没有删除的条数（含建不成而已物化的链接）。
     pub skipped_deletes: usize,
     /// 不阻断的提示：链接退回物化、链接下的删除未执行等。
     pub warnings: Vec<String>,
@@ -123,6 +122,21 @@ struct Backup {
     created_at: String,
 }
 
+/// 建链接这一步的平台原语。做成可注入，测试才能覆盖「平台不允许建链接」这条常规路径
+/// （Windows 默认权限下 `ERROR_PRIVILEGE_NOT_HELD`），而不是靠改权限去碰运气。
+pub trait LinkCreator {
+    fn create_link(&self, target: &str, path: &Path, is_dir: bool) -> io::Result<()>;
+}
+
+/// 生产实现：直接调 [`platform::create_link`]。
+pub struct PlatformLinkCreator;
+
+impl LinkCreator for PlatformLinkCreator {
+    fn create_link(&self, target: &str, path: &Path, is_dir: bool) -> io::Result<()> {
+        platform::create_link(target, path, is_dir)
+    }
+}
+
 /// core：应用快照。`delete_paths` 是用户勾选确认的删除项，其余删除候选原样保留。
 pub fn apply(
     agent_dir: &Path,
@@ -131,14 +145,17 @@ pub fn apply(
     delete_paths: &[String],
     app_data_dir: &Path,
     runner: &dyn CommandRunner,
+    link_creator: &dyn LinkCreator,
 ) -> Result<ApplyReport, ApplyFailure> {
     // 计划可能已经过时：用户看的是旧计划，落地前必须按当前磁盘重算一次。
-    let report = plan::plan_snapshot(agent_dir, sync_root, runner).map_err(|failure| {
-        ApplyFailure::new(
-            "manifest_invalid",
-            format!("快照校验未通过（{}）：{}", failure.code, failure.message),
-        )
-    })?;
+    let report = plan::plan_snapshot(agent_dir, sync_root, runner, HostOs::current()).map_err(
+        |failure| {
+            ApplyFailure::new(
+                "manifest_invalid",
+                format!("快照校验未通过（{}）：{}", failure.code, failure.message),
+            )
+        },
+    )?;
     if report.manifest_info.fingerprint != expected_fingerprint {
         return Err(ApplyFailure::new(
             "plan_stale",
@@ -153,10 +170,13 @@ pub fn apply(
     let confirmed = confirm_deletes(agent_dir, &report.plan, delete_paths)?;
     // 导出时链接被物化成内容，落地时优先按 manifest 的记录重建。
     let recorded_links = manifest_links(sync_root)?;
-    let links = rebuildable_links(agent_dir, &recorded_links, &mut warnings);
-    let rebuilt: Vec<&str> = links.iter().map(|link| link.relative.as_str()).collect();
+    let candidates = rebuildable_links(agent_dir, &recorded_links, &mut warnings);
+    let planned: Vec<&str> = candidates
+        .iter()
+        .map(|link| link.relative.as_str())
+        .collect();
     // 删除会跟随祖先目录里的符号链接落到外部位置；将被重建的链接不算，其余必须在建备份前整次拒绝。
-    reject_delete_through_symlink(agent_dir, &confirmed, &rebuilt)?;
+    reject_delete_through_symlink(agent_dir, &confirmed, &planned)?;
     let skipped = report.plan.deleted.len() - confirmed.len();
 
     let backup = create_backup_dir(app_data_dir)?;
@@ -169,17 +189,41 @@ pub fn apply(
     )?;
     prune(&app_data_dir.join(BACKUPS_DIR_NAME));
 
-    let mut linked = 0;
-    for link in &links {
-        rebuild_link(agent_dir, link)
-            .map_err(|error| fail(&backup, linked, &link.relative, error))?;
-        linked += 1;
-    }
-
+    // 建链接失败就退回物化：Windows 默认权限下没有建链接权限（`ERROR_PRIVILEGE_NOT_HELD`）
+    // 是常态，与「目标缺失」一样只告警、不中断。物化要把快照里该路径下的整棵子树写成真实文件：
+    // 旧链接已经被清掉，而计划是按链接视角算的，只写新增/修改项会丢掉与快照一致、
+    // 根本不在计划里的内容。
+    let mut rebuilt: Vec<&RebuildLink> = Vec::new();
+    let mut materialized: Vec<&RebuildLink> = Vec::new();
     let mut written = 0;
+    for link in &candidates {
+        match rebuild_link(agent_dir, link, link_creator) {
+            Ok(()) => rebuilt.push(link),
+            Err(link_error) => {
+                let files = materialize_snapshot_subtree(agent_dir, sync_root, &link.relative)
+                    .map_err(|error| {
+                        materialize_failed(
+                            &backup,
+                            rebuilt.len() + written,
+                            link,
+                            &link_error,
+                            &error,
+                        )
+                    })?;
+                written += files;
+                warnings.push(format!(
+                    "{} 无法重建为链接（{link_error}），已把快照里该目录的整棵内容写成真实文件",
+                    link.relative
+                ));
+                materialized.push(link);
+            }
+        }
+    }
+    let linked = rebuilt.len();
+
     for item in report.plan.added.iter().chain(&report.plan.modified) {
-        // 链接之下的内容由链接目标提供，不再写真实文件（也不写穿链接）。
-        if links
+        // 链接之下的内容由链接目标提供；链接建不成时，那棵子树也已随物化整棵写出。
+        if candidates
             .iter()
             .any(|link| is_under(&item.path, &link.relative))
         {
@@ -192,18 +236,39 @@ pub fn apply(
 
     let mut deleted = 0;
     let mut skipped_deletes = 0;
+    let mut skipped_under_materialized = 0;
     for relative in &confirmed {
-        if let Some(link) = links.iter().find(|link| is_under(relative, &link.relative)) {
+        // 删除一律以「候选链接」为准：计划是按链接视角算的，对着已经移走的位置执行会 ENOENT。
+        if let Some(link) = candidates
+            .iter()
+            .find(|link| is_under(relative, &link.relative))
+        {
             skipped_deletes += 1;
-            warnings.push(format!(
-                "{relative} 由链接 {} 的目标提供，未删除",
-                link.relative
-            ));
+            if materialized
+                .iter()
+                .any(|item| item.relative == link.relative)
+            {
+                skipped_under_materialized += 1;
+                warnings.push(format!(
+                    "{relative} 落在 {} 之下，而该链接无法重建（内容已按快照物化），未删除",
+                    link.relative
+                ));
+            } else {
+                warnings.push(format!(
+                    "{relative} 由链接 {} 的目标提供，未删除",
+                    link.relative
+                ));
+            }
             continue;
         }
         delete_target(agent_dir, relative)
             .map_err(|error| fail(&backup, linked + written + deleted, relative, error))?;
         deleted += 1;
+    }
+    if skipped_under_materialized > 0 {
+        warnings.push(format!(
+            "因链接无法重建，这 {skipped_under_materialized} 项删除已跳过"
+        ));
     }
 
     Ok(ApplyReport {
@@ -225,6 +290,26 @@ fn fail(backup: &Backup, completed: usize, path: &str, error: io::Error) -> Appl
         code: "apply_failed",
         message: format!(
             "落地 {path} 时失败：{error}；已立即停止，备份在 {}",
+            backup.dir.display()
+        ),
+        completed,
+        backup_dir: Some(backup.dir.clone()),
+    }
+}
+
+/// 建链接失败、改写快照内容也失败：两条原因都带上，停在原地等人工处理。
+fn materialize_failed(
+    backup: &Backup,
+    completed: usize,
+    link: &RebuildLink,
+    link_error: &io::Error,
+    error: &io::Error,
+) -> ApplyFailure {
+    ApplyFailure {
+        code: "apply_failed",
+        message: format!(
+            "{} 重建链接失败（{link_error}），改成写入快照内容也失败（{error}）；已立即停止，备份在 {}",
+            link.relative,
             backup.dir.display()
         ),
         completed,
@@ -283,6 +368,8 @@ fn reject_delete_through_symlink(
 struct RebuildLink {
     relative: String,
     target: String,
+    /// 目标是目录还是文件；Windows 只有这两种链接，Unix 建链接不分类型。
+    is_dir: bool,
 }
 
 /// manifest 里的 `symlinks`。导出端把链接物化成内容，同时把原目标记在这里。
@@ -317,17 +404,6 @@ fn rebuildable_links(
     links: &[ManifestSymlink],
     warnings: &mut Vec<String>,
 ) -> Vec<RebuildLink> {
-    if links.is_empty() {
-        return Vec::new();
-    }
-    if !SYMLINK_SUPPORTED {
-        warnings.push(format!(
-            "当前平台不支持符号链接：{} 个链接条目退回物化写入",
-            links.len()
-        ));
-        return Vec::new();
-    }
-
     let mut rebuilt: Vec<RebuildLink> = Vec::new();
     for link in links {
         let relative = link_relative(&link.path);
@@ -344,19 +420,24 @@ fn rebuildable_links(
             continue;
         };
         // 链接目标相对链接所在目录解释；绝对目标直接决定位置。
-        if !agent_dir.join(parent).join(&link.target).exists() {
-            warnings.push(format!(
-                "{relative} 的链接目标 {} 不存在，已退回写入快照内容",
-                link.target
-            ));
-            continue;
-        }
+        // Windows 建链接要按目标类型分开调，所以这里顺手记下目标是文件还是目录。
+        let target_metadata = match fs::metadata(agent_dir.join(parent).join(&link.target)) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                warnings.push(format!(
+                    "{relative} 的链接目标 {} 不存在，已退回写入快照内容",
+                    link.target
+                ));
+                continue;
+            }
+        };
         if rebuilt.iter().any(|item| item.relative == relative) {
             continue;
         }
         rebuilt.push(RebuildLink {
             relative: relative.to_string(),
             target: link.target.clone(),
+            is_dir: target_metadata.is_dir(),
         });
     }
     // 外层链接先建，嵌套链接才能落到链接目标里。
@@ -366,33 +447,26 @@ fn rebuildable_links(
 
 /// 重建一条链接：父目录就位后清掉旧路径，再按原目标建立链接。
 /// 旧路径是真目录时整棵删除：里面的内容按约定由链接目标提供，不保留本地副本。
-fn rebuild_link(agent_dir: &Path, link: &RebuildLink) -> io::Result<()> {
+/// 建链接失败时旧内容已经不在，调用方必须整棵物化快照内容补回。
+fn rebuild_link(
+    agent_dir: &Path,
+    link: &RebuildLink,
+    link_creator: &dyn LinkCreator,
+) -> io::Result<()> {
     let path = scope::resolve_within(agent_dir, Path::new(&link.relative)).map_err(to_io_error)?;
     if let Some(parent) = path.parent() {
         // 父目录可以本身就是链接：跟随它，不换成真实目录。
         fs::create_dir_all(parent)?;
     }
+    // 旧路径本身也是链接时只删链接：按目录删会连目标内容一起删掉。
     match fs::symlink_metadata(&path) {
+        Ok(_) if platform::is_link_like(&path) => platform::remove_link(&path)?,
         Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&path)?,
         Ok(_) => fs::remove_file(&path)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    create_link(&link.target, &path)
-}
-
-#[cfg(unix)]
-pub(crate) fn create_link(target: &str, path: &Path) -> io::Result<()> {
-    std::os::unix::fs::symlink(target, path)
-}
-
-/// 非 Unix 由 [`SYMLINK_SUPPORTED`] 提前挡下，走不到这里；保留实现只是为了让函数签名在两端一致。
-#[cfg(not(unix))]
-pub(crate) fn create_link(_target: &str, _path: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "当前平台不支持符号链接",
-    ))
+    link_creator.create_link(&link.target, &path, link.is_dir)
 }
 
 /// manifest 里的路径形如 `snapshot/skills/antd`；落地时用相对宿主目录的路径。
@@ -450,15 +524,9 @@ fn create_backup_dir(app_data_dir: &Path) -> Result<Backup, ApplyFailure> {
     }
     let dir = root.join(&id);
 
-    DirBuilder::new()
-        .recursive(true)
-        .mode(BACKUP_DIR_MODE)
-        .create(&dir)
+    platform::create_dir_all_mode(&dir, BACKUP_DIR_MODE)
         .and_then(|()| {
-            DirBuilder::new()
-                .recursive(true)
-                .mode(BACKUP_DIR_MODE)
-                .create(dir.join(BACKUP_FILES_DIR_NAME))
+            platform::create_dir_all_mode(&dir.join(BACKUP_FILES_DIR_NAME), BACKUP_DIR_MODE)
         })
         .map_err(|error| {
             ApplyFailure::new("backup_failed", format!("无法创建备份目录：{error}"))
@@ -583,7 +651,7 @@ pub(crate) fn symlink_ancestors(agent_dir: &Path, relative: &str) -> Vec<String>
             ancestor.push('/');
         }
         ancestor.push_str(&component.as_os_str().to_string_lossy());
-        if fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        if platform::is_link_like(&current) {
             found.push(ancestor.clone());
         }
     }
@@ -634,14 +702,12 @@ fn record(
             path: relative.to_string(),
             kind: RestoreKind::Dir,
             existed: true,
-            mode: Some(metadata.permissions().mode() & 0o777),
+            mode: platform::mode_of(&metadata),
             link_target: None,
         });
     }
 
-    let file_type = metadata.file_type();
-    let mode = (!file_type.is_symlink()).then(|| metadata.permissions().mode() & 0o777);
-    let link_target = if file_type.is_symlink() {
+    let link_target = if platform::is_link_like(&live) {
         let target = fs::read_link(&live).map_err(|error| {
             ApplyFailure::new(
                 "backup_failed",
@@ -652,17 +718,18 @@ fn record(
     } else {
         None
     };
+    // 链接没有有意义的权限位；Windows 上 `mode_of` 一律给 `None`。
+    let mode = match link_target {
+        Some(_) => None,
+        None => platform::mode_of(&metadata),
+    };
 
     if link_target.is_none() {
         let destination = files_dir.join(relative);
         if let Some(parent) = destination.parent() {
-            DirBuilder::new()
-                .recursive(true)
-                .mode(BACKUP_DIR_MODE)
-                .create(parent)
-                .map_err(|error| {
-                    ApplyFailure::new("backup_failed", format!("创建备份子目录失败：{error}"))
-                })?;
+            platform::create_dir_all_mode(parent, BACKUP_DIR_MODE).map_err(|error| {
+                ApplyFailure::new("backup_failed", format!("创建备份子目录失败：{error}"))
+            })?;
         }
         fs::copy(&live, &destination).map_err(|error| {
             ApplyFailure::new("backup_failed", format!("备份 {relative} 失败：{error}"))
@@ -700,26 +767,60 @@ fn prune(backups: &Path) {
     }
 }
 
-/// 写入一个快照文件：先写同目录临时文件再 rename，权限沿用原 mode。
+/// 写入一个快照文件：`<sync_root>/snapshot/<相对路径>` 落到宿主目录的同名位置。
 fn write_snapshot_file(agent_dir: &Path, sync_root: &Path, relative: &str) -> io::Result<()> {
     let source = scope::resolve_within(&sync_root.join(SNAPSHOT_DIR_NAME), Path::new(relative))
         .map_err(to_io_error)?;
-    let bytes = fs::read(&source)?;
     let target = scope::resolve_within(agent_dir, Path::new(relative)).map_err(to_io_error)?;
+    write_file_content(&source, &target)
+}
 
-    // 覆盖已有普通文件时沿用原 mode；新增文件用 0644。
-    let mode = match fs::symlink_metadata(&target) {
-        Ok(metadata) if metadata.is_file() => metadata.permissions().mode() & 0o777,
+/// 把快照里某个链接路径下的整棵子树写成真实文件，返回写出的文件数。
+/// 链接建不成时旧内容已经被清掉，只补计划里的新增/修改项会漏掉与快照一致的内容，所以整棵写出。
+fn materialize_snapshot_subtree(
+    agent_dir: &Path,
+    sync_root: &Path,
+    relative: &str,
+) -> io::Result<usize> {
+    let source = scope::resolve_within(&sync_root.join(SNAPSHOT_DIR_NAME), Path::new(relative))
+        .map_err(to_io_error)?;
+    let target = scope::resolve_within(agent_dir, Path::new(relative)).map_err(to_io_error)?;
+    materialize_subtree(&source, &target)
+}
+
+/// 递归物化：目录就地建出来（空目录也照样落地），普通文件逐个按快照内容写。
+fn materialize_subtree(source: &Path, target: &Path) -> io::Result<usize> {
+    if fs::metadata(source)?.is_dir() {
+        ensure_dir(target)?;
+        let mut written = 0;
+        for item in fs::read_dir(source)? {
+            let item = item?;
+            written += materialize_subtree(&item.path(), &target.join(item.file_name()))?;
+        }
+        Ok(written)
+    } else {
+        write_file_content(source, target)?;
+        Ok(1)
+    }
+}
+
+/// 先写同目录临时文件再替换，权限沿用原 mode。
+fn write_file_content(source: &Path, target: &Path) -> io::Result<()> {
+    let bytes = fs::read(source)?;
+    // 覆盖已有普通文件时沿用原 mode；新增文件用 0644（Windows 上 `set_mode` 不生效）。
+    let mode = match fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.is_file() => platform::mode_of(&metadata).unwrap_or(NEW_FILE_MODE),
         _ => NEW_FILE_MODE,
     };
     if let Some(parent) = target.parent() {
         ensure_dir(parent)?;
     }
 
-    // 目标是符号链接（或目录）时先删掉再写真实文件，绝不写穿链接。
-    match fs::symlink_metadata(&target) {
-        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&target)?,
-        Ok(metadata) if metadata.file_type().is_symlink() => fs::remove_file(&target)?,
+    // 目标是链接（或目录）时先删掉再写真实文件，绝不写穿链接。
+    // 链接必须先判：Windows 的目录型链接同时带目录属性，按目录删会连目标内容一起删。
+    match fs::symlink_metadata(target) {
+        Ok(_) if platform::is_link_like(target) => platform::remove_link(target)?,
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(target)?,
         _ => {}
     }
 
@@ -736,9 +837,11 @@ fn write_snapshot_file(agent_dir: &Path, sync_root: &Path, relative: &str) -> io
             .create_new(true)
             .open(&temp)?;
         file.write_all(&bytes)?;
-        // rename 覆盖已有文件在 Unix 上原子；Windows 会失败，届时改为先 unlink。
-        fs::set_permissions(&temp, fs::Permissions::from_mode(mode))?;
-        fs::rename(&temp, &target)
+        // rename 覆盖已存在的文件在两个平台都成立（Unix 是 rename，Windows 是
+        // MoveFileExW + MOVEFILE_REPLACE_EXISTING）；只有目标是目录才失败，
+        // 而链接与目录已经在上面删掉了。
+        platform::set_mode(&temp, mode)?;
+        fs::rename(&temp, target)
     })();
     if written.is_err() {
         let _ = fs::remove_file(&temp);
@@ -746,16 +849,18 @@ fn write_snapshot_file(agent_dir: &Path, sync_root: &Path, relative: &str) -> io
     written
 }
 
-/// 逐级建目录；遇到符号链接先 unlink 再建真目录，绝不写穿链接。
+/// 逐级建目录；遇到链接先删链接再建真目录，绝不写穿链接。
 fn ensure_dir(dir: &Path) -> io::Result<()> {
     let mut current = PathBuf::new();
     for component in dir.components() {
         current.push(component);
+        // 链接必须先判：Windows 的目录型链接同时带目录属性，当成目录就是写穿。
+        if platform::is_link_like(&current) {
+            platform::remove_link(&current)?;
+            fs::create_dir(&current)?;
+            continue;
+        }
         match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                fs::remove_file(&current)?;
-                fs::create_dir(&current)?;
-            }
             Ok(metadata) if metadata.is_dir() => {}
             Ok(_) => {
                 return Err(io::Error::new(
@@ -781,7 +886,9 @@ fn delete_target(agent_dir: &Path, relative: &str) -> io::Result<()> {
     }
     let target = scope::resolve_within(agent_dir, Path::new(relative)).map_err(to_io_error)?;
 
+    // 链接只删链接本身：Windows 的目录型链接按目录删会连目标内容一起删。
     match fs::symlink_metadata(&target)? {
+        _ if platform::is_link_like(&target) => platform::remove_link(&target),
         metadata if metadata.is_dir() => fs::remove_dir_all(&target),
         _ => fs::remove_file(&target),
     }
@@ -902,6 +1009,7 @@ fn run(
         delete_paths,
         &app_data_dir,
         &ShellRunner::from_env(),
+        &PlatformLinkCreator,
     )
 }
 
@@ -909,7 +1017,8 @@ fn run(
 mod tests {
     use super::*;
     use crate::doctor::CommandOutcome;
-    use std::os::unix::fs::symlink;
+    #[cfg(unix)]
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
@@ -971,6 +1080,7 @@ mod tests {
         fs::write(path, content).expect("写入夹具文件");
     }
 
+    #[cfg(unix)]
     fn mode_of(path: &Path) -> u32 {
         fs::metadata(path)
             .expect("读取文件信息")
@@ -979,6 +1089,7 @@ mod tests {
             & 0o777
     }
 
+    #[cfg(unix)]
     fn set_mode(path: &Path, mode: u32) {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("设置夹具权限");
     }
@@ -1005,7 +1116,7 @@ mod tests {
     }
 
     fn fingerprint(agent: &Path, sync_root: &Path) -> String {
-        plan::plan_snapshot(agent, sync_root, &FakeRunner::ok())
+        plan::plan_snapshot(agent, sync_root, &FakeRunner::ok(), HostOs::Posix)
             .expect("生成夹具计划")
             .manifest_info
             .fingerprint
@@ -1080,6 +1191,7 @@ mod tests {
             &["themes/old.json".to_string()],
             &data,
             &FakeRunner::ok(),
+            &PlatformLinkCreator,
         )
         .expect("应用应成功");
 
@@ -1141,6 +1253,7 @@ mod tests {
             &[],
             &data,
             &FakeRunner::ok(),
+            &PlatformLinkCreator,
         )
         .expect_err("指纹不符必须拒绝");
 
@@ -1159,8 +1272,16 @@ mod tests {
         let expected = fingerprint(&agent, &sync_root);
 
         fs::remove_file(sync_root.join(crate::snapshot::MANIFEST_FILE_NAME)).expect("删 manifest");
-        let failure = apply(&agent, &sync_root, &expected, &[], &data, &FakeRunner::ok())
-            .expect_err("manifest 缺失必须拒绝");
+        let failure = apply(
+            &agent,
+            &sync_root,
+            &expected,
+            &[],
+            &data,
+            &FakeRunner::ok(),
+            &PlatformLinkCreator,
+        )
+        .expect_err("manifest 缺失必须拒绝");
         assert_eq!(failure.code, "manifest_invalid", "{}", failure.message);
 
         // 云盘只传了一半：manifest 还在，但文件内容不符。
@@ -1169,8 +1290,16 @@ mod tests {
             &sync_root.join("snapshot/settings.json"),
             "{\"theme\": \"half\"}",
         );
-        let failure = apply(&agent, &sync_root, &expected, &[], &data, &FakeRunner::ok())
-            .expect_err("哈希不符必须拒绝");
+        let failure = apply(
+            &agent,
+            &sync_root,
+            &expected,
+            &[],
+            &data,
+            &FakeRunner::ok(),
+            &PlatformLinkCreator,
+        )
+        .expect_err("哈希不符必须拒绝");
         assert_eq!(failure.code, "manifest_invalid", "{}", failure.message);
         assert!(
             failure.message.contains("hash_mismatch"),
@@ -1201,6 +1330,7 @@ mod tests {
                 &[path.to_string()],
                 &data,
                 &FakeRunner::ok(),
+                &PlatformLinkCreator,
             )
             .expect_err("不在计划里的删除项必须整次拒绝");
             assert_eq!(failure.code, "delete_not_in_plan", "{path}");
@@ -1210,6 +1340,7 @@ mod tests {
         assert!(backup_ids(&data).is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn backup_records_modes_and_symlink_targets_without_copying_content() {
         let temp = TempDir::new("backup");
@@ -1237,8 +1368,16 @@ mod tests {
         set_mode(&agent.join("settings.json"), 0o640);
         let expected = fingerprint(&agent, &sync_root);
 
-        let report = apply(&agent, &sync_root, &expected, &[], &data, &FakeRunner::ok())
-            .expect("应用应成功");
+        let report = apply(
+            &agent,
+            &sync_root,
+            &expected,
+            &[],
+            &data,
+            &FakeRunner::ok(),
+            &PlatformLinkCreator,
+        )
+        .expect("应用应成功");
 
         // 链接按 manifest 记录重建，外部目标保持原样。
         let metadata = fs::symlink_metadata(agent.join("skills/antd/SKILL.md")).expect("读信息");
@@ -1313,8 +1452,16 @@ mod tests {
         fs::remove_file(agent.join("AGENTS.md")).expect("删除 live 文件");
         let expected = fingerprint(&agent, &sync_root);
 
-        let report = apply(&agent, &sync_root, &expected, &[], &data, &FakeRunner::ok())
-            .expect("应用应成功");
+        let report = apply(
+            &agent,
+            &sync_root,
+            &expected,
+            &[],
+            &data,
+            &FakeRunner::ok(),
+            &PlatformLinkCreator,
+        )
+        .expect("应用应成功");
         assert_eq!(report.written, 1);
 
         let restore = read_restore(&report.backup_dir);
@@ -1323,9 +1470,11 @@ mod tests {
         assert!(!added.existed, "新增文件没有原内容可备份");
         assert_eq!(added.mode, None);
         assert!(!report.backup_dir.join("files/AGENTS.md").exists());
+        #[cfg(unix)]
         assert_eq!(mode_of(&agent.join("AGENTS.md")), NEW_FILE_MODE);
     }
 
+    #[cfg(unix)]
     #[test]
     fn write_failure_stops_and_backup_restores_completed_entries() {
         let temp = TempDir::new("fail");
@@ -1339,8 +1488,16 @@ mod tests {
 
         // 技能目录只读：临时文件创建失败。
         set_mode(&agent.join("skills/antd"), 0o500);
-        let failure = apply(&agent, &sync_root, &expected, &[], &data, &FakeRunner::ok())
-            .expect_err("写入失败必须停下");
+        let failure = apply(
+            &agent,
+            &sync_root,
+            &expected,
+            &[],
+            &data,
+            &FakeRunner::ok(),
+            &PlatformLinkCreator,
+        )
+        .expect_err("写入失败必须停下");
         set_mode(&agent.join("skills/antd"), 0o755);
 
         assert_eq!(failure.code, "apply_failed", "{}", failure.message);
@@ -1387,8 +1544,16 @@ mod tests {
         assert_eq!(backup_ids(&data).len(), 11);
 
         let expected = fingerprint(&agent, &sync_root);
-        let report = apply(&agent, &sync_root, &expected, &[], &data, &FakeRunner::ok())
-            .expect("应用应成功");
+        let report = apply(
+            &agent,
+            &sync_root,
+            &expected,
+            &[],
+            &data,
+            &FakeRunner::ok(),
+            &PlatformLinkCreator,
+        )
+        .expect("应用应成功");
 
         let ids = backup_ids(&data);
         assert_eq!(ids.len(), BACKUP_RETENTION);
@@ -1398,6 +1563,7 @@ mod tests {
     }
 
     /// 宿主目录里的 `skills` 是指向外部目录的链接；快照由该链接导出。
+    #[cfg(unix)]
     fn symlinked_skills_fixture(temp: &TempDir) -> (PathBuf, PathBuf, PathBuf) {
         let agent = temp.path().join("agent");
         let sync_root = temp.path().join("cloud");
@@ -1412,6 +1578,36 @@ mod tests {
     }
 
     #[test]
+    fn plain_directories_are_not_symlink_ancestors() {
+        let temp = TempDir::new("plain-ancestors");
+        let agent = temp.path().join("agent");
+        write_file(&agent.join("skills/antd/SKILL.md"), "# 技能\n");
+
+        assert!(symlink_ancestors(&agent, "skills/antd/SKILL.md").is_empty());
+        assert!(!platform::is_link_like(&agent.join("skills")));
+        assert!(!platform::is_link_like(&agent.join("skills/antd/SKILL.md")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_ancestors_are_reported() {
+        let temp = TempDir::new("linked-ancestors");
+        let agent = temp.path().join("agent");
+        write_file(&temp.path().join("outside/keep.md"), "v1\n");
+        fs::create_dir_all(&agent).expect("创建宿主目录");
+        symlink("../outside", agent.join("skills")).expect("创建目录链接");
+        write_file(&agent.join("skills/keep.md"), "v1\n");
+
+        assert_eq!(
+            symlink_ancestors(&agent, "skills/keep.md"),
+            vec!["skills".to_string()]
+        );
+        // 链接之下的普通文件本身不是链接。
+        assert!(!platform::is_link_like(&agent.join("skills/keep.md")));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn rebuilds_manifest_links_and_skips_writes_under_them() {
         let temp = TempDir::new("rebuild-link");
         let (agent, sync_root, external) = symlinked_skills_fixture(&temp);
@@ -1422,8 +1618,16 @@ mod tests {
         let expected = fingerprint(&agent, &sync_root);
         let external_before = tree(&external);
 
-        let report = apply(&agent, &sync_root, &expected, &[], &data, &FakeRunner::ok())
-            .expect("应用应成功");
+        let report = apply(
+            &agent,
+            &sync_root,
+            &expected,
+            &[],
+            &data,
+            &FakeRunner::ok(),
+            &PlatformLinkCreator,
+        )
+        .expect("应用应成功");
 
         assert_eq!(report.linked, 1);
         assert_eq!(report.written, 0, "链接之下的写入交给链接目标");
@@ -1458,6 +1662,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn broken_link_target_falls_back_to_materializing() {
         let temp = TempDir::new("broken-link");
@@ -1468,8 +1673,16 @@ mod tests {
         fs::remove_dir_all(&external).expect("删除链接目标");
         let expected = fingerprint(&agent, &sync_root);
 
-        let report = apply(&agent, &sync_root, &expected, &[], &data, &FakeRunner::ok())
-            .expect("应用应成功");
+        let report = apply(
+            &agent,
+            &sync_root,
+            &expected,
+            &[],
+            &data,
+            &FakeRunner::ok(),
+            &PlatformLinkCreator,
+        )
+        .expect("应用应成功");
 
         assert_eq!(report.linked, 0, "目标不存在就不重建");
         assert_eq!(report.written, 1);
@@ -1506,6 +1719,256 @@ mod tests {
         );
     }
 
+    /// 平台拒绝建链接：Windows 默认权限下 `ERROR_PRIVILEGE_NOT_HELD` 的替身。
+    struct RefusingLinks;
+
+    impl LinkCreator for RefusingLinks {
+        fn create_link(&self, _target: &str, _path: &Path, _is_dir: bool) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "建链接被拒绝（os error 1314）",
+            ))
+        }
+    }
+
+    /// 宿主目录里的 `skills` 是指向外部目录的链接，目标下有两个文件；快照由该链接导出。
+    #[cfg(unix)]
+    fn nested_symlinked_skills_fixture(temp: &TempDir) -> (PathBuf, PathBuf, PathBuf) {
+        let agent = temp.path().join("agent");
+        let sync_root = temp.path().join("cloud");
+        let external = temp.path().join("outside/skills-live");
+
+        write_file(&external.join("keep.md"), "v1\n");
+        write_file(&external.join("antd/SKILL.md"), "# 技能\n");
+        fs::create_dir_all(&agent).expect("创建宿主目录");
+        symlink("../outside/skills-live", agent.join("skills")).expect("创建目录链接");
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+        crate::snapshot::export(&agent, &sync_root, false).expect("导出夹具快照");
+        (agent, sync_root, external)
+    }
+
+    /// 链接下的内容与快照完全一致：计划里没有任何条目，建链接失败后仍要把整棵子树写回。
+    #[cfg(unix)]
+    #[test]
+    fn failed_link_rebuild_materializes_consistent_subtree() {
+        let temp = TempDir::new("refused-link-consistent");
+        let (agent, sync_root, external) = nested_symlinked_skills_fixture(&temp);
+        let data = app_data(&temp);
+
+        let expected = fingerprint(&agent, &sync_root);
+        let external_before = tree(&external);
+        let report = apply(
+            &agent,
+            &sync_root,
+            &expected,
+            &[],
+            &data,
+            &FakeRunner::ok(),
+            &RefusingLinks,
+        )
+        .expect("退回物化后应用应成功");
+
+        assert_eq!(report.linked, 0, "一条链接也没建成");
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.skipped_deletes, 0);
+        assert_eq!(report.written, 2, "整棵子树的 2 个文件都写回");
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(
+            report.warnings[0].contains("skills"),
+            "{:?}",
+            report.warnings
+        );
+        assert!(
+            report.warnings[0].contains("1314"),
+            "告警要带 OS 错误原文：{:?}",
+            report.warnings
+        );
+        assert!(
+            report.warnings[0].contains("整棵"),
+            "告警要说明写出了整棵内容：{:?}",
+            report.warnings
+        );
+
+        let metadata = fs::symlink_metadata(agent.join("skills")).expect("读 skills 信息");
+        assert!(!metadata.file_type().is_symlink(), "退回物化");
+        assert!(metadata.is_dir());
+        // 计划里一条都没有，这两个文件仍然必须存在且内容正确。
+        assert_eq!(
+            fs::read_to_string(agent.join("skills/keep.md")).expect("读 keep.md"),
+            "v1\n"
+        );
+        assert_eq!(
+            fs::read_to_string(agent.join("skills/antd/SKILL.md")).expect("读 SKILL.md"),
+            "# 技能\n"
+        );
+        assert_eq!(tree(&external), external_before, "链接目标不得被改");
+    }
+
+    /// 链接下的内容只有一部分改动：计划只列出改动项，退回物化仍要写出整棵子树。
+    #[cfg(unix)]
+    #[test]
+    fn failed_link_rebuild_materializes_partially_modified_subtree() {
+        let temp = TempDir::new("refused-link-modified");
+        let (agent, sync_root, external) = nested_symlinked_skills_fixture(&temp);
+        let data = app_data(&temp);
+
+        // 未变的那棵子树不改进；改动的那个文件在计划里只是“修改”。
+        write_file(&external.join("keep.md"), "v2\n");
+        let expected = fingerprint(&agent, &sync_root);
+
+        let report = apply(
+            &agent,
+            &sync_root,
+            &expected,
+            &[],
+            &data,
+            &FakeRunner::ok(),
+            &RefusingLinks,
+        )
+        .expect("退回物化后应用应成功");
+
+        assert_eq!(report.linked, 0);
+        assert_eq!(report.written, 2, "修改项的邻居也必须写回");
+        assert_eq!(report.deleted, 0);
+        assert_eq!(
+            fs::read_to_string(agent.join("skills/keep.md")).expect("读 keep.md"),
+            "v1\n",
+            "按快照写回"
+        );
+        assert_eq!(
+            fs::read_to_string(agent.join("skills/antd/SKILL.md")).expect("读 SKILL.md"),
+            "# 技能\n"
+        );
+        assert_eq!(
+            fs::read_to_string(external.join("keep.md")).expect("读链接目标"),
+            "v2\n",
+            "链接目标本身不写，也不删"
+        );
+    }
+
+    /// 已勾选的删除落在建不成的链接下：跳过并说明原因，整次应用不算失败。
+    #[cfg(unix)]
+    #[test]
+    fn deletes_under_materialized_link_are_skipped_with_warning() {
+        let temp = TempDir::new("skip-delete-under-materialized");
+        let (agent, sync_root, external) = symlinked_skills_fixture(&temp);
+        let data = app_data(&temp);
+
+        write_file(&external.join("extra.md"), "不要删\n");
+        let expected = fingerprint(&agent, &sync_root);
+
+        let report = apply(
+            &agent,
+            &sync_root,
+            &expected,
+            &["skills/extra.md".to_string()],
+            &data,
+            &FakeRunner::ok(),
+            &RefusingLinks,
+        )
+        .expect("链接之下的删除跳过，应用仍成功");
+
+        assert_eq!(report.linked, 0);
+        assert_eq!(report.written, 1, "快照里的 keep.md 写回");
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.skipped_deletes, 1);
+        assert_eq!(report.skipped, 0, "勾选的删除项不算“未勾选保留”");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("skills/extra.md")),
+            "{:?}",
+            report.warnings
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("因链接无法重建，这 1 项删除已跳过")),
+            "{:?}",
+            report.warnings
+        );
+        assert!(agent.join("skills/keep.md").is_file());
+        assert!(
+            !agent.join("skills/extra.md").exists(),
+            "物化只写快照内容，不再带着删除候选"
+        );
+        assert!(external.join("extra.md").is_file(), "链接目标不得被删");
+    }
+
+    /// 建链接失败、物化也失败：整次应用失败，两条原因都带上，备份可回滚。
+    #[cfg(unix)]
+    #[test]
+    fn failed_materialization_stops_with_apply_failed() {
+        let temp = TempDir::new("refused-link-materialize-failed");
+        let agent = temp.path().join("agent");
+        let sync_root = temp.path().join("cloud");
+        let data = app_data(&temp);
+
+        write_file(&temp.path().join("outside/shared-live/note.md"), "方式\n");
+        fs::create_dir_all(agent.join("agents")).expect("创建 agents 目录");
+        symlink(
+            "../../outside/shared-live",
+            agent.join("agents/link-to-shared"),
+        )
+        .expect("创建目录链接");
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+        crate::snapshot::export(&agent, &sync_root, false).expect("导出夹具快照");
+
+        // 链接没了，父目录又不可写：建链接失败之后连物化都落不下去。
+        fs::remove_file(agent.join("agents/link-to-shared")).expect("删除夹具链接");
+        set_mode(&agent.join("agents"), 0o500);
+        let expected = fingerprint(&agent, &sync_root);
+
+        let failure = apply(
+            &agent,
+            &sync_root,
+            &expected,
+            &[],
+            &data,
+            &FakeRunner::ok(),
+            &RefusingLinks,
+        )
+        .expect_err("物化失败必须停在原地");
+        set_mode(&agent.join("agents"), 0o755);
+
+        assert_eq!(failure.code, "apply_failed", "{}", failure.message);
+        assert!(
+            failure
+                .message
+                .contains("agents/link-to-shared 重建链接失败"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("1314"),
+            "要带上建链接失败的原因：{}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("改成写入快照内容也失败"),
+            "要带上物化失败的原因：{}",
+            failure.message
+        );
+        assert_eq!(failure.completed, 0);
+
+        // 失败前已经做完的备份留着：链接与写入都能回滚。
+        let backup_dir = failure.backup_dir.clone().expect("失败要附上备份目录");
+        assert!(backup_dir.is_dir());
+        let restore = read_restore(&backup_dir);
+        assert_eq!(restore.fingerprint, expected);
+        assert!(!entry(&restore, "agents/link-to-shared/note.md").existed);
+        assert!(
+            !agent.join("agents/link-to-shared").exists(),
+            "既没建成链接，也没留下写了一半的内容"
+        );
+        assert!(
+            temp.path().join("outside/shared-live/note.md").is_file(),
+            "链接目标不得被改"
+        );
+    }
+
     #[test]
     fn tampered_manifest_link_outside_scope_is_not_rebuilt() {
         let temp = TempDir::new("link-out-of-scope");
@@ -1528,8 +1991,16 @@ mod tests {
         .expect("写 manifest");
 
         let expected = fingerprint(&agent, &sync_root);
-        let report = apply(&agent, &sync_root, &expected, &[], &data, &FakeRunner::ok())
-            .expect("应用应成功");
+        let report = apply(
+            &agent,
+            &sync_root,
+            &expected,
+            &[],
+            &data,
+            &FakeRunner::ok(),
+            &PlatformLinkCreator,
+        )
+        .expect("应用应成功");
 
         assert_eq!(report.linked, 0);
         assert_eq!(report.written, 0);
@@ -1548,6 +2019,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn deletes_under_rebuilt_link_are_skipped() {
         let temp = TempDir::new("skip-delete-under-link");
@@ -1566,6 +2038,7 @@ mod tests {
             &["skills/extra.md".to_string()],
             &data,
             &FakeRunner::ok(),
+            &PlatformLinkCreator,
         )
         .expect("链接之下的删除跳过，应用仍成功");
 
@@ -1595,6 +2068,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn deleting_under_symlink_ancestor_not_in_manifest_is_rejected() {
         let temp = TempDir::new("delete-through-local-link");
@@ -1617,6 +2091,7 @@ mod tests {
             &["skills/extra.md".to_string()],
             &data,
             &FakeRunner::ok(),
+            &PlatformLinkCreator,
         )
         .expect_err("经符号链接删除必须整次拒绝");
 
@@ -1654,6 +2129,7 @@ mod tests {
             &["prompts/live-only.md".to_string()],
             &data,
             &FakeRunner::ok(),
+            &PlatformLinkCreator,
         )
         .expect("普通删除应成功");
 

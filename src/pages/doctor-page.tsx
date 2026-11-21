@@ -75,7 +75,7 @@ type PreviewState =
 type DeclaredPackage = { source: string; enabled: boolean };
 
 /** 与 Rust 侧 `packages::InstalledPackage` 一一对应。 */
-type InstalledPackage = { source: string; path: string };
+type InstalledPackage = { source: string; path: string; version: string | null };
 
 /** 与 Rust 侧 `packages::PackageStatus` 一一对应。 */
 type PackageStatus = {
@@ -214,7 +214,7 @@ function commandText(argv: string[]): string {
   return argv.map((part) => (/\s/.test(part) ? `"${part}"` : part)).join(' ');
 }
 
-/** 与 Rust 侧 `doctor::sh_quote` 一致：后端拼接的单引号形式，展示时才与执行的一致。 */
+/** 与 Rust 侧 `platform::sh_quote` 一致：后端拼接的单引号形式，展示时才与执行的一致。 */
 function shQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
@@ -328,7 +328,7 @@ export function DoctorPage() {
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-lg">
       <header>
-        <h1 className="text-lg font-semibold text-foreground">环境医生</h1>
+        <h1 className="text-lg font-semibold text-foreground">环境检测</h1>
         <p className="mt-xs text-sm text-muted-foreground">
           只读检查 Node.js、Pi CLI、凭据与扩展包是否就绪。检查过程不写任何文件，也不会安装东西。
         </p>
@@ -596,7 +596,7 @@ function InstallCard({
           )}
           {run.result.status === 'succeeded' && (
             <p className="mt-sm text-xs leading-relaxed text-muted-foreground">
-              已自动重跑环境医生：看上面的 Pi 路径与版本是否更新。若仍提示找不到 pi，请重开终端后再检查。
+              已自动重跑环境检测：看上面的 Pi 路径与版本是否更新。若仍提示找不到 pi，请重开终端后再检查。
             </p>
           )}
         </div>
@@ -691,17 +691,25 @@ function PackagesCard() {
           {status.declared.length > 0 && (
             <PackageList
               title="声明"
-              items={status.declared.map((item) =>
-                item.enabled ? item.source : `${item.source}（已停用，不自动安装）`,
-              )}
+              items={status.declared.map((item, index) => ({
+                key: `${index}-${item.source}`,
+                text: item.enabled
+                  ? item.source
+                  : `${item.source}（已停用，不自动安装）`,
+              }))}
             />
           )}
           {status.installed.length > 0 && (
             <PackageList
               title="实装"
-              items={status.installed.map((item) =>
-                item.path === '' ? item.source : `${item.source} · ${item.path}`,
-              )}
+              items={status.installed.map((item, index) => ({
+                key: `${index}-${item.source}`,
+                text:
+                  item.version === null
+                    ? item.source
+                    : `${item.source} · ${item.version}`,
+                sub: item.path === '' ? undefined : item.path,
+              }))}
             />
           )}
 
@@ -739,7 +747,10 @@ function PackagesCard() {
           {status.extra.length > 0 && (
             <PackageList
               title="多余（不会自动删除，需要时手动 pi remove）"
-              items={status.extra}
+              items={status.extra.map((source, index) => ({
+                key: `${index}-${source}`,
+                text: source,
+              }))}
             />
           )}
 
@@ -840,17 +851,29 @@ function PackagesCard() {
   );
 }
 
-function PackageList({ title, items }: { title: string; items: string[] }) {
+function PackageList({
+  title,
+  items,
+}: {
+  title: string;
+  /** 同一个包可能出现在两条来源里，展示文本会重复：key 由调用方给，不能拿文本顶替。 */
+  items: ReadonlyArray<{ key: string; text: string; sub?: string }>;
+}) {
   return (
     <div className="mt-md">
       <p className="text-xs text-muted-foreground">{title}</p>
       <ul className="mt-xs flex flex-col gap-xs">
         {items.map((item) => (
           <li
-            key={item}
+            key={item.key}
             className="break-all rounded-md bg-surface-muted px-md py-xs font-mono text-xs text-foreground"
           >
-            {item}
+            {item.text}
+            {item.sub !== undefined && (
+              <span className="block font-mono text-xs text-muted-foreground">
+                {item.sub}
+              </span>
+            )}
           </li>
         ))}
       </ul>

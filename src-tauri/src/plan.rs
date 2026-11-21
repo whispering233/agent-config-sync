@@ -8,6 +8,7 @@
 
 use crate::config;
 use crate::doctor::{self, CommandOutcome, CommandRunner, ShellRunner, Version, PROBE_TIMEOUT};
+use crate::platform::{HostOs, ProgramPath};
 use crate::scope::{self, EntryKind};
 use crate::snapshot::{
     self, Manifest, ManifestFile, Requirements, SourceInfo, FORMAT_VERSION, MANIFEST_FILE_NAME,
@@ -161,11 +162,13 @@ impl PlanFailure {
     }
 }
 
-/// core：校验快照并生成计划。`agent_dir` 是 live 宿主目录，`sync_root` 是云盘同步文件夹。
+/// core：校验快照并生成计划。`agent_dir` 是 live 宿主目录，`sync_root` 是云盘同步文件夹；
+/// `host` 只影响宿主版本探测的命令形态（生产传 [`HostOs::current`]）。
 pub fn plan_snapshot(
     agent_dir: &Path,
     sync_root: &Path,
     runner: &dyn CommandRunner,
+    host: HostOs,
 ) -> Result<PlanReport, PlanFailure> {
     let manifest = read_manifest(sync_root)?;
 
@@ -197,7 +200,7 @@ pub fn plan_snapshot(
         },
         plan,
         totals,
-        requirements: requirement_checks(&manifest.requirements, runner),
+        requirements: requirement_checks(&manifest.requirements, agent_dir, runner, host),
     })
 }
 
@@ -436,8 +439,17 @@ fn slash(path: &Path) -> String {
         .join("/")
 }
 
-/// 宿主版本探测：node 用 `node -p process.versions.node`，pi 用 `pi --version`，共用一个 5s 超时。
-fn probe_versions(runner: &dyn CommandRunner) -> (Option<Version>, Option<Version>) {
+/// 宿主版本探测：POSIX 一条登录 shell 脚本（node 用 `node -p process.versions.node`，
+/// pi 用 `pi --version`，共用 5s 超时）；Windows 逐命令跑，与医生、安装页同一套入口解析。
+fn probe_versions(
+    agent_dir: &Path,
+    runner: &dyn CommandRunner,
+    host: HostOs,
+) -> (Option<Version>, Option<Version>) {
+    if host == HostOs::Windows {
+        return probe_versions_windows(agent_dir, runner, &ProgramPath::from_env());
+    }
+
     let stdout = match runner.run(VERSION_PROBE_SCRIPT, PROBE_TIMEOUT, &[]) {
         CommandOutcome::Ok { stdout, .. } | CommandOutcome::Failed { stdout, .. } => stdout,
         // 探测不到就记未知，不阻断计划。
@@ -453,11 +465,40 @@ fn probe_versions(runner: &dyn CommandRunner) -> (Option<Version>, Option<Versio
     (field("node"), field("pi"))
 }
 
+/// Windows 的逐命令版本探测：程序按 PATH 与 PATHEXT 解析，`pi` 再兜底 `<agent_dir>/bin`
+/// 与 npm 全局前缀；解析不到或执行失败都记未知，不阻断计划。
+fn probe_versions_windows(
+    agent_dir: &Path,
+    runner: &dyn CommandRunner,
+    search: &ProgramPath,
+) -> (Option<Version>, Option<Version>) {
+    let node = search
+        .find("node")
+        .and_then(|program| program_version(runner, &program, &["-p", "process.versions.node"]));
+    let npm_prefix = search
+        .find("npm")
+        .and_then(|npm| doctor::npm_global_prefix(runner, &npm));
+    let pi = doctor::find_pi(search, Some(agent_dir), npm_prefix.as_deref())
+        .and_then(|program| program_version(runner, &program, &["--version"]));
+    (node, pi)
+}
+
+fn program_version(runner: &dyn CommandRunner, program: &Path, args: &[&str]) -> Option<Version> {
+    match doctor::probe_program(runner, program, args) {
+        CommandOutcome::Ok { stdout, .. } | CommandOutcome::Failed { stdout, .. } => {
+            doctor::parse_version(&doctor::first_line(&stdout))
+        }
+        CommandOutcome::Timeout | CommandOutcome::Unavailable(_) => None,
+    }
+}
+
 fn requirement_checks(
     requirements: &Requirements,
+    agent_dir: &Path,
     runner: &dyn CommandRunner,
+    host: HostOs,
 ) -> Vec<RequirementCheck> {
-    let (node, pi) = probe_versions(runner);
+    let (node, pi) = probe_versions(agent_dir, runner, host);
     [
         ("node", requirements.node.as_str(), node),
         ("pi", requirements.pi.as_str(), pi),
@@ -525,7 +566,12 @@ fn probe(app: &AppHandle, root: Option<String>) -> Result<PlanReport, PlanFailur
         PlanFailure::new("agent_dir_missing", "无法确定宿主目录，请先在设置页填写")
     })?;
 
-    plan_snapshot(&agent_dir, &sync_root, &ShellRunner::from_env())
+    plan_snapshot(
+        &agent_dir,
+        &sync_root,
+        &ShellRunner::from_env(),
+        HostOs::current(),
+    )
 }
 
 /// 子进程会阻塞最多 5 秒，放阻塞线程池，别占住 UI 线程。
@@ -542,6 +588,7 @@ pub async fn verify_and_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
@@ -615,6 +662,65 @@ mod tests {
         }
     }
 
+    /// 单测统一按 POSIX 形态检查：版本探测走登录 shell 替身，
+    /// 同一组用例在 Windows 上跑也走同一条路。
+    fn plan_snapshot_posix(
+        agent_dir: &Path,
+        sync_root: &Path,
+        runner: &dyn CommandRunner,
+    ) -> Result<PlanReport, PlanFailure> {
+        plan_snapshot(agent_dir, sync_root, runner, HostOs::Posix)
+    }
+
+    /// Windows 逐命令探测的替身：按顺序回放结果，并记下每个 argv。
+    struct FakePrograms {
+        outcomes: RefCell<Vec<CommandOutcome>>,
+        calls: RefCell<Vec<Vec<String>>>,
+    }
+
+    impl FakePrograms {
+        fn new(outcomes: Vec<CommandOutcome>) -> Self {
+            Self {
+                outcomes: RefCell::new(outcomes),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn lines(&self) -> Vec<String> {
+            self.calls
+                .borrow()
+                .iter()
+                .map(|argv| crate::platform::cmd_line_of(argv))
+                .collect()
+        }
+    }
+
+    impl CommandRunner for FakePrograms {
+        fn run(
+            &self,
+            _script: &str,
+            _timeout: Duration,
+            _env: &[(&str, String)],
+        ) -> CommandOutcome {
+            CommandOutcome::Unavailable("Windows 探测不该走脚本入口".to_string())
+        }
+
+        fn run_program(
+            &self,
+            argv: &[String],
+            _timeout: Duration,
+            _env: &[(&str, String)],
+        ) -> CommandOutcome {
+            self.calls.borrow_mut().push(argv.to_vec());
+            let mut outcomes = self.outcomes.borrow_mut();
+            if outcomes.is_empty() {
+                CommandOutcome::Timeout
+            } else {
+                outcomes.remove(0)
+            }
+        }
+    }
+
     fn write_file(path: &Path, content: &str) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("创建父目录");
@@ -680,7 +786,8 @@ mod tests {
         write_file(&agent.join("sessions/late.json"), "{}");
         write_file(&agent.join("auth.json"), "{\"changed\": true}");
 
-        let report = plan_snapshot(&agent, &sync_root, &FakeRunner::ok()).expect("应生成计划");
+        let report =
+            plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok()).expect("应生成计划");
         assert!(report.plan.added.is_empty(), "{:?}", report.plan);
         assert!(report.plan.modified.is_empty(), "{:?}", report.plan);
         assert!(report.plan.deleted.is_empty(), "{:?}", report.plan);
@@ -723,7 +830,8 @@ mod tests {
         write_file(&agent.join("settings.json"), "{\"theme\": \"light\"}");
         write_file(&agent.join("web-search.json"), "{\"provider\": \"exa\"}");
 
-        let report = plan_snapshot(&agent, &sync_root, &FakeRunner::ok()).expect("应生成计划");
+        let report =
+            plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok()).expect("应生成计划");
 
         assert_eq!(paths(&report.plan.added), vec!["skills/antd/SKILL.md"]);
         assert_eq!(paths(&report.plan.modified), vec!["settings.json"]);
@@ -769,7 +877,7 @@ mod tests {
         fs::write(&target, &bytes).expect("改写快照文件");
 
         let failure =
-            plan_snapshot(&agent, &sync_root, &FakeRunner::ok()).expect_err("应报哈希不符");
+            plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok()).expect_err("应报哈希不符");
         assert_eq!(failure.code, "hash_mismatch");
         assert!(
             failure.message.contains("1 个文件不匹配"),
@@ -798,7 +906,7 @@ mod tests {
         fs::remove_file(sync_root.join("snapshot/AGENTS.md")).expect("删除快照文件");
 
         let failure =
-            plan_snapshot(&agent, &sync_root, &FakeRunner::ok()).expect_err("应报哈希不符");
+            plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok()).expect_err("应报哈希不符");
         assert_eq!(failure.code, "hash_mismatch");
         assert_eq!(failure.mismatches.len(), 1);
         assert_eq!(failure.mismatches[0].reason, MismatchReason::Missing);
@@ -832,8 +940,8 @@ mod tests {
         }
         fs::write(&manifest_path, manifest.to_string()).expect("写回 manifest");
 
-        let failure =
-            plan_snapshot(&agent, &sync_root, &FakeRunner::ok()).expect_err("25 条不符应中止");
+        let failure = plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok())
+            .expect_err("25 条不符应中止");
         assert_eq!(failure.code, "hash_mismatch");
         assert_eq!(failure.mismatches.len(), MAX_LISTED_MISMATCHES);
         assert!(
@@ -851,8 +959,8 @@ mod tests {
         write_file(&agent.join("settings.json"), "{}");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
 
-        let failure =
-            plan_snapshot(&agent, &sync_root, &FakeRunner::ok()).expect_err("缺 manifest 应失败");
+        let failure = plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok())
+            .expect_err("缺 manifest 应失败");
         assert_eq!(failure.code, "manifest_missing");
 
         fs::write(
@@ -860,13 +968,14 @@ mod tests {
             "{\"formatVersion\": 99}",
         )
         .expect("写 manifest");
-        let failure =
-            plan_snapshot(&agent, &sync_root, &FakeRunner::ok()).expect_err("版本不支持应失败");
+        let failure = plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok())
+            .expect_err("版本不支持应失败");
         assert_eq!(failure.code, "manifest_unsupported");
         assert!(failure.message.contains("99"), "{}", failure.message);
 
         fs::write(sync_root.join(MANIFEST_FILE_NAME), "not json").expect("写坏 manifest");
-        let failure = plan_snapshot(&agent, &sync_root, &FakeRunner::ok()).expect_err("损坏应失败");
+        let failure =
+            plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok()).expect_err("损坏应失败");
         assert_eq!(failure.code, "manifest_corrupt");
 
         // 合法 JSON 但缺 formatVersion：同样是损坏。
@@ -876,7 +985,7 @@ mod tests {
         )
         .expect("写缺字段 manifest");
         let failure =
-            plan_snapshot(&agent, &sync_root, &FakeRunner::ok()).expect_err("缺字段应失败");
+            plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok()).expect_err("缺字段应失败");
         assert_eq!(failure.code, "manifest_corrupt");
 
         // 版本对了但字段不全：结构损坏，不是"版本不支持"。
@@ -886,7 +995,7 @@ mod tests {
         )
         .expect("写不完整 manifest");
         let failure =
-            plan_snapshot(&agent, &sync_root, &FakeRunner::ok()).expect_err("结构不全应失败");
+            plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok()).expect_err("结构不全应失败");
         assert_eq!(failure.code, "manifest_corrupt");
     }
 
@@ -915,7 +1024,8 @@ mod tests {
         fs::write(&manifest_path, manifest.to_string()).expect("写回 manifest");
 
         // 计划里不得出现 auth.json：它既不是新增也不参与比较。
-        let report = plan_snapshot(&agent, &sync_root, &FakeRunner::ok()).expect("应生成计划");
+        let report =
+            plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok()).expect("应生成计划");
         assert!(report.plan.added.is_empty(), "{:?}", report.plan.added);
         assert!(report.plan.modified.is_empty());
         assert!(report.plan.deleted.is_empty());
@@ -941,8 +1051,8 @@ mod tests {
         fs::remove_file(agent.join("AGENTS.md")).expect("删除 live 指令文件");
         write_file(&agent.join("settings.json"), "{\"theme\": \"light\"}");
 
-        let first = plan_snapshot(&agent, &sync_root, &FakeRunner::ok()).expect("第一次");
-        let second = plan_snapshot(&agent, &sync_root, &FakeRunner::ok()).expect("第二次");
+        let first = plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok()).expect("第一次");
+        let second = plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok()).expect("第二次");
         assert_eq!(first, second);
 
         for group in [&first.plan.added, &first.plan.modified, &first.plan.deleted] {
@@ -973,16 +1083,60 @@ mod tests {
             node: "22.18.0",
             pi: "1.4.9",
         };
-        let report = plan_snapshot(&agent, &sync_root, &old).expect("版本不满足也要出计划");
+        let report = plan_snapshot_posix(&agent, &sync_root, &old).expect("版本不满足也要出计划");
         assert_eq!(report.requirements[0].satisfied, Some(false));
         assert_eq!(report.requirements[0].found.as_deref(), Some("22.18.0"));
         assert_eq!(report.requirements[1].satisfied, Some(false));
         assert_eq!(report.totals.unchanged, 3);
 
         // 探测失败：记未知，不误报为不满足。
-        let report = plan_snapshot(&agent, &sync_root, &TimeoutRunner).expect("探测失败也要出计划");
+        let report =
+            plan_snapshot_posix(&agent, &sync_root, &TimeoutRunner).expect("探测失败也要出计划");
         assert_eq!(report.requirements[0].satisfied, None);
         assert!(report.requirements[0].found.is_none());
         assert_eq!(report.requirements[1].satisfied, None);
+    }
+
+    #[test]
+    fn windows_version_probe_runs_one_command_each() {
+        let temp = TempDir::new("windows-versions");
+        let bin = temp.path().join("bin");
+        fs::create_dir_all(&bin).expect("建目录");
+        fs::write(bin.join("node.exe"), "").expect("写文件");
+        fs::write(bin.join("pi.cmd"), "").expect("写文件");
+        let search = ProgramPath::new(vec![bin.clone()], vec![".exe".into(), ".cmd".into()]);
+
+        let runner = FakePrograms::new(vec![
+            CommandOutcome::Ok {
+                stdout: "22.23.0\n".to_string(),
+                stderr: String::new(),
+            },
+            CommandOutcome::Ok {
+                stdout: "1.5.2\n".to_string(),
+                stderr: String::new(),
+            },
+        ]);
+        let (node, pi) = probe_versions_windows(temp.path(), &runner, &search);
+
+        assert_eq!(node, Some((22, 23, 0)));
+        assert_eq!(pi, Some((1, 5, 2)));
+        let node_program = bin.join("node.exe").display().to_string();
+        let pi_program = bin.join("pi.cmd").display().to_string();
+        assert_eq!(
+            runner.lines(),
+            vec![
+                crate::platform::cmd_line(&node_program, &["-p", "process.versions.node"]),
+                crate::platform::cmd_line(&pi_program, &["--version"]),
+            ]
+        );
+
+        // 解析不到程序就不起进程：版本记未知，不误报为不满足。
+        let empty = ProgramPath::new(Vec::new(), vec![".exe".into()]);
+        let runner = FakePrograms::new(Vec::new());
+        assert_eq!(
+            probe_versions_windows(temp.path(), &runner, &empty),
+            (None, None)
+        );
+        assert!(runner.calls.borrow().is_empty());
     }
 }

@@ -56,7 +56,7 @@ Pi CLI 配置的换机交付工具（手动快照交付，不做实时同步）�
 ## 验证
 
 ```bash
-cd src-tauri && cargo test      # 期望全绿（239 通过 + 2 个 ignored 的真机测试）
+cd src-tauri && cargo test      # 期望全绿（另含需真机环境的 ignored 测试）
 cd src-tauri && cargo check
 cd src-tauri && cargo fmt -- --check
 npm run build
@@ -67,7 +67,7 @@ npm run build
 - 文件遍历、manifest、哈希、密钥扫描、应用/回滚、包/安装必须有单元测试与临时目录夹具。
 - UI 验证交给子代理，条目数给定上限，只报不修。
 - 每个任务卡必须能独立验证、独立回滚。
-- 打包：`npm run tauri build -- --bundles deb,appimage`（AppImage 需要能访问 GitHub release 下载 runtime）。
+- 打包：`npm run tauri -- build --bundles deb,appimage`（AppImage 需要能访问 GitHub release 下载 runtime）。
 
 ## 提交
 

@@ -5,13 +5,14 @@
 //! 全程只读：只读文件与环境，不写文件、不改环境变量、不安装任何东西。
 
 use crate::config::{self, AGENT_DIR_ENV_VAR};
+use crate::platform::{self, HostOs, ProgramPath};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// 普通探测的超时。
@@ -84,18 +85,30 @@ pub enum CommandOutcome {
 
 /// 命令执行器。生产用 [`ShellRunner`]，单测用假实现。
 pub trait CommandRunner {
+    /// POSIX 登录 shell 入口：一条脚本里跑多个探测，靠哨兵分段取回结果。
     fn run(&self, script: &str, timeout: Duration, env: &[(&str, String)]) -> CommandOutcome;
+    /// 逐命令入口：直接起 `argv[0]`，不经脚本包装。Windows 上的探测与安装全走这条。
+    ///
+    /// 不跑进程的替身只需实现 [`CommandRunner::run`]；万一有人把逐命令探测接到
+    /// 未实现它的替身上，这里报「无法启动」而不是默默返回空输出。
+    fn run_program(
+        &self,
+        _argv: &[String],
+        _timeout: Duration,
+        _env: &[(&str, String)],
+    ) -> CommandOutcome {
+        CommandOutcome::Unavailable("当前执行器不支持逐命令调用".to_string())
+    }
 }
 
 /// 通过登录 shell 执行命令：GUI 进程的 PATH 通常不含 nvm/fnm/mise 的路径。
+/// Windows 上没有登录 shell，探测与安装统一走 [`CommandRunner::run_program`]。
 pub struct ShellRunner {
     shell: OsString,
 }
 
 impl ShellRunner {
     /// `$SHELL -lc`；没有该变量时退回 `sh`。
-    ///
-    /// shortcut: Windows 需要 `cmd /C`，v1 只支持 Linux，按 POSIX 处理。
     pub fn from_env() -> Self {
         Self {
             shell: std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("sh")),
@@ -105,65 +118,88 @@ impl ShellRunner {
 
 impl CommandRunner for ShellRunner {
     fn run(&self, script: &str, timeout: Duration, env: &[(&str, String)]) -> CommandOutcome {
-        let mut command = Command::new(&self.shell);
-        command
-            .arg("-lc")
-            .arg(script)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let argv = vec![
+            self.shell.to_string_lossy().into_owned(),
+            "-lc".to_string(),
+            script.to_string(),
+        ];
+        self.run_program(&argv, timeout, env)
+    }
+
+    fn run_program(
+        &self,
+        argv: &[String],
+        timeout: Duration,
+        env: &[(&str, String)],
+    ) -> CommandOutcome {
+        let mut command = match platform::build_command(argv) {
+            Ok(command) => command,
+            Err(detail) => return CommandOutcome::Unavailable(detail),
+        };
         for (key, value) in env {
             command.env(key, value);
         }
-
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => return CommandOutcome::Unavailable(error.to_string()),
-        };
-
-        // 并行读两个管道：边读边轮询，避免子进程写满管道后卡住把超时拖成死锁。
-        let stdout_reader = child.stdout.take().map(spawn_reader);
-        let stderr_reader = child.stderr.take().map(spawn_reader);
-        let deadline = Instant::now() + timeout;
-        let mut timed_out = false;
-
-        let exit = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) => {
-                    if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        timed_out = true;
-                        break None;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return CommandOutcome::Unavailable(error.to_string());
-                }
-            }
-        };
-
-        let stdout = join_reader(stdout_reader);
-        let stderr = join_reader(stderr_reader);
-
-        if timed_out {
-            return CommandOutcome::Timeout;
-        }
-
-        match exit {
-            Some(status) if status.success() => CommandOutcome::Ok { stdout, stderr },
-            Some(status) => CommandOutcome::Failed {
-                code: status.code(),
-                stdout,
-                stderr,
-            },
-            None => CommandOutcome::Timeout,
-        }
+        run_child(command, timeout, false)
     }
+}
+
+/// 起一个子进程并把两条管道都读回来。`group` 为真时 POSIX 下独立成进程组，
+/// 超时整组终止（安装命令用它）。
+pub(crate) fn run_child(mut command: Command, timeout: Duration, group: bool) -> CommandOutcome {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    platform::isolate_group(&mut command, group);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return CommandOutcome::Unavailable(error.to_string()),
+    };
+
+    // 并行读两个管道：边读边轮询，避免子进程写满管道后卡住把超时拖成死锁。
+    let stdout_reader = child.stdout.take().map(spawn_reader);
+    let stderr_reader = child.stderr.take().map(spawn_reader);
+    let deadline = Instant::now() + timeout;
+
+    let exit = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() >= deadline => {
+                kill_tree(&mut child, group);
+                break None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => {
+                kill_tree(&mut child, group);
+                return CommandOutcome::Unavailable(error.to_string());
+            }
+        }
+    };
+
+    let stdout = join_reader(stdout_reader);
+    let stderr = join_reader(stderr_reader);
+
+    match exit {
+        Some(status) if status.success() => CommandOutcome::Ok { stdout, stderr },
+        Some(status) => CommandOutcome::Failed {
+            code: status.code(),
+            stdout,
+            stderr,
+        },
+        None => CommandOutcome::Timeout,
+    }
+}
+
+/// 先按平台杀整棵树或整个进程组，再兜底杀直接子进程并回收。
+/// Windows 的 `child.kill()` 只杀 `cmd.exe`，npm 派生的子进程会活下来。
+fn kill_tree(child: &mut Child, group: bool) {
+    platform::kill_tree(child.id());
+    if group {
+        platform::kill_group(child.id());
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn spawn_reader(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
@@ -265,6 +301,182 @@ fn section_data(outcome: &CommandOutcome, id: &str) -> SectionData {
     }
 }
 
+/// 取第一行并去掉首尾空白：宿主 CLI 的版本号可能带前缀或换行。
+pub(crate) fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or_default().trim().to_string()
+}
+
+/// 按 Windows 的形态跑一次逐命令探测：`.cmd` 中间层经 `cmd /C`。
+/// 参数不是合法命令行（含 cmd 会展开的字符）时直接判为无法启动。
+pub(crate) fn probe_program(
+    runner: &dyn CommandRunner,
+    program: &Path,
+    args: &[&str],
+) -> CommandOutcome {
+    match platform::program_argv(HostOs::Windows, &program.display().to_string(), args) {
+        Ok(argv) => runner.run_program(&argv, PROBE_TIMEOUT, &[]),
+        Err(detail) => CommandOutcome::Unavailable(detail),
+    }
+}
+
+/// 一次逐命令探测：解析到的程序路径与执行结果。
+struct ProgramProbe {
+    program: String,
+    outcome: CommandOutcome,
+}
+
+impl ProgramProbe {
+    fn run(runner: &dyn CommandRunner, program: &Path, args: &[&str]) -> Self {
+        Self {
+            program: program.display().to_string(),
+            outcome: probe_program(runner, program, args),
+        }
+    }
+
+    fn stdout(&self) -> &str {
+        match &self.outcome {
+            CommandOutcome::Ok { stdout, .. } | CommandOutcome::Failed { stdout, .. } => stdout,
+            CommandOutcome::Timeout | CommandOutcome::Unavailable(_) => "",
+        }
+    }
+
+    /// 该探测对应的段视图：命令跑起来了就带上 `path`，其余字段由各探测补。
+    /// 非零退出或没有输出只让字段为空，「找到但执行失败」因此仍能报出入口位置。
+    fn section(&self, fields: &[(&str, &str)]) -> SectionData {
+        match &self.outcome {
+            CommandOutcome::Timeout => SectionData::Timeout,
+            CommandOutcome::Unavailable(detail) => SectionData::Unavailable(detail.clone()),
+            CommandOutcome::Ok { stdout, .. } | CommandOutcome::Failed { stdout, .. } => {
+                let mut map = BTreeMap::new();
+                map.insert("path".to_string(), self.program.clone());
+                for (key, value) in fields {
+                    map.insert((*key).to_string(), (*value).to_string());
+                }
+                SectionData::Body {
+                    raw: stdout.clone(),
+                    fields: map,
+                }
+            }
+        }
+    }
+}
+
+/// 快速组的三个探测结果。POSIX 从一条登录 shell 脚本的哨兵段里取；Windows 每个探测点
+/// 单独起进程（`.cmd` 中间层经 `cmd /d /s /c`），不再拼批处理。
+struct FastProbes {
+    node: SectionData,
+    npm: SectionData,
+    pi: SectionData,
+}
+
+fn fast_probes(
+    runner: &dyn CommandRunner,
+    agent_dir: Option<&Path>,
+    search: &ProgramPath,
+    host: HostOs,
+) -> FastProbes {
+    if host == HostOs::Windows {
+        return windows_probes(runner, search, agent_dir);
+    }
+
+    let env = [(
+        "PI_DOCTOR_AGENT_DIR",
+        agent_dir
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default(),
+    )];
+    let outcome = runner.run(&fast_script(), PROBE_TIMEOUT, &env);
+    FastProbes {
+        node: section_data(&outcome, "node"),
+        npm: section_data(&outcome, "npm"),
+        pi: section_data(&outcome, "pi"),
+    }
+}
+
+fn windows_probes(
+    runner: &dyn CommandRunner,
+    search: &ProgramPath,
+    agent_dir: Option<&Path>,
+) -> FastProbes {
+    let node = windows_node(runner, search);
+    let (npm, prefix) = windows_npm(runner, search);
+    let pi = windows_pi(runner, search, agent_dir, prefix.as_deref());
+    FastProbes { node, npm, pi }
+}
+
+fn windows_node(runner: &dyn CommandRunner, search: &ProgramPath) -> SectionData {
+    let Some(program) = search.find("node") else {
+        return SectionData::Missing;
+    };
+    let probe = ProgramProbe::run(runner, &program, &["-p", "process.versions.node"]);
+    let version = first_line(probe.stdout());
+    probe.section(&[("version", &version)])
+}
+
+/// `npm -v` 与 `npm prefix -g`：全局前缀稍后用来兜底找 `pi.cmd`。
+fn windows_npm(runner: &dyn CommandRunner, search: &ProgramPath) -> (SectionData, Option<String>) {
+    let Some(program) = search.find("npm") else {
+        return (SectionData::Missing, None);
+    };
+
+    let version = ProgramProbe::run(runner, &program, &["-v"]);
+    if matches!(
+        version.outcome,
+        CommandOutcome::Timeout | CommandOutcome::Unavailable(_)
+    ) {
+        return (version.section(&[]), None);
+    }
+
+    let prefix = npm_global_prefix(runner, &program).unwrap_or_default();
+    let value = first_line(version.stdout());
+    let section = version.section(&[("version", &value), ("prefix", &prefix)]);
+    let fallback = (!prefix.is_empty()).then_some(prefix);
+    (section, fallback)
+}
+
+/// npm 全局前缀：`npm prefix -g` 的第一行。找不到 `pi` 时靠它兜底，
+/// 安装页与包对齐页也走这里，避免“检测说装了、安装页说没装”。
+pub(crate) fn npm_global_prefix(runner: &dyn CommandRunner, npm: &Path) -> Option<String> {
+    let prefix = first_line(ProgramProbe::run(runner, npm, &["prefix", "-g"]).stdout());
+    (!prefix.is_empty()).then_some(prefix)
+}
+
+fn windows_pi(
+    runner: &dyn CommandRunner,
+    search: &ProgramPath,
+    agent_dir: Option<&Path>,
+    npm_prefix: Option<&str>,
+) -> SectionData {
+    let Some(program) = find_pi(search, agent_dir, npm_prefix) else {
+        return SectionData::Missing;
+    };
+
+    let version = ProgramProbe::run(runner, &program, &["--version"]);
+    if matches!(
+        version.outcome,
+        CommandOutcome::Timeout | CommandOutcome::Unavailable(_)
+    ) {
+        return version.section(&[]);
+    }
+
+    let list = ProgramProbe::run(runner, &program, &["list"]);
+    let value = first_line(version.stdout());
+    version.section(&[("version", &value), ("list", list.stdout().trim())])
+}
+
+/// `pi` 入口：先看 PATH，再兜底 `<agent_dir>/bin` 与 npm 全局前缀；都没有就算未找到。
+/// 检测、安装与包对齐三处都走这里，入口判断不会不一致。
+pub(crate) fn find_pi(
+    search: &ProgramPath,
+    agent_dir: Option<&Path>,
+    npm_prefix: Option<&str>,
+) -> Option<PathBuf> {
+    search
+        .find("pi")
+        .or_else(|| agent_dir.and_then(|dir| search.find_in(&dir.join("bin"), "pi")))
+        .or_else(|| npm_prefix.and_then(|prefix| search.find_in(Path::new(prefix), "pi")))
+}
+
 fn record(
     id: &str,
     status: CheckStatus,
@@ -362,15 +574,10 @@ if [ -z "$p" ]; then
 else
   "$p" auth check --provider {} --json 2>&1
 fi"#,
-        sh_quote(pi_path),
-        sh_quote(provider)
+        platform::sh_quote(pi_path),
+        platform::sh_quote(provider)
     );
     section("auth", &body)
-}
-
-/// 单引号包裹并转义，避免 provider id 里的字符逃出引号。
-pub(crate) fn sh_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn platform() -> Platform {
@@ -430,15 +637,15 @@ fn agent_dir_check(agent_dir: Option<&Path>) -> Check {
     }
 }
 
-fn node_checks(outcome: &CommandOutcome) -> Vec<Check> {
-    match section_data(outcome, "node") {
+fn node_checks(section: &SectionData) -> Vec<Check> {
+    match section {
         SectionData::Timeout => vec![
             unknown("node.path", "探测超时（probe_timeout）"),
             unknown("node.version", "探测超时（probe_timeout）"),
         ],
         SectionData::Unavailable(detail) => vec![
-            unknown("node.path", &detail),
-            unknown("node.version", &detail),
+            unknown("node.path", detail),
+            unknown("node.version", detail),
         ],
         SectionData::Missing => vec![
             fail(
@@ -506,10 +713,10 @@ fn node_checks(outcome: &CommandOutcome) -> Vec<Check> {
     }
 }
 
-fn npm_checks(outcome: &CommandOutcome) -> Vec<Check> {
-    match section_data(outcome, "npm") {
+fn npm_checks(section: &SectionData) -> Vec<Check> {
+    match section {
         SectionData::Timeout => vec![unknown("npm", "探测超时（probe_timeout）")],
-        SectionData::Unavailable(detail) => vec![unknown("npm", &detail)],
+        SectionData::Unavailable(detail) => vec![unknown("npm", detail)],
         SectionData::Missing => vec![fail(
             "npm",
             "登录 shell 里找不到 npm（tool_not_found）",
@@ -554,8 +761,8 @@ fn npm_checks(outcome: &CommandOutcome) -> Vec<Check> {
     }
 }
 
-fn pi_checks(outcome: &CommandOutcome) -> (Vec<Check>, Option<String>, Option<String>) {
-    match section_data(outcome, "pi") {
+fn pi_checks(section: &SectionData) -> (Vec<Check>, Option<String>, Option<String>) {
+    match section {
         SectionData::Timeout => (
             vec![
                 unknown("pi.path", "探测超时（probe_timeout）"),
@@ -565,7 +772,7 @@ fn pi_checks(outcome: &CommandOutcome) -> (Vec<Check>, Option<String>, Option<St
             None,
         ),
         SectionData::Unavailable(detail) => (
-            vec![unknown("pi.path", &detail), unknown("pi.version", &detail)],
+            vec![unknown("pi.path", detail), unknown("pi.version", detail)],
             None,
             None,
         ),
@@ -642,7 +849,7 @@ fn install_kind_check(agent_dir: Option<&Path>, pi_path: Option<&str>) -> Check 
     }
 
     match pi_path {
-        Some(path) if path.contains("node_modules") => pass(
+        Some(path) if platform::is_npm_install_path(path) => pass(
             "pi.install_kind",
             Some("npm 全局安装".to_string()),
             Some(path.to_string()),
@@ -664,6 +871,7 @@ fn auth_checks(
     agent_dir: Option<&Path>,
     pi_path: Option<&str>,
     runner: &dyn CommandRunner,
+    host: HostOs,
 ) -> Vec<Check> {
     let providers = match provider_ids(agent_dir) {
         Ok(providers) => providers,
@@ -673,23 +881,70 @@ fn auth_checks(
         return vec![pass("auth", Some("没有配置 provider".to_string()), None)];
     }
 
-    let env = [("PI_DOCTOR_PI", pi_path.unwrap_or_default().to_string())];
     providers
         .into_iter()
-        .map(|provider| {
-            let outcome = runner.run(
-                &auth_script(pi_path.unwrap_or_default(), &provider),
-                AUTH_TIMEOUT,
-                &env,
-            );
-            auth_check(&provider, &outcome)
-        })
+        .map(|provider| auth_check(&provider, auth_probe(pi_path, &provider, runner, host)))
         .collect()
 }
 
-fn auth_check(provider: &str, outcome: &CommandOutcome) -> Check {
+/// 一次凭据探测。POSIX 走登录 shell 脚本；Windows 直接跑 `pi auth check`，provider id
+/// 来自用户配置，必须经 [`platform::program_argv`] 按平台转义后再拼。
+fn auth_probe(
+    pi_path: Option<&str>,
+    provider: &str,
+    runner: &dyn CommandRunner,
+    host: HostOs,
+) -> SectionData {
+    if host == HostOs::Windows {
+        return auth_probe_windows(pi_path, provider, runner);
+    }
+
+    let outcome = runner.run(
+        &auth_script(pi_path.unwrap_or_default(), provider),
+        AUTH_TIMEOUT,
+        &[],
+    );
+    section_data(&outcome, "auth")
+}
+
+fn auth_probe_windows(
+    pi_path: Option<&str>,
+    provider: &str,
+    runner: &dyn CommandRunner,
+) -> SectionData {
+    let program = pi_path.map(str::to_string).or_else(|| {
+        ProgramPath::from_env()
+            .find("pi")
+            .map(|path| path.display().to_string())
+    });
+    let Some(program) = program else {
+        return SectionData::Missing;
+    };
+    let argv = match platform::program_argv(
+        HostOs::Windows,
+        &program,
+        &["auth", "check", "--provider", provider, "--json"],
+    ) {
+        Ok(argv) => argv,
+        Err(detail) => return SectionData::Unavailable(detail),
+    };
+
+    match runner.run_program(&argv, AUTH_TIMEOUT, &[]) {
+        // 段内容就是 JSON 原文，只看 stdout：stderr 是给人看的错误信息。
+        CommandOutcome::Ok { stdout, .. } | CommandOutcome::Failed { stdout, .. } => {
+            SectionData::Body {
+                raw: stdout,
+                fields: BTreeMap::new(),
+            }
+        }
+        CommandOutcome::Timeout => SectionData::Timeout,
+        CommandOutcome::Unavailable(detail) => SectionData::Unavailable(detail),
+    }
+}
+
+fn auth_check(provider: &str, section: SectionData) -> Check {
     let id = format!("auth:{provider}");
-    match section_data(outcome, "auth") {
+    match section {
         SectionData::Timeout => unknown(&id, "凭据检查超时（probe_timeout）"),
         SectionData::Unavailable(detail) => unknown(&id, &detail),
         SectionData::Missing => fail(
@@ -877,7 +1132,8 @@ fn skills_check(agent_dir: Option<&Path>) -> Check {
     )
 }
 
-/// 统计 `skills/` 下的符号链接与断链，返回 (链接数, 断链名)。
+/// 统计 `skills/` 下的链接类条目与断链，返回 (链接数, 断链名)。
+/// Windows 的 junction 也算链接，所以判定走 [`platform::link_like`]。
 pub fn skills_links(skills: &Path) -> Result<(usize, Vec<String>), std::io::Error> {
     let mut links = 0;
     let mut broken = Vec::new();
@@ -885,19 +1141,21 @@ pub fn skills_links(skills: &Path) -> Result<(usize, Vec<String>), std::io::Erro
     for entry in fs::read_dir(skills)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
-        if !file_type.is_symlink() {
+        let path = entry.path();
+        if !platform::link_like(file_type.is_symlink(), &fs::read_link(&path)) {
             continue;
         }
         links += 1;
 
-        let path = entry.path();
-        let target = fs::read_link(&path)?;
-        let resolved = if target.is_absolute() {
-            target
-        } else {
-            skills.join(target)
-        };
-        if fs::metadata(&resolved).is_err() {
+        // 链接类却读不到目标：目标无从验证，按断链处理。
+        let resolved = fs::read_link(&path).ok().map(|target| {
+            if target.is_absolute() {
+                target
+            } else {
+                skills.join(target)
+            }
+        });
+        if resolved.is_none_or(|target| fs::metadata(&target).is_err()) {
             broken.push(entry.file_name().to_string_lossy().to_string());
         }
     }
@@ -1061,25 +1319,20 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
-/// 执行一次完整检查。只读：只有读文件与读命令输出。
-pub fn check(agent_dir: Option<&Path>, runner: &dyn CommandRunner) -> DoctorReport {
+/// 执行一次完整检查。只读：只有读文件与读命令输出。`host` 由调用方给定：
+/// 生产传 [`HostOs::current`]，单测显式指定，这样两条命令形态在任意平台上都能断言。
+pub fn check(agent_dir: Option<&Path>, runner: &dyn CommandRunner, host: HostOs) -> DoctorReport {
     let mut checks = vec![platform_check(), agent_dir_check(agent_dir)];
 
     // 子进程串行执行：同时最多 2 个的上限自然满足，也不会拖慢宿主。
-    let fast_env = [(
-        "PI_DOCTOR_AGENT_DIR",
-        agent_dir
-            .map(|dir| dir.display().to_string())
-            .unwrap_or_default(),
-    )];
-    let fast_outcome = runner.run(&fast_script(), PROBE_TIMEOUT, &fast_env);
+    let probes = fast_probes(runner, agent_dir, &ProgramPath::from_env(), host);
 
-    checks.extend(node_checks(&fast_outcome));
-    checks.extend(npm_checks(&fast_outcome));
-    let (pi, pi_path, pi_list) = pi_checks(&fast_outcome);
+    checks.extend(node_checks(&probes.node));
+    checks.extend(npm_checks(&probes.npm));
+    let (pi, pi_path, pi_list) = pi_checks(&probes.pi);
     checks.extend(pi);
     checks.push(install_kind_check(agent_dir, pi_path.as_deref()));
-    checks.extend(auth_checks(agent_dir, pi_path.as_deref(), runner));
+    checks.extend(auth_checks(agent_dir, pi_path.as_deref(), runner, host));
     checks.push(packages_check(agent_dir, pi_list.as_deref()));
     checks.push(skills_check(agent_dir));
 
@@ -1104,7 +1357,11 @@ fn probe(app: &tauri::AppHandle) -> Result<DoctorReport, String> {
     let resolved =
         config::resolve_agent_dir(&config, env_agent_dir.as_deref(), home_dir.as_deref());
 
-    Ok(check(resolved.path.as_deref(), &ShellRunner::from_env()))
+    Ok(check(
+        resolved.path.as_deref(),
+        &ShellRunner::from_env(),
+        HostOs::current(),
+    ))
 }
 
 /// 子进程会阻塞 5 到 15 秒，放阻塞线程池，别占住 UI 线程。
@@ -1112,7 +1369,7 @@ fn probe(app: &tauri::AppHandle) -> Result<DoctorReport, String> {
 pub async fn run_check(app: tauri::AppHandle) -> Result<DoctorReport, String> {
     tauri::async_runtime::spawn_blocking(move || probe(&app))
         .await
-        .map_err(|error| format!("医生检查失败：{error}"))?
+        .map_err(|error| format!("环境检测失败：{error}"))?
 }
 
 #[cfg(test)]
@@ -1165,10 +1422,11 @@ mod tests {
         }
     }
 
-    /// 假命令执行器：按调用顺序返回预置结果，并记录收到的脚本与超时。
+    /// 假命令执行器：按调用顺序返回预置结果，并记录收到的脚本与逐命令调用。
     struct FakeRunner {
         outcomes: RefCell<Vec<CommandOutcome>>,
         calls: RefCell<Vec<(String, Duration)>>,
+        programs: RefCell<Vec<(Vec<String>, Duration)>>,
     }
 
     impl FakeRunner {
@@ -1176,6 +1434,7 @@ mod tests {
             Self {
                 outcomes: RefCell::new(outcomes),
                 calls: RefCell::new(Vec::new()),
+                programs: RefCell::new(Vec::new()),
             }
         }
 
@@ -1186,11 +1445,12 @@ mod tests {
         fn calls(&self) -> Vec<(String, Duration)> {
             self.calls.borrow().clone()
         }
-    }
 
-    impl CommandRunner for FakeRunner {
-        fn run(&self, script: &str, timeout: Duration, _env: &[(&str, String)]) -> CommandOutcome {
-            self.calls.borrow_mut().push((script.to_string(), timeout));
+        fn programs(&self) -> Vec<(Vec<String>, Duration)> {
+            self.programs.borrow().clone()
+        }
+
+        fn next_outcome(&self) -> CommandOutcome {
             let mut outcomes = self.outcomes.borrow_mut();
             if outcomes.is_empty() {
                 CommandOutcome::Timeout
@@ -1200,11 +1460,53 @@ mod tests {
         }
     }
 
+    impl CommandRunner for FakeRunner {
+        fn run(&self, script: &str, timeout: Duration, _env: &[(&str, String)]) -> CommandOutcome {
+            self.calls.borrow_mut().push((script.to_string(), timeout));
+            self.next_outcome()
+        }
+
+        fn run_program(
+            &self,
+            argv: &[String],
+            timeout: Duration,
+            _env: &[(&str, String)],
+        ) -> CommandOutcome {
+            self.programs.borrow_mut().push((argv.to_vec(), timeout));
+            self.next_outcome()
+        }
+    }
+
     fn ok(stdout: &str) -> CommandOutcome {
         CommandOutcome::Ok {
             stdout: stdout.to_string(),
             stderr: String::new(),
         }
+    }
+
+    fn failed(code: i32, stderr: &str) -> CommandOutcome {
+        CommandOutcome::Failed {
+            code: Some(code),
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+        }
+    }
+
+    /// Windows 的 PATH 与 PATHEXT 替身：后缀顺序取真实默认值的前三个。
+    fn windows_search(dirs: &[&Path]) -> ProgramPath {
+        ProgramPath::new(
+            dirs.iter().map(|dir| dir.to_path_buf()).collect(),
+            vec![".cmd".to_string(), ".exe".to_string(), ".bat".to_string()],
+        )
+    }
+
+    /// 逐命令调用里的 `cmd /d /s /c` 整行原文；POSIX 替身上拿到的是程序与参数。
+    fn command_lines(runner: &FakeRunner) -> Vec<String> {
+        runner
+            .programs()
+            .into_iter()
+            .map(|(argv, _)| platform::cmd_line_of(&argv))
+            .collect()
     }
 
     /// 真实的探测输出形态：哨兵各占一行，前后是 shell 启动噪音。
@@ -1219,6 +1521,12 @@ mod tests {
             fake_section("npm", npm),
             fake_section("pi", pi)
         ))
+    }
+
+    /// 单测统一按 POSIX 形态检查：命令形态用替身，不碰真实进程，
+    /// 这样同一组用例在 Windows 上跑也走登录 shell 那条路。
+    fn check_posix(agent_dir: Option<&Path>, runner: &dyn CommandRunner) -> DoctorReport {
+        check(agent_dir, runner, HostOs::Posix)
     }
 
     fn find<'a>(report: &'a DoctorReport, id: &str) -> &'a Check {
@@ -1281,7 +1589,7 @@ mod tests {
     #[test]
     fn timeout_marks_probes_unknown() {
         let runner = FakeRunner::single(CommandOutcome::Timeout);
-        let report = check(None, &runner);
+        let report = check_posix(None, &runner);
 
         for id in ["node.path", "node.version", "npm", "pi.path", "pi.version"] {
             let check = find(&report, id);
@@ -1307,7 +1615,7 @@ mod tests {
 
     #[test]
     fn missing_command_differs_from_broken_command() {
-        let missing = check(
+        let missing = check_posix(
             None,
             &FakeRunner::new(vec![fast_ok(
                 MISSING_MARKER,
@@ -1323,7 +1631,7 @@ mod tests {
             .contains("tool_not_found"));
         assert_eq!(find(&missing, "pi.path").status, CheckStatus::Fail);
 
-        let broken = check(
+        let broken = check_posix(
             None,
             &FakeRunner::new(vec![fast_ok(
                 "path:/usr/bin/node\nversion:",
@@ -1344,7 +1652,7 @@ mod tests {
 
     #[test]
     fn node_below_minimum_fails_with_upgrade_hint() {
-        let report = check(
+        let report = check_posix(
             None,
             &FakeRunner::new(vec![fast_ok(
                 "path:/usr/bin/node\nversion:20.11.1",
@@ -1362,7 +1670,7 @@ mod tests {
 
     #[test]
     fn unparsable_version_is_unknown() {
-        let report = check(
+        let report = check_posix(
             None,
             &FakeRunner::new(vec![fast_ok(
                 "path:/usr/bin/node\nversion:twenty-two",
@@ -1401,7 +1709,7 @@ mod tests {
             )),
         ]);
 
-        let report = check(Some(dir.path()), &runner);
+        let report = check_posix(Some(dir.path()), &runner);
 
         // provider id 按字典序检查：local 先于 openrouter。
         assert_eq!(find(&report, "auth:local").status, CheckStatus::Fail);
@@ -1423,7 +1731,7 @@ mod tests {
     #[test]
     fn auth_without_models_file_is_unknown() {
         let dir = TempDir::new("auth-missing");
-        let report = check(
+        let report = check_posix(
             Some(dir.path()),
             &FakeRunner::single(CommandOutcome::Timeout),
         );
@@ -1442,7 +1750,7 @@ mod tests {
         let list =
             "User packages:\n  npm:pi-lens\n    /tmp/pi-lens\n  npm:extra-pkg\n    /tmp/extra-pkg";
 
-        let report = check(
+        let report = check_posix(
             Some(dir.path()),
             &FakeRunner::new(vec![fast_ok(
                 "path:/usr/bin/node\nversion:22.23.0",
@@ -1488,7 +1796,7 @@ mod tests {
         assert_eq!(links, 2);
         assert_eq!(broken, vec!["bad".to_string()]);
 
-        let report = check(
+        let report = check_posix(
             Some(dir.path()),
             &FakeRunner::single(CommandOutcome::Timeout),
         );
@@ -1507,7 +1815,7 @@ mod tests {
         let dir = TempDir::new("install-kind");
         dir.write("install/managed-install.json", "{}");
 
-        let report = check(
+        let report = check_posix(
             Some(dir.path()),
             &FakeRunner::new(vec![fast_ok(
                 "path:/usr/bin/node\nversion:22.23.0",
@@ -1528,7 +1836,7 @@ mod tests {
 
     #[test]
     fn install_kind_falls_back_to_npm_layout() {
-        let report = check(
+        let report = check_posix(
             None,
             &FakeRunner::new(vec![fast_ok(
                 "path:/usr/bin/node\nversion:22.23.0",
@@ -1548,7 +1856,7 @@ mod tests {
         let dir = TempDir::new("agent-dir");
         let missing = dir.path().join("not-there");
 
-        let report = check(Some(&missing), &FakeRunner::single(CommandOutcome::Timeout));
+        let report = check_posix(Some(&missing), &FakeRunner::single(CommandOutcome::Timeout));
         let check = find(&report, "agent_dir");
 
         assert_eq!(check.status, CheckStatus::Fail);
@@ -1583,7 +1891,7 @@ mod tests {
         );
         let list = "User packages:\n  npm:pi-lens\n    /tmp/pi-lens";
 
-        let report = check(
+        let report = check_posix(
             Some(dir.path()),
             &FakeRunner::new(vec![fast_ok(
                 "path:/usr/bin/node\nversion:22.23.0",
@@ -1604,7 +1912,7 @@ mod tests {
 
     #[test]
     fn report_serializes_documented_field_names() {
-        let report = check(
+        let report = check_posix(
             None,
             &FakeRunner::new(vec![fast_ok(
                 "path:/usr/bin/node\nversion:22.23.0",
@@ -1630,5 +1938,226 @@ mod tests {
     fn timestamp_formats_as_utc_iso8601() {
         assert_eq!(iso8601_from_unix(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso8601_from_unix(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn posix_probes_keep_the_single_login_shell_script() {
+        let runner = FakeRunner::single(CommandOutcome::Timeout);
+        check_posix(None, &runner);
+
+        // POSIX 仍是一条脚本跑完全部探测：没有逐命令调用。
+        assert!(runner.programs().is_empty());
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].0.contains("__PI_DOCTOR__BEGIN__node__"));
+    }
+
+    #[test]
+    fn windows_probes_run_one_command_each() {
+        let dir = TempDir::new("windows-shape");
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).expect("建目录");
+        for name in ["node.exe", "npm.cmd", "pi.cmd"] {
+            fs::write(bin.join(name), "").expect("写文件");
+        }
+        let search = windows_search(&[&bin]);
+        let list = "User packages:\n  npm:pi-lens\n    C:\\Users\\u\\.pi\\agent\\npm\\pi-lens";
+
+        let runner = FakeRunner::new(vec![
+            ok("22.23.0\n"),
+            ok("10.9.2\n"),
+            ok("C:\\Users\\u\\AppData\\Roaming\\npm\n"),
+            ok("1.5.2\n"),
+            ok(list),
+        ]);
+
+        let probes = windows_probes(&runner, &search, None);
+
+        let node = bin.join("node.exe").display().to_string();
+        let npm = bin.join("npm.cmd").display().to_string();
+        let pi = bin.join("pi.cmd").display().to_string();
+        assert_eq!(
+            command_lines(&runner),
+            vec![
+                platform::cmd_line(&node, &["-p", "process.versions.node"]),
+                platform::cmd_line(&npm, &["-v"]),
+                platform::cmd_line(&npm, &["prefix", "-g"]),
+                platform::cmd_line(&pi, &["--version"]),
+                platform::cmd_line(&pi, &["list"]),
+            ]
+        );
+        // 每个探测点单独 5 秒超时，不拼脚本。
+        assert!(runner
+            .programs()
+            .iter()
+            .all(|(_, timeout)| *timeout == PROBE_TIMEOUT));
+
+        let node = node_checks(&probes.node);
+        assert_eq!(node[0].status, CheckStatus::Pass);
+        assert_eq!(
+            node[0].value.as_deref(),
+            Some(bin.join("node.exe").display().to_string().as_str())
+        );
+        assert_eq!(node[1].status, CheckStatus::Pass);
+        assert_eq!(node[1].value.as_deref(), Some("22.23.0"));
+
+        assert_eq!(npm_checks(&probes.npm)[0].status, CheckStatus::Pass);
+
+        let (pi_checks, pi_path, pi_list) = pi_checks(&probes.pi);
+        assert_eq!(pi_checks[0].status, CheckStatus::Pass);
+        assert_eq!(pi_path, Some(bin.join("pi.cmd").display().to_string()));
+        assert_eq!(pi_list.as_deref(), Some(list));
+    }
+
+    #[test]
+    fn windows_probes_report_missing_programs() {
+        let dir = TempDir::new("windows-missing");
+        let search = windows_search(&[dir.path()]);
+        let runner = FakeRunner::single(ok(""));
+
+        let probes = windows_probes(&runner, &search, None);
+
+        assert!(runner.programs().is_empty(), "解析不到程序就不起进程");
+
+        let node = node_checks(&probes.node);
+        assert_eq!(node[0].status, CheckStatus::Fail);
+        assert!(node[0]
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("tool_not_found"));
+
+        let npm = npm_checks(&probes.npm);
+        assert_eq!(npm[0].status, CheckStatus::Fail);
+        assert!(npm[0]
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("tool_not_found"));
+
+        let (pi, pi_path, pi_list) = pi_checks(&probes.pi);
+        assert_eq!(pi[0].status, CheckStatus::Fail);
+        assert!(pi[0]
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("tool_not_found"));
+        assert_eq!(pi_path, None);
+        assert_eq!(pi_list, None);
+    }
+
+    #[test]
+    fn windows_probes_report_broken_commands() {
+        let dir = TempDir::new("windows-broken");
+        fs::write(dir.path().join("node.exe"), "").expect("写文件");
+        fs::write(dir.path().join("pi.cmd"), "").expect("写文件");
+        let search = windows_search(&[dir.path()]);
+
+        // node 在，`-p` 非零退出；npm 没装；pi 两次调用拿到不同结果。
+        let runner = FakeRunner::new(vec![
+            failed(1, "boom"),
+            ok("1.5.2\n"),
+            failed(9, "list failed"),
+        ]);
+
+        let probes = windows_probes(&runner, &search, None);
+
+        let node = node_checks(&probes.node);
+        assert_eq!(node[0].status, CheckStatus::Pass, "找到 node 就要报出路径");
+        assert_eq!(
+            node[0].value.as_deref(),
+            Some(dir.path().join("node.exe").display().to_string().as_str())
+        );
+        assert_eq!(node[1].status, CheckStatus::Fail);
+        assert!(node[1]
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("tool_broken"));
+
+        assert_eq!(npm_checks(&probes.npm)[0].status, CheckStatus::Fail);
+
+        let (pi, pi_path, _) = pi_checks(&probes.pi);
+        assert_eq!(pi[0].status, CheckStatus::Pass);
+        assert_eq!(pi[1].status, CheckStatus::Pass);
+        assert_eq!(
+            pi_path,
+            Some(dir.path().join("pi.cmd").display().to_string())
+        );
+    }
+
+    #[test]
+    fn windows_pi_falls_back_to_agent_dir_then_npm_prefix() {
+        let agent = TempDir::new("windows-agent");
+        fs::create_dir_all(agent.path().join("bin")).expect("建目录");
+        fs::write(agent.path().join("bin/pi.cmd"), "").expect("写文件");
+
+        let empty = TempDir::new("windows-empty-path");
+        let search = windows_search(&[empty.path()]);
+        let pi = agent.path().join("bin/pi.cmd").display().to_string();
+
+        let runner = FakeRunner::single(ok("1.5.2\n"));
+        let found = windows_pi(&runner, &search, Some(agent.path()), None);
+        assert!(
+            matches!(found, SectionData::Body { .. }),
+            "agent_dir/bin 兜底生效"
+        );
+        assert_eq!(
+            command_lines(&runner)[0],
+            platform::cmd_line(&pi, &["--version"])
+        );
+
+        // npm 全局前缀下的 `pi.cmd`：PATH 与 agent_dir 都找不到时才算数。
+        let prefix = TempDir::new("windows-prefix");
+        fs::write(prefix.path().join("pi.cmd"), "").expect("写文件");
+        let runner = FakeRunner::single(ok("1.5.2\n"));
+        let found = windows_pi(
+            &runner,
+            &search,
+            None,
+            Some(prefix.path().to_str().unwrap()),
+        );
+        assert!(matches!(found, SectionData::Body { .. }));
+        assert!(command_lines(&runner)[0].contains("pi.cmd"));
+    }
+
+    #[test]
+    fn windows_auth_runs_pi_auth_check_directly() {
+        let dir = TempDir::new("windows-auth");
+        let pi = dir.path().join("pi.cmd");
+        fs::write(&pi, "").expect("写文件");
+
+        let runner = FakeRunner::single(ok(r#"{"status":"ready"}"#));
+        let section = auth_probe_windows(Some(&pi.display().to_string()), "openrouter", &runner);
+        let check = auth_check("openrouter", section);
+
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(
+            command_lines(&runner),
+            vec![platform::cmd_line(
+                &pi.display().to_string(),
+                &["auth", "check", "--provider", "openrouter", "--json"]
+            )]
+        );
+    }
+
+    #[test]
+    fn windows_auth_rejects_provider_ids_cmd_would_expand() {
+        let dir = TempDir::new("windows-auth-rejected");
+        let pi = dir.path().join("pi.cmd");
+        fs::write(&pi, "").expect("写文件");
+
+        let runner = FakeRunner::single(ok("{}"));
+        let section =
+            auth_probe_windows(Some(&pi.display().to_string()), "p%USERPROFILE%", &runner);
+        let check = auth_check("p%USERPROFILE%", section);
+
+        assert_eq!(check.status, CheckStatus::Unknown);
+        assert!(check
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("拒绝执行"));
+        assert!(runner.programs().is_empty(), "未过转义的参数不能交给 cmd");
     }
 }

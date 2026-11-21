@@ -844,6 +844,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn saved_config_is_private() {
         use std::os::unix::fs::PermissionsExt;

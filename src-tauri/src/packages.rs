@@ -6,6 +6,7 @@
 
 use crate::doctor::{self, CommandOutcome, CommandRunner, ShellRunner};
 use crate::installer::{self, GroupRunner, InstallRunner, InstallStatus};
+use crate::platform::{HostOs, ProgramPath};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::fs;
@@ -24,12 +25,14 @@ pub struct DeclaredPackage {
     pub enabled: bool,
 }
 
-/// `pi list` 里的一个实装包及其安装目录。
+/// `pi list` 里的一个实装包、安装目录与读到的版本号。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstalledPackage {
     pub source: String,
     pub path: String,
+    /// 安装目录下 `package.json` 的 `version`；读不到时为 `None`，不影响其余结果。
+    pub version: Option<String>,
 }
 
 /// 一次比对的结果。
@@ -62,9 +65,14 @@ pub struct AlignReport {
 }
 
 /// 比对声明与实装。只读：读 `settings.json` 并执行一次 `pi list`。
-pub fn status(agent_dir: &Path, runner: &dyn CommandRunner) -> Result<PackageStatus, String> {
+/// `host` 由调用方给定：生产传 [`HostOs::current`]，单测显式指定。
+pub fn status(
+    agent_dir: &Path,
+    runner: &dyn CommandRunner,
+    host: HostOs,
+) -> Result<PackageStatus, String> {
     let declared = declared_packages(agent_dir)?;
-    let installed = installed_packages(runner)?;
+    let installed = installed_packages(agent_dir, runner, host)?;
 
     // 只有启用的声明算「应当装」；disabled 的包只展示，不自动装回来。
     let installed_sources: BTreeSet<&str> =
@@ -141,7 +149,27 @@ fi"#
     .to_string()
 }
 
-fn installed_packages(runner: &dyn CommandRunner) -> Result<Vec<InstalledPackage>, String> {
+fn installed_packages(
+    agent_dir: &Path,
+    runner: &dyn CommandRunner,
+    host: HostOs,
+) -> Result<Vec<InstalledPackage>, String> {
+    let stdout = if host == HostOs::Windows {
+        pi_list_windows(agent_dir, runner, &ProgramPath::from_env())?
+    } else {
+        pi_list_scripted(runner)?
+    };
+
+    parse_user_packages(&stdout).map(|mut installed| {
+        for item in &mut installed {
+            item.version = installed_package_version(agent_dir, &item.path);
+        }
+        installed
+    })
+}
+
+/// POSIX：一条登录 shell 脚本，找不到 pi 时打印标记，输出里混着脚本噪音。
+fn pi_list_scripted(runner: &dyn CommandRunner) -> Result<String, String> {
     let stdout = match runner.run(&pi_list_script(), doctor::PROBE_TIMEOUT, &[]) {
         CommandOutcome::Ok { stdout, .. } | CommandOutcome::Failed { stdout, .. } => stdout,
         CommandOutcome::Timeout => {
@@ -156,7 +184,52 @@ fn installed_packages(runner: &dyn CommandRunner) -> Result<Vec<InstalledPackage
         return Err("tool_not_found：找不到 pi 命令，无法读取实装列表".to_string());
     }
 
-    parse_user_packages(&stdout)
+    Ok(stdout)
+}
+
+/// Windows：解析到 `pi.cmd` 就直接跑 `pi list`，没有标记可用。
+/// 入口与医生、安装页走同一个 [`doctor::find_pi`]，npm 全局前缀兜底也一致。
+fn pi_list_windows(
+    agent_dir: &Path,
+    runner: &dyn CommandRunner,
+    search: &ProgramPath,
+) -> Result<String, String> {
+    let npm_prefix = search
+        .find("npm")
+        .and_then(|npm| doctor::npm_global_prefix(runner, &npm));
+    let Some(program) = doctor::find_pi(search, Some(agent_dir), npm_prefix.as_deref()) else {
+        return Err("tool_not_found：找不到 pi 命令，无法读取实装列表".to_string());
+    };
+
+    match doctor::probe_program(runner, &program, &["list"]) {
+        CommandOutcome::Ok { stdout, .. } | CommandOutcome::Failed { stdout, .. } => Ok(stdout),
+        CommandOutcome::Timeout => Err("probe_timeout：pi list 超时（5 秒），未重试".to_string()),
+        CommandOutcome::Unavailable(detail) => {
+            Err(format!("tool_broken：无法执行 pi list（{detail}）"))
+        }
+    }
+}
+
+/// 版本号读自安装目录的 `package.json`。
+///
+/// `pi list` 也会列出 git 源等落在宿主目录之外的包，而受管范围之外的文件不读取内容，
+/// 所以先确认安装路径在宿主目录内，否则版本留空。
+/// 单个包读不到版本不应让整次状态读取失败，因此这里把错误全部折成 `None`。
+fn installed_package_version(agent_dir: &Path, path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let root = fs::canonicalize(agent_dir).ok()?;
+    let install_dir = fs::canonicalize(path).ok()?;
+    if !install_dir.starts_with(&root) {
+        return None;
+    }
+    let text = fs::read_to_string(install_dir.join("package.json")).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&text).ok()?;
+    manifest
+        .get("version")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
 }
 
 /// 解析 `pi list` 的 `User packages:` 段：两空格缩进是来源，四空格缩进是安装目录。
@@ -192,6 +265,7 @@ pub fn parse_user_packages(list: &str) -> Result<Vec<InstalledPackage>, String> 
             2 => installed.push(InstalledPackage {
                 source: text.to_string(),
                 path: String::new(),
+                version: None,
             }),
             4 => {
                 if let Some(last) = installed.last_mut() {
@@ -218,13 +292,14 @@ pub fn align(
     confirm: bool,
     probes: &dyn CommandRunner,
     runner: &dyn InstallRunner,
+    host: HostOs,
 ) -> Result<AlignReport, String> {
     if !confirm {
         return Err("not_confirmed：未确认，未执行任何命令".to_string());
     }
 
     // 后端重新计算，前端传不了缺失清单之外的包。
-    let current = status(agent_dir, probes)?;
+    let current = status(agent_dir, probes, host)?;
     for source in sources {
         if !current.missing.iter().any(|missing| missing == source) {
             return Err(format!(
@@ -233,11 +308,16 @@ pub fn align(
         }
     }
 
+    // 包名先全部按平台转义好：有一条过不了就一行命令都不执行。
+    let mut commands = Vec::with_capacity(sources.len());
+    for source in sources {
+        commands.push((source, installer::install_package_argv(host, source)?));
+    }
+
     let mut results = Vec::new();
     let mut completed = true;
 
-    for source in sources {
-        let argv = installer::shell_argv(&format!("pi install {}", doctor::sh_quote(source)));
+    for (source, argv) in commands {
         let result = align_result(source, runner.run(&argv, installer::EXEC_TIMEOUT));
         if result.status != InstallStatus::Succeeded {
             completed = false;
@@ -289,7 +369,7 @@ fn resolve_agent_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 pub async fn package_status(app: tauri::AppHandle) -> Result<PackageStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let agent_dir = resolve_agent_dir(&app)?;
-        status(&agent_dir, &ShellRunner::from_env())
+        status(&agent_dir, &ShellRunner::from_env(), HostOs::current())
     })
     .await
     .map_err(|error| format!("读取包状态失败：{error}"))?
@@ -310,6 +390,7 @@ pub async fn align_packages(
             confirm,
             &ShellRunner::from_env(),
             &GroupRunner,
+            HostOs::current(),
         )
     })
     .await
@@ -366,10 +447,11 @@ mod tests {
         }
     }
 
-    /// 假探测执行器：按调用顺序回放 `pi list` 的结果，并记录收到的脚本。
+    /// 假探测执行器：按调用顺序回放 `pi list` 的结果，并记录收到的脚本与 argv。
     struct FakeProbe {
         outcomes: RefCell<Vec<CommandOutcome>>,
         calls: RefCell<Vec<String>>,
+        programs: RefCell<Vec<Vec<String>>>,
     }
 
     impl FakeProbe {
@@ -377,6 +459,7 @@ mod tests {
             Self {
                 outcomes: RefCell::new(outcomes),
                 calls: RefCell::new(Vec::new()),
+                programs: RefCell::new(Vec::new()),
             }
         }
 
@@ -388,11 +471,30 @@ mod tests {
         fn calls(&self) -> Vec<String> {
             self.calls.borrow().clone()
         }
+
+        fn programs(&self) -> Vec<Vec<String>> {
+            self.programs.borrow().clone()
+        }
     }
 
     impl CommandRunner for FakeProbe {
         fn run(&self, script: &str, _timeout: Duration, _env: &[(&str, String)]) -> CommandOutcome {
             self.calls.borrow_mut().push(script.to_string());
+            let mut outcomes = self.outcomes.borrow_mut();
+            if outcomes.is_empty() {
+                CommandOutcome::Timeout
+            } else {
+                outcomes.remove(0)
+            }
+        }
+
+        fn run_program(
+            &self,
+            argv: &[String],
+            _timeout: Duration,
+            _env: &[(&str, String)],
+        ) -> CommandOutcome {
+            self.programs.borrow_mut().push(argv.to_vec());
             let mut outcomes = self.outcomes.borrow_mut();
             if outcomes.is_empty() {
                 CommandOutcome::Timeout
@@ -478,10 +580,12 @@ mod tests {
                 InstalledPackage {
                     source: "npm:pi-lens".to_string(),
                     path: "/home/u/.pi/agent/npm/node_modules/pi-lens".to_string(),
+                    version: None,
                 },
                 InstalledPackage {
                     source: "git:github.com/u/r".to_string(),
                     path: "/home/u/r".to_string(),
+                    version: None,
                 },
             ]
         );
@@ -514,7 +618,12 @@ mod tests {
             ),
         );
 
-        let status = status(dir.path(), &FakeProbe::list("User packages:\n")).unwrap();
+        let status = status(
+            dir.path(),
+            &FakeProbe::list("User packages:\n"),
+            HostOs::Posix,
+        )
+        .unwrap();
 
         assert_eq!(
             status.declared,
@@ -538,6 +647,92 @@ mod tests {
     }
 
     #[test]
+    fn installed_version_comes_from_install_dir_manifest() {
+        let dir = TempDir::new("installed-version");
+        let manifest_path = dir.write(
+            "npm/node_modules/pi-lens/package.json",
+            r#"{"name":"pi-lens","version":"1.4.2"}"#,
+        );
+        let install_dir = manifest_path.parent().unwrap().to_str().unwrap();
+        let list = user_list(&[("npm:pi-lens", install_dir)]);
+
+        let installed =
+            installed_packages(dir.path(), &FakeProbe::list(&list), HostOs::Posix).unwrap();
+
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].version.as_deref(), Some("1.4.2"));
+        assert_eq!(installed[0].path, install_dir);
+    }
+
+    #[test]
+    fn installed_version_without_manifest_is_none() {
+        let dir = TempDir::new("installed-no-manifest");
+        let install_dir = dir.path().join("pi-lens");
+        fs::create_dir_all(&install_dir).unwrap();
+        let list = user_list(&[("npm:pi-lens", install_dir.to_str().unwrap())]);
+
+        let installed =
+            installed_packages(dir.path(), &FakeProbe::list(&list), HostOs::Posix).unwrap();
+
+        assert_eq!(installed[0].version, None);
+    }
+
+    #[test]
+    fn installed_version_without_version_field_is_none() {
+        let dir = TempDir::new("installed-no-version");
+        let manifest_path = dir.write(
+            "npm/node_modules/pi-lens/package.json",
+            r#"{"name":"pi-lens"}"#,
+        );
+        let install_dir = manifest_path.parent().unwrap().to_str().unwrap();
+        let list = user_list(&[("npm:pi-lens", install_dir)]);
+
+        let installed =
+            installed_packages(dir.path(), &FakeProbe::list(&list), HostOs::Posix).unwrap();
+
+        assert_eq!(installed[0].version, None);
+    }
+
+    #[test]
+    fn installed_version_with_empty_path_is_none() {
+        let dir = TempDir::new("installed-empty-path");
+        let list = user_list(&[("npm:pi-lens", "")]);
+
+        let installed =
+            installed_packages(dir.path(), &FakeProbe::list(&list), HostOs::Posix).unwrap();
+
+        assert_eq!(installed[0].path, "");
+        assert_eq!(installed[0].version, None);
+    }
+
+    #[test]
+    fn installed_version_outside_agent_dir_is_none() {
+        let agent = TempDir::new("installed-agent-scope");
+        let elsewhere = TempDir::new("installed-elsewhere");
+        let manifest_path = elsewhere.write("package.json", r#"{"version":"9.9.9"}"#);
+        let install_dir = manifest_path.parent().unwrap().to_str().unwrap();
+        let list = user_list(&[("git:elsewhere", install_dir)]);
+
+        let installed =
+            installed_packages(agent.path(), &FakeProbe::list(&list), HostOs::Posix).unwrap();
+
+        assert_eq!(installed[0].version, None, "宿主目录之外的包不读内容");
+    }
+
+    #[test]
+    fn installed_version_with_invalid_manifest_is_none() {
+        let dir = TempDir::new("installed-bad-json");
+        let manifest_path = dir.write("npm/node_modules/pi-lens/package.json", "{");
+        let install_dir = manifest_path.parent().unwrap().to_str().unwrap();
+        let list = user_list(&[("npm:pi-lens", install_dir)]);
+
+        let installed =
+            installed_packages(dir.path(), &FakeProbe::list(&list), HostOs::Posix).unwrap();
+
+        assert_eq!(installed[0].version, None);
+    }
+
+    #[test]
     fn status_reports_missing_and_extra() {
         let dir = TempDir::new("status");
         dir.write(
@@ -549,7 +744,7 @@ mod tests {
             ("npm:pi-old", "/home/u/.pi/agent/npm/node_modules/pi-old"),
         ]);
 
-        let status = status(dir.path(), &FakeProbe::list(&list)).unwrap();
+        let status = status(dir.path(), &FakeProbe::list(&list), HostOs::Posix).unwrap();
 
         assert_eq!(status.missing, vec!["npm:pi-docs"]);
         assert_eq!(status.extra, vec!["npm:pi-old"]);
@@ -559,7 +754,12 @@ mod tests {
     #[test]
     fn status_requires_settings_json() {
         let dir = TempDir::new("no-settings");
-        let error = status(dir.path(), &FakeProbe::list("User packages:\n")).unwrap_err();
+        let error = status(
+            dir.path(),
+            &FakeProbe::list("User packages:\n"),
+            HostOs::Posix,
+        )
+        .unwrap_err();
         assert!(error.contains("settings_unreadable"), "{error}");
     }
 
@@ -571,13 +771,111 @@ mod tests {
         let missing = status(
             dir.path(),
             &FakeProbe::list(&format!("{PI_MISSING_MARKER}\n")),
+            HostOs::Posix,
         )
         .unwrap_err();
         assert!(missing.contains("tool_not_found"), "{missing}");
 
-        let timeout =
-            status(dir.path(), &FakeProbe::new(vec![CommandOutcome::Timeout])).unwrap_err();
+        let timeout = status(
+            dir.path(),
+            &FakeProbe::new(vec![CommandOutcome::Timeout]),
+            HostOs::Posix,
+        )
+        .unwrap_err();
         assert!(timeout.contains("probe_timeout"), "{timeout}");
+    }
+
+    #[test]
+    fn windows_pi_list_runs_directly() {
+        let dir = TempDir::new("windows-pi-list");
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).expect("建目录");
+        // pi 只在 `<agent_dir>/bin` 下：PATH 里没有。
+        fs::write(bin.join("pi.cmd"), "").expect("写文件");
+        let search = ProgramPath::new(vec![], vec![".cmd".to_string(), ".exe".to_string()]);
+
+        let runner = FakeProbe::new(vec![ok(&user_list(&[("npm:pi-lens", "C:\\npm\\pi-lens")]))]);
+        let stdout = pi_list_windows(dir.path(), &runner, &search).unwrap();
+
+        assert!(stdout.contains("npm:pi-lens"));
+        assert!(runner.calls().is_empty(), "Windows 上不拼脚本");
+        let programs = runner.programs();
+        assert_eq!(programs.len(), 1);
+        assert_eq!(
+            crate::platform::cmd_line_of(&programs[0]),
+            crate::platform::cmd_line(&bin.join("pi.cmd").display().to_string(), &["list"])
+        );
+    }
+
+    #[test]
+    fn windows_pi_list_falls_back_to_npm_global_prefix() {
+        let dir = TempDir::new("windows-pi-list-prefix");
+        let prefix = dir.path().join("npm-prefix");
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&prefix).expect("建目录");
+        fs::create_dir_all(&bin).expect("建目录");
+        // pi 只在 npm 全局前缀下：PATH 与 `<agent_dir>/bin` 都没有。
+        fs::write(prefix.join("pi.cmd"), "").expect("写文件");
+        fs::write(bin.join("npm.cmd"), "").expect("写文件");
+        let search = ProgramPath::new(vec![bin.clone()], vec![".cmd".to_string()]);
+
+        let list = user_list(&[("npm:pi-lens", "C:\\npm\\pi-lens")]);
+        let runner = FakeProbe::new(vec![ok(&format!("{}\n", prefix.display())), ok(&list)]);
+        let stdout = pi_list_windows(dir.path(), &runner, &search).unwrap();
+
+        assert!(stdout.contains("npm:pi-lens"));
+        let programs = runner.programs();
+        assert_eq!(
+            crate::platform::cmd_line_of(&programs[0]),
+            crate::platform::cmd_line(
+                &bin.join("npm.cmd").display().to_string(),
+                &["prefix", "-g"]
+            )
+        );
+        assert_eq!(
+            crate::platform::cmd_line_of(&programs[1]),
+            crate::platform::cmd_line(&prefix.join("pi.cmd").display().to_string(), &["list"])
+        );
+    }
+
+    #[test]
+    fn windows_pi_list_without_pi_is_tool_not_found() {
+        let dir = TempDir::new("windows-pi-list-missing");
+        let search = ProgramPath::new(vec![], vec![".cmd".to_string()]);
+
+        let error = pi_list_windows(dir.path(), &FakeProbe::new(Vec::new()), &search).unwrap_err();
+
+        assert!(error.contains("tool_not_found"), "{error}");
+    }
+
+    #[test]
+    fn align_commands_are_quoted_per_platform() {
+        let windows = installer::install_package_argv(HostOs::Windows, "npm:pi-lens").unwrap();
+        assert_eq!(&windows[..4], ["cmd", "/d", "/s", "/c"]);
+        assert_eq!(
+            windows[4],
+            crate::platform::cmd_line("pi", &["install", "npm:pi-lens"]),
+            "整行以外层引号包住，内部逐元素加引号"
+        );
+        assert_eq!(
+            installer::install_package_argv(HostOs::Posix, "npm:o'brien").unwrap(),
+            vec![
+                std::env::var_os("SHELL")
+                    .unwrap_or_else(|| "sh".into())
+                    .to_string_lossy()
+                    .into_owned(),
+                "-lc".to_string(),
+                "pi install 'npm:o'\\''brien'".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn align_rejects_package_names_cmd_would_expand() {
+        for source in ["npm:a%b", "npm:a\"b", "npm:a&b", "npm:a|b", "npm:a^b"] {
+            let error = installer::install_package_argv(HostOs::Windows, source).unwrap_err();
+            assert!(error.contains("拒绝执行"), "{source}: {error}");
+        }
     }
 
     #[test]
@@ -593,6 +891,7 @@ mod tests {
             false,
             &probes,
             &runner,
+            HostOs::Posix,
         )
         .unwrap_err();
 
@@ -615,6 +914,7 @@ mod tests {
             true,
             &probes,
             &runner,
+            HostOs::Posix,
         )
         .unwrap_err();
 
@@ -649,6 +949,7 @@ mod tests {
             true,
             &probes,
             &runner,
+            HostOs::Posix,
         )
         .unwrap();
 
@@ -687,6 +988,7 @@ mod tests {
             true,
             &probes,
             &runner,
+            HostOs::Posix,
         )
         .unwrap();
 
@@ -715,6 +1017,7 @@ mod tests {
             true,
             &probes,
             &runner,
+            HostOs::Posix,
         )
         .unwrap();
 
@@ -739,6 +1042,7 @@ mod tests {
             true,
             &probes,
             &runner,
+            HostOs::Posix,
         )
         .unwrap();
 

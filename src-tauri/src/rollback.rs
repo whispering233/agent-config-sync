@@ -11,18 +11,16 @@ use crate::apply::{
     RESTORE_FILE_NAME, RESTORE_VERSION,
 };
 use crate::config;
+use crate::platform;
 use crate::scope;
 use serde::Serialize;
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
 /// 列表最多返回几份备份；更旧的只在磁盘上。
 pub const BACKUP_LIST_LIMIT: usize = 20;
-/// 备份里没记权限时的文件权限，与 [`crate::apply`] 新增文件一致。
-const DEFAULT_FILE_MODE: u32 = 0o644;
 
 /// 一份备份的摘要：列表用，不含条目细节。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -248,7 +246,13 @@ fn restore_entry(agent_dir: &Path, backup_dir: &Path, entry: &RestoreEntry) -> i
                 .as_deref()
                 .ok_or_else(|| io::Error::other(format!("{} 的记录里没有链接目标", entry.path)))?;
             remove_any(&target)?;
-            apply::create_link(link_target, &target)
+            // Windows 建链接要按目标类型分开调；目标此刻通常已存在，按它定类型。
+            let is_dir = target
+                .parent()
+                .map(|parent| parent.join(link_target))
+                .and_then(|path| fs::metadata(path).ok())
+                .is_some_and(|metadata| metadata.is_dir());
+            platform::create_link(link_target, &target, is_dir)
         }
         RestoreKind::Dir => ensure_dir(&target),
         RestoreKind::File => {
@@ -260,20 +264,24 @@ fn restore_entry(agent_dir: &Path, backup_dir: &Path, entry: &RestoreEntry) -> i
                 // 父目录可能是记录里要保留的链接：跟随它，不换成真实目录。
                 fs::create_dir_all(parent)?;
             }
-            // 绝不写穿链接：目标是链接先 unlink，是目录则停下让人看。
+            // 绝不写穿链接：目标是链接先删链接，是目录则停下让人看。
+            // 链接必须先判：Windows 的目录型链接同时带目录属性。
             match fs::symlink_metadata(&target) {
+                Ok(_) if platform::is_link_like(&target) => platform::remove_link(&target)?,
                 Ok(metadata) if metadata.is_dir() => {
                     return Err(io::Error::other(format!(
                         "{} 现在是目录，不覆盖",
                         entry.path
                     )))
                 }
-                Ok(metadata) if metadata.file_type().is_symlink() => fs::remove_file(&target)?,
                 _ => {}
             }
-            let mode = entry.mode.unwrap_or(DEFAULT_FILE_MODE) & 0o777;
             fs::write(&target, &bytes)?;
-            fs::set_permissions(&target, fs::Permissions::from_mode(mode))
+            // 备份来自 Windows 时 `mode` 是 `null`：跳过权限还原，不去猜一个默认值。
+            match entry.mode {
+                Some(mode) => platform::set_mode(&target, mode & 0o777),
+                None => Ok(()),
+            }
         }
     }
 }
@@ -289,6 +297,10 @@ fn remove_added(agent_dir: &Path, entry: &RestoreEntry) -> io::Result<()> {
         )));
     }
     let target = resolve(agent_dir, &entry.path)?;
+    // 链接先判：Windows 的目录型链接同时带目录属性，当成目录就会被误拒。
+    if platform::is_link_like(&target) {
+        return platform::remove_link(&target);
+    }
     match fs::symlink_metadata(&target) {
         Ok(metadata) if metadata.is_dir() => Err(io::Error::other(format!(
             "{} 现在是目录，不递归删除",
@@ -303,24 +315,29 @@ fn remove_added(agent_dir: &Path, entry: &RestoreEntry) -> io::Result<()> {
 
 /// 目录条目：缺就建，链接换成真目录，是文件则报错。
 fn ensure_dir(target: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(target) {
-        Ok(metadata) if metadata.file_type().is_symlink() => fs::remove_file(target)?,
-        Ok(metadata) if metadata.is_dir() => return Ok(()),
-        Ok(_) => {
-            return Err(io::Error::other(format!(
-                "{} 现在是文件，无法建成目录",
-                target.display()
-            )))
+    // 链接先判：Windows 的目录型链接同时带目录属性，当成目录就会写穿。
+    if platform::is_link_like(target) {
+        platform::remove_link(target)?;
+    } else {
+        match fs::symlink_metadata(target) {
+            Ok(metadata) if metadata.is_dir() => return Ok(()),
+            Ok(_) => {
+                return Err(io::Error::other(format!(
+                    "{} 现在是文件，无法建成目录",
+                    target.display()
+                )))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
     }
     fs::create_dir_all(target)
 }
 
-/// 清掉一条路径（目录整棵、其余只删自身），不存在也算清干净。
+/// 清掉一条路径：目录整棵、链接只删自身、其余只删自身；不存在也算清干净。
 fn remove_any(target: &Path) -> io::Result<()> {
     match fs::symlink_metadata(target) {
+        Ok(_) if platform::is_link_like(target) => platform::remove_link(target),
         Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(target),
         Ok(_) => fs::remove_file(target),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -388,9 +405,13 @@ fn run(app: &AppHandle, backup_id: &str, confirm: bool) -> Result<RestoreReport,
 mod tests {
     use super::*;
     use crate::apply::BACKUP_RETENTION;
+    #[cfg(unix)]
     use crate::doctor::{CommandOutcome, CommandRunner};
-    use std::os::unix::fs::symlink;
+    use crate::platform::HostOs;
+    #[cfg(unix)]
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::atomic::{AtomicU32, Ordering};
+    #[cfg(unix)]
     use std::time::Duration;
 
     /// 临时目录夹具：Drop 时清理。测试全程不碰真实 HOME。
@@ -422,8 +443,10 @@ mod tests {
     }
 
     /// 固定版本的假命令：计划里的版本探测不起真实进程。
+    #[cfg(unix)]
     struct FakeRunner;
 
+    #[cfg(unix)]
     impl CommandRunner for FakeRunner {
         fn run(
             &self,
@@ -445,6 +468,7 @@ mod tests {
         fs::write(path, content).expect("写入夹具文件");
     }
 
+    #[cfg(unix)]
     fn mode_of(path: &Path) -> u32 {
         fs::metadata(path)
             .expect("读取文件信息")
@@ -453,6 +477,7 @@ mod tests {
             & 0o777
     }
 
+    #[cfg(unix)]
     fn set_mode(path: &Path, mode: u32) {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("设置夹具权限");
     }
@@ -515,6 +540,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn read_restore(backup_dir: &Path) -> RestoreManifest {
         let text = fs::read_to_string(backup_dir.join(RESTORE_FILE_NAME)).expect("读 restore.json");
         serde_json::from_str(&text).expect("restore.json 应是合法 JSON")
@@ -546,6 +572,42 @@ mod tests {
     }
 
     #[test]
+    fn restore_without_a_recorded_mode_skips_permissions() {
+        let temp = TempDir::new("mode-none");
+        let agent = temp.path().join("agent");
+        let data = app_data(&temp);
+        write_file(&agent.join("settings.json"), "live");
+        // 备份可能来自 Windows：那里的 restore.json 记的是 null。
+        #[cfg(unix)]
+        set_mode(&agent.join("settings.json"), 0o640);
+        let id = "2026-01-01T00-00-00Z";
+        craft_backup(
+            &data,
+            id,
+            &manifest(vec![RestoreEntry {
+                path: "settings.json".to_string(),
+                kind: RestoreKind::File,
+                existed: true,
+                mode: None,
+                link_target: None,
+            }]),
+        );
+        craft_content(&data, id, "settings.json", "backup");
+
+        let report = restore(&agent, &data, id, true).expect("mode 缺失也应还原成功");
+
+        assert_eq!(report.restored, 1);
+        assert_eq!(
+            fs::read_to_string(agent.join("settings.json")).expect("读 live"),
+            "backup"
+        );
+        // 不猜默认值：没记权限就不动权限。
+        #[cfg(unix)]
+        assert_eq!(mode_of(&agent.join("settings.json")), 0o640);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn restores_file_content_and_mode() {
         let temp = TempDir::new("content");
         let agent = temp.path().join("agent");
@@ -573,6 +635,7 @@ mod tests {
         assert_eq!(mode_of(&agent.join("settings.json")), 0o600);
     }
 
+    #[cfg(unix)]
     #[test]
     fn safety_backup_holds_the_current_state() {
         let temp = TempDir::new("safety");
@@ -696,6 +759,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn rebuilds_links_from_the_recorded_target() {
         let temp = TempDir::new("link");
@@ -855,6 +919,7 @@ mod tests {
         assert!(list.warnings.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn apply_then_restore_returns_to_the_previous_state() {
         let temp = TempDir::new("apply-restore");
@@ -867,17 +932,18 @@ mod tests {
         write_file(&agent.join("auth.json"), "{\"token\": \"sk-test\"}");
         fs::create_dir_all(&sync_root).expect("建同步目录");
         crate::snapshot::export(&agent, &sync_root, false).expect("导出夹具快照");
-        let fingerprint = crate::plan::plan_snapshot(&agent, &sync_root, &FakeRunner)
-            .expect("生成夹具计划")
-            .manifest_info
-            .fingerprint;
+        let fingerprint =
+            crate::plan::plan_snapshot(&agent, &sync_root, &FakeRunner, HostOs::Posix)
+                .expect("生成夹具计划")
+                .manifest_info
+                .fingerprint;
 
         // 改动本机：改内容与权限、删一个受管文件、留一个待删文件。
         write_file(&agent.join("settings.json"), "{\"theme\": \"light\"}");
         set_mode(&agent.join("settings.json"), 0o640);
         fs::remove_file(agent.join("skills/antd/SKILL.md")).expect("删 live 技能");
         write_file(&agent.join("prompts/leftover.md"), "留下");
-        let expected = crate::plan::plan_snapshot(&agent, &sync_root, &FakeRunner)
+        let expected = crate::plan::plan_snapshot(&agent, &sync_root, &FakeRunner, HostOs::Posix)
             .expect("重算计划")
             .manifest_info
             .fingerprint;
@@ -893,6 +959,7 @@ mod tests {
             &["prompts/leftover.md".to_string()],
             &data,
             &FakeRunner,
+            &crate::apply::PlatformLinkCreator,
         )
         .expect("应用应成功");
         assert_eq!(
@@ -947,6 +1014,7 @@ mod tests {
         assert!(backup_ids(&data).is_empty(), "拒绝时不得建还原前备份");
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_ancestors_are_never_written_through() {
         let temp = TempDir::new("write-through");

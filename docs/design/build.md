@@ -34,7 +34,7 @@ npm run build          # tsc -b && vite build
 ## 打包（Linux）
 
 ```bash
-npm run tauri -- build -- --bundles deb,appimage
+npm run tauri -- build --bundles deb,appimage
 ```
 
 产物：
@@ -52,12 +52,12 @@ release 配置：`strip = true`、`lto = "thin"`（`src-tauri/Cargo.toml`）。�
 只在 Windows 上构建（本地 Windows 或 CI 的 `windows-latest`）；不在 Linux 上交叉编译（官方定位为 last resort）。
 
 ```bash
-npm run tauri -- build -- --bundles nsis
+npm run tauri -- build --bundles nsis
 ```
 
-产物：`src-tauri/target/release/bundle/nsis/`。
+产物：`src-tauri/target/release/bundle/nsis/` 下的 `*-setup.exe`。
 
-- 安装范围 `perUser`：不需要管理员提权，程序装到 `%LOCALAPPDATA%`。
+- 安装范围取 NSIS 默认的 `currentUser`：不需要管理员提权，程序装到 `%LOCALAPPDATA%`。
 - 未签名：首次运行会有 SmartScreen 提示；自测点「更多信息 → 仍要运行」，或先 `Unblock-File` 去掉 MOTW。
 - WebView2 用默认 `downloadBootstrapper`：Win11 与已更新的 Win10 自带运行时；只有断网且缺运行时的机器才需要 `offlineInstaller`（安装包会涨到上百 MB）。
 - 应用数据在 `%APPDATA%\<identifier>`（配置、WebDAV 凭据、备份、暂存、webview 存储同目录）。卸载**不删除**该目录：安装器默认只删程序文件，本项目不装清理钩子。

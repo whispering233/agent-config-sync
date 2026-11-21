@@ -8,7 +8,7 @@ import { SettingsPage } from './pages/settings-page';
 type PageId = 'doctor' | 'snapshot' | 'settings';
 
 const navItems: ReadonlyArray<NavItem<PageId>> = [
-  { id: 'doctor', label: '医生', icon: Stethoscope },
+  { id: 'doctor', label: '环境检测', icon: Stethoscope },
   { id: 'snapshot', label: '快照', icon: Archive },
   { id: 'settings', label: '设置', icon: Settings },
 ];
