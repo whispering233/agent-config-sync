@@ -37,6 +37,7 @@ Pi CLI 配置的换机交付工具（手动快照交付；可选托盘常驻与�
 - `auth.json` 只纳入宿主目录根级，整文件覆盖；不按 provider 合并，不重建符号链接。
 - WebDAV 凭据单独存于应用数据目录（POSIX 0600；Windows 依赖用户配置目录的继承 ACL），不进快照、日志、错误信息与同步文件夹。
 - 含 `auth.json` 的 WebDAV 上传/下载只允许 HTTPS（`localhost`/`127.0.0.1`/`::1` 例外），否则报告 `remote_insecure`。
+- 自动上行默认不包含 `auth.json`；设置里显式开启后才沿用同一套 HTTPS 闸门。
 - 不发明私有占位语法，不对快照整体加密，不自动写 shell 启动文件。
 
 ## 代码与注释纪律
@@ -67,9 +68,16 @@ npm run build
 - 文件遍历、manifest、哈希、密钥扫描、应用/回滚、包/安装必须有单元测试与临时目录夹具。
 - UI 验证交给子代理，条目数给定上限，只报不修。
 - 每个任务卡必须能独立验证、独立回滚。
-- 打包：`npm run tauri -- build --bundles deb,appimage`（AppImage 需要能访问 GitHub release 下载 runtime）；Windows 上 `npm run tauri -- build --bundles nsis`，CI 的 `windows-latest` job 会先跑 `cargo test` 再出包。
+- 打包：`npm run tauri -- build --bundles deb,appimage`（AppImage 需要能访问 GitHub release 下载 runtime）；Windows 上 `npm run tauri -- build --bundles nsis`。CI 的 `windows-latest` job 会先跑 `cargo test` 再出包；PR 阶段另有 Windows `cargo test`。
 - 平台差异收在 `src-tauri/src/platform.rs`：权限位、链接判定与创建、`cmd /d /s /c` 命令行、`CREATE_NO_WINDOW`、进程树终止。调用点不直接写 `cfg(windows)`，命令形态由注入的宿主平台分支。
 
 ## 提交
 
 - 一个任务一次提交，提交信息说明“做了什么、为什么”，不写卡号。
+
+## 发布
+
+- 版本号三处同步：`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`；`Cargo.lock` 与 `package-lock.json` 一并更新。
+- `CHANGELOG.md` 先落 `## [vX.Y.Z] - <日期>`；tag 必须是 `vX.Y.Z`。
+- 先推 `main`，再推 tag；`release.yml` 建 Release，`desktop.yml` 构建 Linux/Windows 资产并上传。
+- 手动补包用 `workflow_dispatch`，目标 Release 必须已存在。

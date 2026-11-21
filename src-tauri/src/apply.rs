@@ -61,7 +61,7 @@ pub struct ApplyReport {
     pub failed_at: Option<String>,
 }
 
-/// 应用失败。失败码见 `docs/design/10-snapshot-sync.md` 第 9 节与任务卡。
+/// 应用失败。失败码见 `docs/design/10-snapshot-sync.md` 第 9 节。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApplyFailure {

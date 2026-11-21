@@ -41,8 +41,8 @@ npm run tauri -- build --bundles deb,appimage
 
 ```text
 src-tauri/target/release/bundle/
-├── deb/Agent Config Sync_0.0.1_amd64.deb          （约 3.1 MB）
-└── appimage/Agent Config Sync_0.0.1_amd64.AppImage（约 83 MB）
+├── deb/Agent Config Sync_0.0.2_amd64.deb          （约 3.1 MB）
+└── appimage/Agent Config Sync_0.0.2_amd64.AppImage（约 83 MB）
 ```
 
 release 配置：`strip = true`、`lto = "thin"`（`src-tauri/Cargo.toml`）。二进制已去符号。
@@ -94,7 +94,7 @@ npm run tauri -- build --bundles nsis
 
 ```bash
 # 1. deb 依赖声明（应含 libwebkit2gtk-4.1-0）
-dpkg-deb -I "src-tauri/target/release/bundle/deb/Agent Config Sync_0.0.1_amd64.deb" | grep Depends
+dpkg-deb -I "src-tauri/target/release/bundle/deb/Agent Config Sync_0.0.2_amd64.deb" | grep Depends
 
 # 2. 已去符号（应显示 stripped / no symbols）
 file src-tauri/target/release/agent-config-sync
@@ -128,6 +128,23 @@ cp /tmp/tray-template/32x32.png src-tauri/icons/tray-template.png
 - 16/32/64/128/256/512/1024 都应来自 CLI，不再保留手工放大的占位图。
 - 托盘图固定 32×32；彩色图用于 Windows/Linux，template 图只用于 macOS。
 - 改图后重新跑上述命令并提交 `src-tauri/icons/`；图标不参与 Rust 逻辑，回滚只需还原目录。
+
+## 发布流程
+
+```bash
+# 1. 三处版本号与 CHANGELOG 同步
+#    package.json / src-tauri/tauri.conf.json / src-tauri/Cargo.toml
+git commit -am "release: vX.Y.Z"
+git tag vX.Y.Z
+
+# 2. 先推 main，再推 tag
+git push origin main
+git push origin vX.Y.Z
+```
+
+- tag 触发 `release.yml`（校验三处版本一致、按 CHANGELOG 建 Release）与 `desktop.yml`（Linux deb/AppImage、Windows NSIS，上传到同一 Release）。
+- 手动补包：`gh workflow run desktop.yml -f release_tag=vX.Y.Z`；目标 Release 必须已存在。
+- 本地 Windows 验证：`npm run tauri -- build --bundles nsis`，产物在 `src-tauri/target/release/bundle/nsis/`。
 
 ## 已知限制
 

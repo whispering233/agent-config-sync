@@ -92,7 +92,7 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
   "createdAt": "2026-11-20T05:30:00Z",
   "fingerprint": "a1b2c3d4e5f6",
   "source": {
-    "app": "0.0.1",
+    "app": "0.0.2",
     "os": "linux",
     "arch": "x64",
     "pi": "1.5.2",

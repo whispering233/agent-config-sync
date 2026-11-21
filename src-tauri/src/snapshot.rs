@@ -117,7 +117,7 @@ pub struct ExportReport {
     pub manifest_path: PathBuf,
 }
 
-/// 导出失败。失败码见 `docs/design/10-snapshot-sync.md` 第 9 节与任务卡。
+/// 导出失败。失败码见 `docs/design/10-snapshot-sync.md` 第 9 节。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportFailure {

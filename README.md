@@ -25,11 +25,11 @@ Linux：
 
 ```bash
 # deb（推荐）
-sudo dpkg -i "src-tauri/target/release/bundle/deb/Agent Config Sync_0.0.1_amd64.deb"
+sudo dpkg -i "src-tauri/target/release/bundle/deb/Agent Config Sync_0.0.2_amd64.deb"
 
 # AppImage（不安装）
-chmod +x "src-tauri/target/release/bundle/appimage/Agent Config Sync_0.0.1_amd64.AppImage"
-"./Agent Config Sync_0.0.1_amd64.AppImage"
+chmod +x "src-tauri/target/release/bundle/appimage/Agent Config Sync_0.0.2_amd64.AppImage"
+"./Agent Config Sync_0.0.2_amd64.AppImage"
 ```
 
 文件名含空格，命令需要引号。deb 依赖 `libwebkit2gtk-4.1-0` 与 `libgtk-3-0`。
@@ -58,6 +58,7 @@ Windows 上命令执行走 `cmd /d /s /c`，环境检测与包对齐按逐命令
 ## 价格与风险
 
 - 安装包未签名，只适合自己本机安装；转发前需补签名。
+- Windows 的 NSIS 可在本机或 CI 构建；正式发布由 CI 的 `desktop.yml` 构建并挂到 Release。
 - 快照含明文密钥：云盘服务商、WebDAV 服务端及其版本历史/备份可见。OAuth 多机共享 refresh token 可能互相失效；自动上行默认不包含 `auth.json`。
 - WebDAV 凭据明文存于应用数据目录的 `webdav.json`，不进快照。Linux 为 `~/.local/share/dev.agentconfigsync.app/`（0600），Windows 为 `%APPDATA%\dev.agentconfigsync.app\`（继承 ACL）。
 - 应用每次落地前都会备份；备份目录在同一个应用数据目录下（Linux 0700）。

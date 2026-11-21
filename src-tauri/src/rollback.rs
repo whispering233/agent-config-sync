@@ -593,8 +593,10 @@ mod tests {
     }
 
     /// 建链接一律失败的替身：模拟 Windows 默认权限下的 `ERROR_PRIVILEGE_NOT_HELD`。
+    #[cfg(unix)]
     struct NoLinkCreator;
 
+    #[cfg(unix)]
     impl crate::apply::LinkCreator for NoLinkCreator {
         fn create_link(&self, _target: &str, _path: &Path, _is_dir: bool) -> io::Result<()> {
             Err(io::Error::other("客户端没有所需的特权。 (os error 1314)"))
