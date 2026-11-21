@@ -22,12 +22,6 @@ type SecretFinding = {
   rule: string;
 };
 
-type RequiredSecret = {
-  name: string;
-  usedBy: string[];
-  hint: string | null;
-};
-
 type RequiredPackage = {
   source: string;
   enabled: boolean;
@@ -37,7 +31,6 @@ type RequiredPackage = {
 type ExportReport = {
   files: number;
   fingerprint: string;
-  requiredSecrets: RequiredSecret[];
   requiredPackages: RequiredPackage[];
   skipped: number;
   warnings: SecretFinding[];
@@ -50,7 +43,6 @@ type ExportReport = {
 type ExportFailure = {
   code: string;
   message: string;
-  findings: SecretFinding[];
 };
 
 /** 计划项的差异类别，与 Rust 侧 `PlanCategory` 一致。 */
@@ -185,23 +177,17 @@ type DownloadState =
   | { kind: 'done'; view: RemoteDownload }
   | { kind: 'failed'; message: string };
 
-/** 上传失败的结构与导出失败一致：`code` 区分明文密钥阻断，`findings` 只因此才有内容。 */
-type UploadFailure = ExportFailure;
-
 type UploadState =
   | { kind: 'idle' }
   | { kind: 'uploading' }
   | { kind: 'uploaded'; view: Extract<RemoteUpload, { kind: 'uploaded' }> }
   | { kind: 'conflict'; view: Extract<RemoteUpload, { kind: 'conflict' }> }
-  /** `overwrite` 记下用户当时的选择，确认明文后接着原路走。 */
-  | { kind: 'blocked'; failure: UploadFailure; overwrite: boolean }
   | { kind: 'failed'; message: string };
 
 type ExportState =
   | { kind: 'idle' }
   | { kind: 'exporting' }
   | { kind: 'done'; report: ExportReport }
-  | { kind: 'blocked'; failure: ExportFailure }
   | { kind: 'failed'; message: string };
 
 type PlanState =
@@ -273,7 +259,6 @@ function asFailure(error: unknown): ExportFailure | null {
   return {
     code: candidate.code,
     message: candidate.message,
-    findings: Array.isArray(candidate.findings) ? candidate.findings : [],
   };
 }
 
@@ -414,10 +399,10 @@ export function SnapshotPage() {
     }
   }
 
-  async function runUpload(overwrite: boolean, allowPlaintext = false) {
+  async function runUpload(overwrite: boolean) {
     setUpload({ kind: 'uploading' });
     try {
-      const view = await uploadSnapshot(overwrite, allowPlaintext);
+      const view = await uploadSnapshot(overwrite);
       setUpload(
         view.kind === 'conflict'
           ? { kind: 'conflict', view }
@@ -425,10 +410,6 @@ export function SnapshotPage() {
       );
     } catch (error) {
       const failure = asFailure(error);
-      if (failure !== null && failure.code === 'secrets_unconfirmed') {
-        setUpload({ kind: 'blocked', failure, overwrite });
-        return;
-      }
       setUpload({
         kind: 'failed',
         message: failure?.message ?? errorMessage(error),
@@ -508,19 +489,13 @@ export function SnapshotPage() {
     }
   }
 
-  async function runExport(allowPlaintext: boolean) {
+  async function runExport() {
     setExported({ kind: 'exporting' });
     try {
-      const report = await invoke<ExportReport>('export_snapshot', {
-        allowPlaintext,
-      });
+      const report = await invoke<ExportReport>('export_snapshot');
       setExported({ kind: 'done', report });
     } catch (error) {
       const failure = asFailure(error);
-      if (failure !== null && failure.code === 'secrets_unconfirmed') {
-        setExported({ kind: 'blocked', failure });
-        return;
-      }
       setExported({
         kind: 'failed',
         message: failure?.message ?? errorMessage(error),
@@ -533,7 +508,7 @@ export function SnapshotPage() {
       <header>
         <h1 className="text-lg font-semibold text-foreground">快照</h1>
         <p className="mt-xs text-sm text-muted-foreground">
-          把当前 Pi 配置整理成一份可校验的快照，写进云盘同步文件夹；密钥会换成环境变量引用。
+          把当前 Pi 配置整理成一份可校验的快照，写进云盘同步文件夹；密钥会原样进入快照。
         </p>
       </header>
 
@@ -647,51 +622,6 @@ export function SnapshotPage() {
             </div>
           )}
 
-          {upload.kind === 'blocked' && (
-            <div className="mt-md flex flex-col gap-sm">
-              <p className="flex items-start gap-sm text-sm text-warning">
-                <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
-                <span>
-                  {upload.failure.message}；这些位置不会自动改写，确认后才会把明文带进远端快照。
-                </span>
-              </p>
-              <ul className="flex flex-col gap-sm">
-                {upload.failure.findings.map((finding) => (
-                  <li
-                    key={`${finding.path}-${finding.line}-${finding.field ?? ''}`}
-                    className="rounded-md bg-surface-muted px-md py-sm"
-                  >
-                    <p className="break-all font-mono text-xs text-foreground">
-                      {finding.path}:{finding.line}
-                    </p>
-                    <p className="mt-xs text-xs text-muted-foreground">
-                      {finding.field ?? '未识别字段'} ·{' '}
-                      {finding.level === 'high' ? '高危' : '提示'} · {finding.rule}
-                    </p>
-                  </li>
-                ))}
-              </ul>
-              <div className="flex flex-wrap gap-sm">
-                <Button
-                  onClick={() => void runUpload(upload.overwrite, true)}
-                  disabled={uploading}
-                >
-                  仍然上传
-                </Button>
-                <Button
-                  variant="secondary"
-                  onClick={() => setUpload({ kind: 'idle' })}
-                  disabled={uploading}
-                >
-                  取消
-                </Button>
-              </div>
-              <p className="text-xs text-muted-foreground">
-                更稳妥的做法是先把这些值改成 $NAME / ${'${NAME}'} 形式的引用，再重新上传。
-              </p>
-            </div>
-          )}
-
           {upload.kind === 'failed' && (
             <div className="mt-md flex flex-col gap-sm">
               <p className="flex items-start gap-sm text-sm text-danger">
@@ -757,7 +687,7 @@ export function SnapshotPage() {
       )}
 
       <div className="flex flex-wrap items-center gap-md">
-        <Button onClick={() => void runExport(false)} disabled={!canExport}>
+        <Button onClick={() => void runExport()} disabled={!canExport}>
           {exporting ? '导出中…' : '导出快照'}
         </Button>
         {!isDesktop && (
@@ -765,7 +695,7 @@ export function SnapshotPage() {
         )}
         {exporting && (
           <span className="text-sm text-muted-foreground" aria-live="polite">
-            正在收集配置、引用化密钥并写入临时目录…
+            正在收集配置、扫描明文密钥并写入临时目录…
           </span>
         )}
       </div>
@@ -819,6 +749,16 @@ export function SnapshotPage() {
             </p>
             <PlanGroup title="新增" items={planning.report.plan.added} />
             <PlanGroup title="修改" items={planning.report.plan.modified} />
+            {[...planning.report.plan.added, ...planning.report.plan.modified, ...planning.report.plan.deleted].some(
+              (item) => item.path === 'auth.json',
+            ) && (
+              <p className="flex items-start gap-sm text-sm text-warning">
+                <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
+                <span>
+                  本计划会覆盖或删除本机 auth.json（Pi 凭据）；覆盖/删除前会先备份。
+                </span>
+              </p>
+            )}
             <PlanGroup
               title="删除"
               hint="应用时需逐项确认"
@@ -1146,10 +1086,6 @@ export function SnapshotPage() {
             <ResultRow label="文件数" value={String(exported.report.files)} />
             <ResultRow label="指纹" value={exported.report.fingerprint} mono />
             <ResultRow
-              label="需要的环境变量"
-              value={String(exported.report.requiredSecrets.length)}
-            />
-            <ResultRow
               label="声明的包"
               value={String(exported.report.requiredPackages.length)}
             />
@@ -1159,26 +1095,15 @@ export function SnapshotPage() {
           <p className="mt-md text-sm text-muted-foreground">
             等待云盘上传完成后再在另一台机器上导入；manifest 最后写入，可作为上传完成的信号。
           </p>
-          {exported.report.requiredSecrets.length > 0 && (
-            <ul className="mt-sm flex flex-wrap gap-sm">
-              {exported.report.requiredSecrets.map((secret) => (
-                <li
-                  key={secret.name}
-                  className="rounded-md bg-surface-muted px-sm py-xs font-mono text-xs text-foreground"
-                >
-                  {secret.name}
-                </li>
-              ))}
-            </ul>
-          )}
           {exported.report.plaintextSecrets && (
             <p className="mt-sm text-sm text-warning">
-              本次保留了明文密钥，manifest 已记录；导入端会再提醒一次。
+              快照含明文密钥（auth.json 或高危命中），manifest 已记录；云盘/WebDAV
+              服务端及其版本历史可见。OAuth 多机共享可能互相失效，切换机器前先应用最新快照。
             </p>
           )}
           {exported.report.warnings.length > 0 && (
             <p className="mt-sm text-sm text-muted-foreground">
-              另有 {exported.report.warnings.length} 条低置信提示，未自动改写。
+              另有 {exported.report.warnings.length} 条密钥提示，文件已原样保留。
             </p>
           )}
         </Card>
@@ -1196,46 +1121,6 @@ export function SnapshotPage() {
         </Card>
       )}
 
-      {exported.kind === 'blocked' && (
-        <Card className="p-lg">
-          <h2 className="text-sm font-semibold text-foreground">发现明文密钥</h2>
-          <p className="mt-xs text-sm text-muted-foreground">
-            {exported.failure.message}
-            ；这些位置不会自动改写，确认要原样带进快照吗？
-          </p>
-          <ul className="mt-md flex flex-col gap-sm">
-            {exported.failure.findings.map((finding) => (
-              <li
-                key={`${finding.path}-${finding.line}-${finding.field ?? ''}`}
-                className="rounded-md bg-surface-muted px-md py-sm"
-              >
-                <p className="break-all font-mono text-xs text-foreground">
-                  {finding.path}:{finding.line}
-                </p>
-                <p className="mt-xs text-xs text-muted-foreground">
-                  {finding.field ?? '未识别字段'} ·{' '}
-                  {finding.level === 'high' ? '高危' : '提示'} · {finding.rule}
-                </p>
-              </li>
-            ))}
-          </ul>
-          <div className="mt-lg flex flex-wrap gap-sm">
-            <Button onClick={() => void runExport(true)} disabled={exporting}>
-              仍然导出
-            </Button>
-            <Button
-              variant="secondary"
-              onClick={() => setExported({ kind: 'idle' })}
-              disabled={exporting}
-            >
-              取消
-            </Button>
-          </div>
-          <p className="mt-sm text-xs text-muted-foreground">
-            更稳妥的做法是先把这些值改成 $NAME / ${'${NAME}'} 形式的引用，再重新导出。
-          </p>
-        </Card>
-      )}
     </div>
   );
 }

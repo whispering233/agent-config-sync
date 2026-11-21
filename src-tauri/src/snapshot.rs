@@ -1,7 +1,7 @@
 //! 快照导出流水线。
 //!
 //! 流程来源：`docs/design/10-snapshot-sync.md` 第 5 节。
-//! 顺序固定为：预检 → 物化到临时目录 → 密钥引用化/扫描 → 原子替换 → 最后写 manifest。
+//! 顺序固定为：预检 → 物化到临时目录 → 只读密钥扫描 → 原子替换 → 最后写 manifest。
 //! 任一步失败都删掉临时目录，原快照与 manifest 保持原样。
 //!
 //! `export_snapshot` 是 command 层入口；核心逻辑 [`export_with`] 只碰文件系统与给定的版本号，
@@ -9,9 +9,9 @@
 
 use crate::config::{self, AGENT_DIR_ENV_VAR};
 use crate::doctor::{self, ShellRunner};
-use crate::platform::HostOs;
+use crate::platform::{self, HostOs};
 use crate::scope;
-use crate::secrets::{self, RequiredSecret, SecretFinding, SecretLevel};
+use crate::secrets::{self, SecretFinding, SecretLevel};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
@@ -26,7 +26,11 @@ pub const SNAPSHOT_DIR_NAME: &str = "snapshot";
 /// manifest 文件名。
 pub const MANIFEST_FILE_NAME: &str = "manifest.json";
 /// manifest 格式版本。不认识的值一律拒绝读取。
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
+/// 快照目录权限：含明文凭据，只允许本用户进入。
+const SNAPSHOT_DIR_MODE: u32 = 0o700;
+/// 凭据文件权限。
+const AUTH_FILE_MODE: u32 = 0o600;
 /// v1 只有一套配置。
 pub const PROFILE_ID: &str = "default";
 
@@ -45,9 +49,8 @@ pub struct Manifest {
     pub requirements: Requirements,
     pub files: Vec<ManifestFile>,
     pub symlinks: Vec<ManifestSymlink>,
-    pub required_secrets: Vec<RequiredSecret>,
     pub required_packages: Vec<RequiredPackage>,
-    /// 用户在知情前提下保留了明文密钥；导入端据此给出警告。
+    /// 快照含 auth.json 或扫描到高危明文；导入端据此给出警告。
     #[serde(default, skip_serializing_if = "is_false")]
     pub plaintext_secrets: bool,
 }
@@ -104,11 +107,10 @@ fn is_false(value: &bool) -> bool {
 pub struct ExportReport {
     pub files: usize,
     pub fingerprint: String,
-    pub required_secrets: Vec<RequiredSecret>,
     pub required_packages: Vec<RequiredPackage>,
     /// 断链等被跳过的条目数。
     pub skipped: usize,
-    /// 低置信提示：不阻断，也没有自动改写。
+    /// 只读扫描结果：不阻断，也没有自动改写。
     pub warnings: Vec<SecretFinding>,
     pub plaintext_secrets: bool,
     pub snapshot_dir: PathBuf,
@@ -121,8 +123,6 @@ pub struct ExportReport {
 pub struct ExportFailure {
     pub code: &'static str,
     pub message: String,
-    /// 仅 `secrets_unconfirmed` 会带上待确认条目。
-    pub findings: Vec<SecretFinding>,
 }
 
 impl ExportFailure {
@@ -130,19 +130,6 @@ impl ExportFailure {
         Self {
             code,
             message: message.into(),
-            findings: Vec::new(),
-        }
-    }
-
-    fn with_findings(
-        code: &'static str,
-        message: impl Into<String>,
-        findings: Vec<SecretFinding>,
-    ) -> Self {
-        Self {
-            code,
-            message: message.into(),
-            findings,
         }
     }
 }
@@ -157,24 +144,14 @@ pub struct SourceVersions {
 /// 导出快照（不记来源版本）。生产路径都用 [`export_with`] 带上探测结果，
 /// 这里留给单测：临时目录夹具不关心宿主版本。
 #[cfg(test)]
-pub fn export(
-    agent_dir: &Path,
-    sync_root: &Path,
-    allow_plaintext: bool,
-) -> Result<ExportReport, ExportFailure> {
-    export_with(
-        agent_dir,
-        sync_root,
-        allow_plaintext,
-        SourceVersions::default(),
-    )
+pub fn export(agent_dir: &Path, sync_root: &Path) -> Result<ExportReport, ExportFailure> {
+    export_with(agent_dir, sync_root, SourceVersions::default())
 }
 
 /// 与 [`export`] 相同，额外把探测到的 node/pi 版本写进 `manifest.source`。
 pub fn export_with(
     agent_dir: &Path,
     sync_root: &Path,
-    allow_plaintext: bool,
     versions: SourceVersions,
 ) -> Result<ExportReport, ExportFailure> {
     precheck(agent_dir, sync_root)?;
@@ -196,29 +173,39 @@ pub fn export_with(
         ExportFailure::new("export_failed", format!("复制受管文件失败：{error}"))
     })?;
 
-    let sanitized = secrets::sanitize_snapshot(&temp_dir).map_err(|error| {
+    // 快照目录含明文凭据：目录只给本用户，auth.json 再收紧到 0600。
+    platform::set_mode(&temp_dir, SNAPSHOT_DIR_MODE).map_err(|error| {
+        let _ = fs::remove_dir_all(&temp_dir);
+        ExportFailure::new(
+            "no_write_permission",
+            format!("设置快照目录权限失败：{error}"),
+        )
+    })?;
+    let auth_path = temp_dir.join("auth.json");
+    let auth_present = auth_path.is_file();
+    if auth_present {
+        platform::set_mode(&auth_path, AUTH_FILE_MODE).map_err(|error| {
+            let _ = fs::remove_dir_all(&temp_dir);
+            ExportFailure::new(
+                "no_write_permission",
+                format!("设置 auth.json 权限失败：{error}"),
+            )
+        })?;
+    }
+
+    // 扫描只读：命中只用于告警，不改写快照内容。
+    let secret_findings = secrets::scan_snapshot(&temp_dir).map_err(|error| {
         let _ = fs::remove_dir_all(&temp_dir);
         ExportFailure::new("export_failed", format!("密钥扫描失败：{error}"))
     })?;
-
-    let blocking: Vec<SecretFinding> = sanitized
-        .findings
+    let has_high = secret_findings
         .iter()
-        .filter(|finding| finding.level == SecretLevel::High)
-        .cloned()
+        .any(|finding| finding.level == SecretLevel::High);
+    let plaintext_secrets = auth_present || has_high;
+    let warnings: Vec<SecretFinding> = secret_findings
+        .into_iter()
+        .filter(|finding| finding.path != "snapshot/auth.json")
         .collect();
-    if !blocking.is_empty() && !allow_plaintext {
-        let _ = fs::remove_dir_all(&temp_dir);
-        return Err(ExportFailure::with_findings(
-            "secrets_unconfirmed",
-            format!(
-                "发现 {} 处明文密钥，未做自动改写；确认后可以仍然导出",
-                blocking.len()
-            ),
-            blocking,
-        ));
-    }
-    let plaintext_secrets = !blocking.is_empty();
 
     let collected = collect_snapshot_files(&temp_dir).map_err(|error| {
         let _ = fs::remove_dir_all(&temp_dir);
@@ -260,7 +247,6 @@ pub fn export_with(
                 target: target.to_string_lossy().into_owned(),
             })
             .collect(),
-        required_secrets: sanitized.required_secrets,
         required_packages,
         plaintext_secrets,
     };
@@ -271,14 +257,9 @@ pub fn export_with(
     Ok(ExportReport {
         files: manifest.files.len(),
         fingerprint,
-        required_secrets: manifest.required_secrets,
         required_packages: manifest.required_packages,
         skipped: materialized.skipped.len(),
-        warnings: sanitized
-            .findings
-            .into_iter()
-            .filter(|finding| finding.level == SecretLevel::Low)
-            .collect(),
+        warnings,
         plaintext_secrets,
         snapshot_dir: sync_root.join(SNAPSHOT_DIR_NAME),
         manifest_path: sync_root.join(MANIFEST_FILE_NAME),
@@ -610,20 +591,14 @@ fn civil_from_days(days: i64) -> (i64, u64, u64) {
 
 /// command 层入口：从应用配置读取同步根目录与宿主目录，再跑导出。
 #[tauri::command]
-pub async fn export_snapshot(
-    app: tauri::AppHandle,
-    allow_plaintext: Option<bool>,
-) -> Result<ExportReport, ExportFailure> {
+pub async fn export_snapshot(app: tauri::AppHandle) -> Result<ExportReport, ExportFailure> {
     // 版本探测要起子进程，最多各等 5 秒；放阻塞线程池，别占住 UI 线程。
-    tauri::async_runtime::spawn_blocking(move || export_snapshot_blocking(&app, allow_plaintext))
+    tauri::async_runtime::spawn_blocking(move || export_snapshot_blocking(&app))
         .await
         .map_err(|error| ExportFailure::new("export_failed", format!("导出失败：{error}")))?
 }
 
-fn export_snapshot_blocking(
-    app: &tauri::AppHandle,
-    allow_plaintext: Option<bool>,
-) -> Result<ExportReport, ExportFailure> {
+fn export_snapshot_blocking(app: &tauri::AppHandle) -> Result<ExportReport, ExportFailure> {
     let config_dir = app.path().app_config_dir().map_err(|error| {
         ExportFailure::new(
             "app_config_unavailable",
@@ -655,12 +630,7 @@ fn export_snapshot_blocking(
         &ShellRunner::from_env(),
         HostOs::current(),
     );
-    export_with(
-        &agent_dir,
-        &sync_root,
-        allow_plaintext.unwrap_or(false),
-        SourceVersions { pi, node },
-    )
+    export_with(&agent_dir, &sync_root, SourceVersions { pi, node })
 }
 
 #[cfg(test)]
@@ -721,7 +691,7 @@ mod tests {
         );
         write_file(&root.join("AGENTS.md"), "# 指令\n");
         write_file(&root.join("skills/antd/SKILL.md"), "# 技能\n");
-        // 范围外：永不进入快照。
+        // 根级 auth.json 进快照；sessions 仍在范围外。
         write_file(
             &root.join("auth.json"),
             "{\"openai\": {\"key\": \"sk-secret\"}}",
@@ -760,14 +730,14 @@ mod tests {
             pi: Some("1.6.0".to_string()),
             node: Some("24.14.0".to_string()),
         };
-        export_with(&agent, &sync_root, false, versions).expect("导出应成功");
+        export_with(&agent, &sync_root, versions).expect("导出应成功");
 
         let manifest = read_manifest(&sync_root);
         assert_eq!(manifest.source.pi.as_deref(), Some("1.6.0"));
         assert_eq!(manifest.source.node.as_deref(), Some("24.14.0"));
 
         // 探测不到时留空：导出照常成功，manifest 里是 null。
-        export(&agent, &sync_root, false).expect("导出应成功");
+        export(&agent, &sync_root).expect("导出应成功");
         let manifest = read_manifest(&sync_root);
         assert_eq!(manifest.source.pi, None);
         assert_eq!(manifest.source.node, None);
@@ -781,11 +751,11 @@ mod tests {
         fixture_agent(&agent);
         fs::create_dir_all(&sync_root).expect("创建同步目录");
 
-        let report = export(&agent, &sync_root, false).expect("导出应成功");
-        assert_eq!(report.files, 5, "{:?}", report);
+        let report = export(&agent, &sync_root).expect("导出应成功");
+        assert_eq!(report.files, 6, "{:?}", report);
         assert_eq!(report.fingerprint.len(), 12);
         assert!(report.fingerprint.chars().all(|ch| ch.is_ascii_hexdigit()));
-        assert!(!report.plaintext_secrets);
+        assert!(report.plaintext_secrets, "auth.json 与字面密钥都应在快照里");
 
         let manifest = read_manifest(&sync_root);
         assert_eq!(manifest.format_version, FORMAT_VERSION);
@@ -809,6 +779,7 @@ mod tests {
             paths,
             vec![
                 "snapshot/AGENTS.md",
+                "snapshot/auth.json",
                 "snapshot/models.json",
                 "snapshot/settings.json",
                 "snapshot/skills/antd/SKILL.md",
@@ -838,21 +809,29 @@ mod tests {
             ]
         );
 
-        // 密钥已被引用化，快照里没有明文；范围外文件没有进入快照。
+        // 文件原样保留：字面密钥与 auth.json 都进入快照，不再引用化。
         let models = fs::read_to_string(sync_root.join("snapshot/models.json")).expect("读取快照");
-        assert!(!models.contains(SECRET), "{models}");
-        assert!(models.contains("$PI_OPENROUTER_API_KEY"), "{models}");
-        assert!(!sync_root.join("snapshot/auth.json").exists());
+        assert!(models.contains(SECRET), "{models}");
+        assert!(!models.contains("$PI_OPENROUTER_API_KEY"), "{models}");
+        assert!(sync_root.join("snapshot/auth.json").is_file());
         assert!(!sync_root.join("snapshot/sessions").exists());
 
-        assert_eq!(
-            report
-                .required_secrets
-                .iter()
-                .map(|secret| secret.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["PI_EXA_API_KEY", "PI_OPENROUTER_API_KEY"]
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let auth_mode = fs::metadata(sync_root.join("snapshot/auth.json"))
+                .expect("auth 元数据")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(auth_mode, 0o600, "快照里的 auth.json 必须是 0600");
+            let dir_mode = fs::metadata(sync_root.join("snapshot"))
+                .expect("快照目录元数据")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700, "快照目录必须是 0700");
+        }
 
         // 同步根目录里只多了约定产物；没有临时目录残留。
         assert_eq!(dir_entries(&sync_root), vec!["manifest.json", "snapshot"]);
@@ -894,7 +873,7 @@ mod tests {
         let sync_root = temp.path().join("cloud");
         fixture_agent(&agent);
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        export(&agent, &sync_root, false).expect("导出应成功");
+        export(&agent, &sync_root).expect("导出应成功");
         let manifest = read_manifest(&sync_root);
 
         // 原样通过。
@@ -912,48 +891,26 @@ mod tests {
     }
 
     #[test]
-    fn second_export_failure_keeps_previous_snapshot_and_manifest() {
+    fn second_export_replaces_snapshot_without_temp_leftovers() {
         let temp = TempDir::new("atomic");
         let agent = temp.path().join("agent");
         let sync_root = temp.path().join("cloud");
         fixture_agent(&agent);
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        export(&agent, &sync_root, false).expect("首次导出应成功");
+        export(&agent, &sync_root).expect("首次导出应成功");
 
-        let manifest_before =
-            fs::read_to_string(sync_root.join(MANIFEST_FILE_NAME)).expect("读 manifest");
-        let settings_before =
-            fs::read_to_string(sync_root.join("snapshot/settings.json")).expect("读快照文件");
-
-        // 第二次：宿主目录里出现非已知文件中的明文密钥，未确认时必须中止。
+        // 第二次：新增的扩展文件也进入快照，旧快照整体被替换。
         write_file(
             &agent.join("extensions/leak/index.ts"),
             &format!("const apiKey = \"sk-{SECRET}\";\n"),
         );
-        let failure = export(&agent, &sync_root, false).expect_err("应阻断");
-        assert_eq!(failure.code, "secrets_unconfirmed");
-        assert_eq!(failure.findings.len(), 1);
-        assert_eq!(
-            failure.findings[0].path,
-            "snapshot/extensions/leak/index.ts"
-        );
-
-        assert_eq!(
-            fs::read_to_string(sync_root.join(MANIFEST_FILE_NAME)).expect("读 manifest"),
-            manifest_before
-        );
-        assert_eq!(
-            fs::read_to_string(sync_root.join("snapshot/settings.json")).expect("读快照文件"),
-            settings_before
-        );
-        assert!(!sync_root.join("snapshot/extensions/leak").exists());
-        // 没有临时/旧目录残留。
-        assert_eq!(dir_entries(&sync_root), vec!["manifest.json", "snapshot"]);
-
-        // 用户确认后可以导出，manifest 记录明文。
-        let report = export(&agent, &sync_root, true).expect("确认后应成功");
+        let report = export(&agent, &sync_root).expect("第二次导出应成功");
         assert!(report.plaintext_secrets);
+        assert!(sync_root
+            .join("snapshot/extensions/leak/index.ts")
+            .is_file());
         assert!(read_manifest(&sync_root).plaintext_secrets);
+        assert_eq!(dir_entries(&sync_root), vec!["manifest.json", "snapshot"]);
     }
 
     #[test]
@@ -964,15 +921,14 @@ mod tests {
 
         let inside = agent.join("cloud");
         fs::create_dir_all(&inside).expect("创建嵌套同步目录");
-        let failure = export(&agent, &inside, false).expect_err("嵌套应被拒绝");
+        let failure = export(&agent, &inside).expect_err("嵌套应被拒绝");
         assert_eq!(failure.code, "sync_root_overlaps_agent_dir");
 
         let missing = temp.path().join("missing");
-        let failure = export(&agent, &missing, false).expect_err("缺失应被拒绝");
+        let failure = export(&agent, &missing).expect_err("缺失应被拒绝");
         assert_eq!(failure.code, "sync_root_missing");
 
-        let failure =
-            export(&agent, Path::new("relative/path"), false).expect_err("相对路径应被拒绝");
+        let failure = export(&agent, Path::new("relative/path")).expect_err("相对路径应被拒绝");
         assert_eq!(failure.code, "sync_root_invalid");
     }
 
@@ -1004,11 +960,6 @@ mod tests {
                 path: "snapshot/skills/antd".to_string(),
                 target: "../../../.agents/skills/antd".to_string(),
             }],
-            required_secrets: vec![RequiredSecret {
-                name: "EXA_API_KEY".to_string(),
-                used_by: vec!["snapshot/web-search.json".to_string()],
-                hint: None,
-            }],
             required_packages: vec![RequiredPackage {
                 source: "npm:pi-web-access".to_string(),
                 enabled: true,
@@ -1028,7 +979,6 @@ mod tests {
             "requirements",
             "files",
             "symlinks",
-            "requiredSecrets",
             "requiredPackages",
         ] {
             assert!(value.get(key).is_some(), "manifest 缺少字段 {key}");

@@ -288,7 +288,8 @@ fn walk(
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if scope::is_excluded_name(&name) {
+        let relative_path = relative.join(&name);
+        if scope::is_excluded_relative(&relative_path) {
             continue;
         }
 
@@ -297,7 +298,6 @@ fn walk(
         let Ok(metadata) = fs::metadata(&path) else {
             continue;
         };
-        let relative_path = relative.join(&name);
 
         if metadata.is_dir() {
             if is_root && !scope::INCLUDED_ROOT_DIRS.contains(&name.as_str()) {
@@ -309,8 +309,8 @@ fn walk(
                 continue;
             }
             if let Some(original) = conflict_original_name(&name) {
-                // 冲突副本跟随原名的排除规则：`auth.json` 的副本同样是密钥。
-                if scope::is_excluded_name(&original) {
+                // 冲突副本跟随原名的排除规则；根级 auth.json 的副本同样要展示。
+                if scope::is_excluded_relative(&relative.join(&original)) {
                     continue;
                 }
                 found.push(Found {
@@ -601,7 +601,7 @@ mod tests {
         write_file(&agent.join("npm/p-NSConflict.json"), b"{}");
         write_file(&agent.join("notes-冲突.md"), b"notes\n");
         write_file(&agent.join("cache/c-冲突.json"), b"{}");
-        // 原名被排除的副本也要留在范围外。
+        // 根级 auth.json 已纳入范围，其冲突副本也要展示；子目录同名副本仍排除。
         write_file(&agent.join("auth.json"), b"{\"key\":\"literal\"}\n");
         write_file(&agent.join("auth-冲突.json"), b"{}");
         write_file(&agent.join("skills/auth-NSConflict.json"), b"{}");
@@ -609,9 +609,13 @@ mod tests {
         let report = scan(agent).expect("扫描");
         assert_eq!(
             conflicts(&report),
-            vec!["AGENTS-冲突.md", "skills/reviewer/SKILL-冲突.md"]
+            vec![
+                "AGENTS-冲突.md",
+                "auth-冲突.json",
+                "skills/reviewer/SKILL-冲突.md",
+            ]
         );
-        assert_eq!(report.totals.paired, 2);
+        assert_eq!(report.totals.paired, 3);
         assert_eq!(report.totals.orphan, 0);
     }
 

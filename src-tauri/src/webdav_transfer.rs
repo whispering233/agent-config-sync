@@ -108,10 +108,10 @@ pub enum TransferError {
     },
     /// 协议层失败（无凭据、不可达、认证、配额等）。
     Network(DavError),
-    /// 导出当前 live 失败：宿主目录不可用、明文密钥未确认等。
-    ///
-    /// 保留原结构是为了让前端能把 `secrets_unconfirmed` 的确认流程接上去。
+    /// 导出当前 live 失败：宿主目录不可用等。
     Export(ExportFailure),
+    /// 快照含 auth.json，但 WebDAV 不是 HTTPS（localhost 例外）。
+    Insecure(String),
     /// 提交 manifest 时条件请求未通过：远端在本次上传期间被改写过。
     RemoteChanged,
     /// 本机暂存目录或远端状态文件读写失败。
@@ -145,6 +145,7 @@ impl fmt::Display for TransferError {
             }
             Self::Network(error) => write!(formatter, "{error}"),
             Self::Export(failure) => write!(formatter, "{}", failure.message),
+            Self::Insecure(detail) => write!(formatter, "{detail}"),
             Self::RemoteChanged => write!(
                 formatter,
                 "远端 manifest 在本次上传期间被改写过，条件写未通过；请重新上传，让两边先对齐"
@@ -255,6 +256,7 @@ pub fn download<T: DavTransport>(
         )));
     }
     let manifest = parse_manifest(&bytes)?;
+    require_secure_with_auth(client.root_url(), manifest_has_auth(&manifest))?;
     // 状态文件损坏时先停：它记着「上次看到的远端」，覆盖掉就没人能判断冲突了。
     let previous = load_state(app_data).map_err(TransferError::Storage)?;
 
@@ -290,7 +292,6 @@ pub fn upload<T: DavTransport>(
     app_data: &Path,
     agent_dir: &Path,
     versions: &snapshot::SourceVersions,
-    allow_plaintext: bool,
     overwrite: bool,
 ) -> Result<UploadOutcome, TransferError> {
     let workspace = prepare_upload_workspace(app_data)?;
@@ -300,7 +301,7 @@ pub fn upload<T: DavTransport>(
         versions,
         workspace: &workspace,
     };
-    let outcome = upload_into(client, &input, allow_plaintext, overwrite);
+    let outcome = upload_into(client, &input, overwrite);
     // 工作区只是本次搬运的中间产物：内容在 live 与远端都还在，留着只会占地方。
     let _ = fs::remove_dir_all(app_data.join(UPLOAD_WORKSPACE_DIR_NAME));
     outcome
@@ -323,18 +324,17 @@ struct RemoteManifest {
 fn upload_into<T: DavTransport>(
     client: &WebdavClient<T>,
     input: &UploadInput<'_>,
-    allow_plaintext: bool,
     overwrite: bool,
 ) -> Result<UploadOutcome, TransferError> {
     // 1. 导出：脱敏、明文扫描、manifest、指纹全部复用快照流水线，不另写一套。
-    snapshot::export_with(
-        input.agent_dir,
-        input.workspace,
-        allow_plaintext,
-        input.versions.clone(),
-    )
-    .map_err(TransferError::Export)?;
+    snapshot::export_with(input.agent_dir, input.workspace, input.versions.clone())
+        .map_err(TransferError::Export)?;
     let manifest = read_workspace_manifest(input.workspace)?;
+    let has_auth = manifest
+        .files
+        .iter()
+        .any(|file| file.path == format!("{}/auth.json", snapshot::SNAPSHOT_DIR_NAME));
+    require_secure_with_auth(client.root_url(), has_auth)?;
 
     // 2. 读远端 manifest：不存在表示首次上传，可解析则拿它判冲突、做条件写。
     let (remote, corrupt_etag) = match read_remote_manifest(client)? {
@@ -428,6 +428,35 @@ fn upload_into<T: DavTransport>(
         skipped,
         seen_at,
     })
+}
+
+fn manifest_has_auth(manifest: &Manifest) -> bool {
+    manifest
+        .files
+        .iter()
+        .any(|file| file.path == format!("{}/auth.json", snapshot::SNAPSHOT_DIR_NAME))
+}
+
+/// 明文凭据只允许走 HTTPS；本机回环地址是开发/自托管的例外。
+fn require_secure_with_auth(url: &str, has_auth: bool) -> Result<(), TransferError> {
+    if !has_auth {
+        return Ok(());
+    }
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|error| TransferError::Insecure(format!("WebDAV 地址无效：{error}")))?;
+    if parsed.scheme() == "https" {
+        return Ok(());
+    }
+    let loopback = matches!(
+        parsed.host_str(),
+        Some("localhost") | Some("127.0.0.1") | Some("::1") | Some("[::1]")
+    );
+    if parsed.scheme() == "http" && loopback {
+        return Ok(());
+    }
+    Err(TransferError::Insecure(
+        "快照含 auth.json，WebDAV 必须使用 HTTPS（localhost 例外）".to_string(),
+    ))
 }
 
 /// 读回刚导出的 manifest：上传的路径清单以它为准，不再从目录重新拼一遍。
@@ -841,7 +870,6 @@ mod tests {
             },
             files,
             symlinks: Vec::new(),
-            required_secrets: Vec::new(),
             required_packages: Vec::new(),
             plaintext_secrets: false,
         }
@@ -1346,7 +1374,6 @@ mod tests {
         client: &WebdavClient<T>,
         app_data: &Path,
         agent_dir: &Path,
-        allow_plaintext: bool,
         overwrite: bool,
     ) -> Result<UploadOutcome, TransferError> {
         upload(
@@ -1354,7 +1381,6 @@ mod tests {
             app_data,
             agent_dir,
             &snapshot::SourceVersions::default(),
-            allow_plaintext,
             overwrite,
         )
     }
@@ -1424,7 +1450,6 @@ mod tests {
             &app_data,
             &agent,
             &snapshot::SourceVersions::default(),
-            false,
             false,
         )
         .expect("首次上传应成功");
@@ -1505,7 +1530,6 @@ mod tests {
             &agent,
             &snapshot::SourceVersions::default(),
             false,
-            false,
         )
         .expect("应返回冲突而不是报错");
 
@@ -1546,7 +1570,6 @@ mod tests {
             &app_data,
             &agent,
             &snapshot::SourceVersions::default(),
-            false,
             true,
         )
         .expect("确认覆盖后应成功");
@@ -1601,7 +1624,6 @@ mod tests {
             &agent,
             &snapshot::SourceVersions::default(),
             false,
-            false,
         )
         .expect("上传应成功")
         {
@@ -1620,7 +1642,6 @@ mod tests {
                     &app_data,
                     &agent,
                     &snapshot::SourceVersions::default(),
-                    false,
                     true,
                 )
                 .expect("确认覆盖后应成功")
@@ -1645,7 +1666,6 @@ mod tests {
             &app_data,
             &agent,
             &snapshot::SourceVersions::default(),
-            false,
             false,
         )
         .expect("二次上传应成功");
@@ -1725,7 +1745,6 @@ mod tests {
             &agent,
             &snapshot::SourceVersions::default(),
             false,
-            false,
         )
         .expect("首次上传应成功");
         let remote = load_state(&app_data).unwrap().unwrap().manifest;
@@ -1740,7 +1759,6 @@ mod tests {
             &app_data,
             &agent,
             &snapshot::SourceVersions::default(),
-            false,
             false,
         )
         .expect("增量上传应成功");
@@ -1797,7 +1815,6 @@ mod tests {
             &agent,
             &snapshot::SourceVersions::default(),
             false,
-            false,
         )
         .expect("冲突不是错误");
 
@@ -1844,7 +1861,6 @@ mod tests {
             &agent,
             &snapshot::SourceVersions::default(),
             false,
-            false,
         )
         .expect("冲突不是错误");
 
@@ -1883,7 +1899,6 @@ mod tests {
             &app_data,
             &agent,
             &snapshot::SourceVersions::default(),
-            false,
             true,
         )
         .expect("覆盖上传应成功");
@@ -1922,7 +1937,6 @@ mod tests {
             &agent,
             &snapshot::SourceVersions::default(),
             false,
-            false,
         )
         .expect("首次上传应成功");
         let before = load_state(&app_data).unwrap().unwrap();
@@ -1939,7 +1953,6 @@ mod tests {
             &app_data,
             &agent,
             &snapshot::SourceVersions::default(),
-            false,
             false,
         )
         .expect_err("412 应失败");
@@ -1990,7 +2003,6 @@ mod tests {
             &agent,
             &snapshot::SourceVersions::default(),
             false,
-            false,
         )
         .expect_err("导出失败应停下");
         match error {
@@ -2003,47 +2015,63 @@ mod tests {
     }
 
     #[test]
-    fn upload_blocks_on_plaintext_secrets_before_the_network() {
+    fn upload_includes_auth_and_plaintext_secrets() {
         let temp = TempDir::new("upload-plaintext");
         let app_data = temp.path().join("data");
         let agent = temp.path().join("agent");
         fixture_agent(&agent);
-        // 范围外的普通脚本里出现已知前缀：不改写，只阻断，等用户确认。
         write_file(
-            &agent.join("extensions/demo/index.ts"),
-            "const apiKey = \"sk-Zx7Qv2Lm9Rt4Bc8Wn3Yp6Kd1\";\n",
+            &agent.join("auth.json"),
+            "{\"openai\": {\"type\": \"api_key\", \"key\": \"sk-Zx7Qv2Lm9Rt4Bc8Wn3Yp6Kd1\"}}",
         );
 
-        let (client, transport) = fake_client(Vec::new());
+        let (client, _) = fake_client(first_upload_responses());
+        let outcome = upload(
+            &client,
+            &app_data,
+            &agent,
+            &snapshot::SourceVersions::default(),
+            false,
+        )
+        .expect("含 auth.json 的上传应成功");
+        assert!(matches!(outcome, UploadOutcome::Uploaded { .. }));
+        assert!(!app_data.join(UPLOAD_WORKSPACE_DIR_NAME).exists());
+        assert!(app_data.join(REMOTE_STATE_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn secure_gate_allows_https_and_loopback_http_only() {
+        assert!(require_secure_with_auth("https://dav.example.com/dav", true).is_ok());
+        assert!(require_secure_with_auth("http://localhost:8080/dav", true).is_ok());
+        assert!(require_secure_with_auth("http://127.0.0.1/dav", true).is_ok());
+        assert!(require_secure_with_auth("http://[::1]/dav", true).is_ok());
+        assert!(require_secure_with_auth("http://dav.example.com/dav", true).is_err());
+        // 没有 auth.json 时仍允许普通 http。
+        assert!(require_secure_with_auth("http://dav.example.com/dav", false).is_ok());
+    }
+
+    #[test]
+    fn upload_refuses_auth_over_plain_http_before_the_network() {
+        let temp = TempDir::new("upload-insecure");
+        let app_data = temp.path().join("data");
+        let agent = temp.path().join("agent");
+        fixture_agent(&agent);
+        write_file(
+            &agent.join("auth.json"),
+            "{\"openai\": {\"type\": \"api_key\"}}",
+        );
+
+        let transport = FakeTransport::new(Vec::new());
+        let client = WebdavClient::new(transport.clone(), "http://dav.example.com/dav");
         let error = upload(
             &client,
             &app_data,
             &agent,
             &snapshot::SourceVersions::default(),
             false,
-            false,
         )
-        .expect_err("明文密钥未确认时不能上传");
-        match error {
-            TransferError::Export(failure) => {
-                assert_eq!(failure.code, "secrets_unconfirmed");
-                assert!(!failure.findings.is_empty(), "要带上待确认条目");
-            }
-            other => panic!("期望 Export，得到 {other:?}"),
-        }
-        assert!(transport.requests().is_empty());
-
-        // 用户确认后同一个入口能继续：复用导出的 allow_plaintext 语义。
-        let (confirming_client, _) = fake_client(first_upload_responses());
-        let outcome = upload(
-            &confirming_client,
-            &app_data,
-            &agent,
-            &snapshot::SourceVersions::default(),
-            true,
-            false,
-        )
-        .expect("确认后应上传成功");
-        assert!(matches!(outcome, UploadOutcome::Uploaded { .. }));
+        .expect_err("auth 不能走明文 HTTP");
+        assert!(matches!(error, TransferError::Insecure(_)), "{error:?}");
+        assert!(transport.requests().is_empty(), "门槛必须在发请求之前");
     }
 }

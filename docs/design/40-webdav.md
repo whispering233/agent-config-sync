@@ -10,6 +10,7 @@
 
 - 只支持 WebDAV，不做 OAuth 类云盘直连，不做 S3 兼容。
 - 明文上传。用户选择 WebDAV 即已把信任边界延伸到服务商；不提供半吊子加密（需要时用服务商侧或 rclone crypt 解决）。
+- 快照含 `auth.json` 时只允许 HTTPS；`localhost`/`127.0.0.1`/`::1` 例外。非 HTTPS 直接拒绝，不发请求（`remote_insecure`）。
 
 ## 2. 凭据
 
@@ -17,7 +18,7 @@
 
 | 字段 | 必选 | 说明 |
 | :--- | :--- | :--- |
-| `url` | 是 | WebDAV 服务地址，如 `https://dav.jianguoyun.com/dav`；只接受 http/https |
+| `url` | 是 | WebDAV 服务地址，如 `https://dav.jianguoyun.com/dav`；只接受 http/https，含 `auth.json` 的快照强制 HTTPS |
 | `username` | 是 | 坚果云填注册邮箱 |
 | `password` | 是 | 应用密码（可单独吊销），不是账号主密码 |
 
@@ -67,18 +68,19 @@
 
 ```text
 1. 导出     按 10-snapshot-sync §5 生成新快照到本机暂存目录（含新 manifest）
-2. 读远端   GET manifest.json
+2. 门槛     manifest 含 auth.json 时地址必须是 HTTPS（localhost 例外），否则 remote_insecure
+3. 读远端   GET manifest.json
    ├─ 404        → 首次上传
    ├─ 无法解析    → 进入冲突流程（远端清单损坏），只有确认覆盖才继续
    └─ 正常        → 取 fingerprint 与 ETag
-3. 冲突判定  见 §7
-4. 建目录   按 manifest 里的路径建出缺失的目录（浅到深，MKCOL 幂等）
-5. 传文件   与新 manifest 逐项比对 path + sha256，只 PUT 变化的文件
-6. 提交     PUT manifest.json
+4. 冲突判定  见 §7
+5. 建目录   按 manifest 里的路径建出缺失的目录（浅到深，MKCOL 幂等）
+6. 传文件   与新 manifest 逐项比对 path + sha256，只 PUT 变化的文件
+7. 提交     PUT manifest.json
    ├─ 远端已有清单 → If-Match: <etag>
    └─ 远端无清单   → If-None-Match: *
    └─ 412          → remote_changed，停止，不重试
-7. 收尾     记录远端状态（§7）；提示"等待云盘侧完成"不适用于本模式
+8. 收尾     记录远端状态（§7）；提示"等待云盘侧完成"不适用于本模式
 ```
 
 - 失败停在原地：已上传的文件留在远端，但旧 manifest 仍指向旧快照；不会出现"半套快照被应用"。
@@ -89,10 +91,11 @@
 
 ```text
 1. GET manifest.json → 404 报 remote_not_found；无法解析报 remote_manifest_corrupt
-2. 状态：远端 fingerprint == 记录值 ? 已是最新 : 云端有更新
-3. 下载：按 manifest 逐文件 GET 到 <应用数据目录>/staging/<时间戳>/，逐个校验 sha256
-4. 之后完全复用 10-snapshot-sync §6：计划 → 预览 → 备份 → 应用
-5. 成功后更新远端状态；暂存目录保留给计划与应用读取，下次成功下载时清理更早的
+2. 门槛：manifest 含 auth.json 时地址必须是 HTTPS（localhost 例外），否则 remote_insecure，不下载文件
+3. 状态：远端 fingerprint == 记录值 ? 已是最新 : 云端有更新
+4. 下载：按 manifest 逐文件 GET 到 <应用数据目录>/staging/<时间戳>/，逐个校验 sha256
+5. 之后完全复用 10-snapshot-sync §6：计划 → 预览 → 备份 → 应用
+6. 成功后更新远端状态；暂存目录保留给计划与应用读取，下次成功下载时清理更早的
 ```
 
 - 任一步失败删除暂存目录，本机 live 不动。
@@ -129,6 +132,7 @@
 | `remote_manifest_corrupt` | 远端 manifest 无法解析或格式版本不支持 |
 | `remote_not_found` | 下载时远端没有 manifest |
 | `remote_changed` | 提交时条件请求失败（远端在此期间被改写） |
+| `remote_insecure` | 快照含 `auth.json` 时使用非 HTTPS 的 WebDAV（localhost 例外） |
 
 ## 9. 已知限制
 

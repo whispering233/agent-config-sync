@@ -36,6 +36,8 @@ pub const BACKUP_RETENTION: usize = 10;
 const BACKUP_DIR_MODE: u32 = 0o700;
 /// 新增文件的权限；覆盖已有文件时沿用原 mode。
 const NEW_FILE_MODE: u32 = 0o644;
+/// 凭据文件的新建与覆盖权限。
+const AUTH_FILE_MODE: u32 = 0o600;
 
 /// 一次应用的输出。失败时改由 [`ApplyFailure`] 返回，`failed_at` 因此总是 `None`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -408,7 +410,12 @@ fn rebuildable_links(
     for link in links {
         let relative = link_relative(&link.path);
         let relative_path = Path::new(relative);
-        // 被改过的 manifest 可能指向受管范围之外：不重建，免得删掉 auth.json 这类文件。
+        // auth.json 只以普通文件落地，不按 manifest 重建链接，避免把凭据指向范围外。
+        if relative_path == Path::new("auth.json") {
+            warnings.push(format!("{relative} 是凭据文件，未按链接重建"));
+            continue;
+        }
+        // 被改过的 manifest 可能指向受管范围之外：不重建。
         if !is_managed_link(relative_path)
             || scope::resolve_within(agent_dir, relative_path).is_err()
         {
@@ -485,7 +492,7 @@ fn is_under(path: &str, ancestor: &str) -> bool {
 }
 
 /// 链接路径必须在受管范围内：白名单与排除规则同计划，但链接本身可以是目录，
-/// 所以根级目录名也算在内。目的是不让被改过的 manifest 借链接删掉 `auth.json` 这类文件。
+/// 所以根级目录名也算在内。目的是不让被改过的 manifest 借链接删掉范围外文件。
 pub(crate) fn is_managed_link(relative: &Path) -> bool {
     let names: Vec<&str> = relative
         .components()
@@ -496,7 +503,7 @@ pub(crate) fn is_managed_link(relative: &Path) -> bool {
         .collect::<Option<Vec<&str>>>()
         .unwrap_or_default();
 
-    if names.is_empty() || names.iter().any(|name| scope::is_excluded_name(name)) {
+    if names.is_empty() || scope::is_excluded_relative(relative) {
         return false;
     }
     if names.len() > 1 {
@@ -809,10 +816,18 @@ pub(crate) fn materialize_subtree(source: &Path, target: &Path) -> io::Result<us
 /// 先写同目录临时文件再替换，权限沿用原 mode。
 fn write_file_content(source: &Path, target: &Path) -> io::Result<()> {
     let bytes = fs::read(source)?;
-    // 覆盖已有普通文件时沿用原 mode；新增文件用 0644（Windows 上 `set_mode` 不生效）。
-    let mode = match fs::symlink_metadata(target) {
-        Ok(metadata) if metadata.is_file() => platform::mode_of(&metadata).unwrap_or(NEW_FILE_MODE),
-        _ => NEW_FILE_MODE,
+    // auth.json 不论新建还是覆盖都收紧到 0600；其他文件沿用原 mode，新增用 0644。
+    // Windows 上 `set_mode` 不生效，保护来自用户目录的继承 ACL。
+    let is_auth = target.file_name().is_some_and(|name| name == "auth.json");
+    let mode = if is_auth {
+        AUTH_FILE_MODE
+    } else {
+        match fs::symlink_metadata(target) {
+            Ok(metadata) if metadata.is_file() => {
+                platform::mode_of(&metadata).unwrap_or(NEW_FILE_MODE)
+            }
+            _ => NEW_FILE_MODE,
+        }
     };
     if let Some(parent) = target.parent() {
         ensure_dir(parent)?;
@@ -1103,11 +1118,11 @@ mod tests {
         write_file(&agent.join("settings.json"), "{\"theme\": \"dark\"}");
         write_file(&agent.join("AGENTS.md"), "# 指令\n");
         write_file(&agent.join("skills/antd/SKILL.md"), "# 技能\n");
-        // 范围外：既不进快照，也不参与计划，永不被碰。
+        // auth.json 进快照；sessions 在范围外，永不参与计划。
         write_file(&agent.join("auth.json"), "{\"token\": \"sk-test\"}");
         write_file(&agent.join("sessions/old.json"), "{}");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &sync_root, false).expect("导出夹具快照");
+        crate::snapshot::export(&agent, &sync_root).expect("导出夹具快照");
         (agent, sync_root)
     }
 
@@ -1287,7 +1302,7 @@ mod tests {
         assert_eq!(failure.code, "manifest_invalid", "{}", failure.message);
 
         // 云盘只传了一半：manifest 还在，但文件内容不符。
-        crate::snapshot::export(&agent, &sync_root, false).expect("重新导出快照");
+        crate::snapshot::export(&agent, &sync_root).expect("重新导出快照");
         write_file(
             &sync_root.join("snapshot/settings.json"),
             "{\"theme\": \"half\"}",
@@ -1354,7 +1369,7 @@ mod tests {
         write_file(&agent.join("settings.json"), "{\"theme\": \"dark\"}");
         write_file(&temp.path().join("outside/keep.txt"), "留在这里\n");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &sync_root, false).expect("导出快照");
+        crate::snapshot::export(&agent, &sync_root).expect("导出快照");
         // 导出之后才出现的链接：快照里没有它，只能删链接本身。
         symlink(temp.path().join("outside"), agent.join("extra")).expect("创建目录链接");
 
@@ -1417,7 +1432,7 @@ mod tests {
         )
         .expect("创建符号链接");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &sync_root, false).expect("导出快照");
+        crate::snapshot::export(&agent, &sync_root).expect("导出快照");
 
         // 链接目标内容变了：计划里 SKILL.md 变成"修改"；settings.json 也改一下，
         // 让备份同时覆盖"修改文件 + 修改链接"两种情况。
@@ -1499,6 +1514,28 @@ mod tests {
                 .exists(),
             "符号链接只记目标，不复制内容"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_file_is_written_with_0600() {
+        let temp = TempDir::new("auth-mode");
+        let (agent, sync_root) = fixture(&temp);
+        let data = app_data(&temp);
+
+        fs::remove_file(agent.join("auth.json")).expect("删除 live auth");
+        let expected = fingerprint(&agent, &sync_root);
+        apply(
+            &agent,
+            &sync_root,
+            &expected,
+            &[],
+            &data,
+            &FakeRunner::ok(),
+            &PlatformLinkCreator,
+        )
+        .expect("应用应成功");
+        assert_eq!(mode_of(&agent.join("auth.json")), 0o600);
     }
 
     #[test]
@@ -1631,7 +1668,7 @@ mod tests {
         fs::create_dir_all(&agent).expect("创建宿主目录");
         symlink("../outside/skills-live", agent.join("skills")).expect("创建目录链接");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &sync_root, false).expect("导出夹具快照");
+        crate::snapshot::export(&agent, &sync_root).expect("导出夹具快照");
         (agent, sync_root, external)
     }
 
@@ -1803,7 +1840,7 @@ mod tests {
         fs::create_dir_all(&agent).expect("创建宿主目录");
         symlink("../outside/skills-live", agent.join("skills")).expect("创建目录链接");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &sync_root, false).expect("导出夹具快照");
+        crate::snapshot::export(&agent, &sync_root).expect("导出夹具快照");
         (agent, sync_root, external)
     }
 
@@ -1974,7 +2011,7 @@ mod tests {
         )
         .expect("创建目录链接");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &sync_root, false).expect("导出夹具快照");
+        crate::snapshot::export(&agent, &sync_root).expect("导出夹具快照");
 
         // 链接没了，父目录又不可写：建链接失败之后连物化都落不下去。
         fs::remove_file(agent.join("agents/link-to-shared")).expect("删除夹具链接");
@@ -2035,7 +2072,7 @@ mod tests {
         let (agent, sync_root) = fixture(&temp);
         let data = app_data(&temp);
 
-        // 被改过的 manifest 想借链接接管 auth.json：范围外一律不重建。
+        // 被改过的 manifest 想借链接接管 auth.json：凭据文件不按链接重建。
         write_file(&temp.path().join("outside/real.md"), "外部\n");
         let manifest_path = sync_root.join(crate::snapshot::MANIFEST_FILE_NAME);
         let mut manifest: serde_json::Value =
@@ -2075,7 +2112,7 @@ mod tests {
         assert_eq!(
             fs::read_to_string(agent.join("auth.json")).expect("读 auth.json"),
             "{\"token\": \"sk-test\"}",
-            "范围外文件不得被写入、删除或接管"
+            "auth.json 不得被链接接管"
         );
     }
 

@@ -718,6 +718,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn restores_auth_file_with_0600() {
+        let temp = TempDir::new("auth");
+        let agent = temp.path().join("agent");
+        let data = app_data(&temp);
+        write_file(&agent.join("auth.json"), "live");
+        let id = "2026-01-01T00-00-00Z";
+        craft_backup(
+            &data,
+            id,
+            &manifest(vec![file_entry("auth.json", true, 0o600)]),
+        );
+        craft_content(&data, id, "auth.json", "{\"openai\": {}}");
+
+        restore(&agent, &data, id, true).expect("auth.json 应能回滚");
+        assert_eq!(
+            fs::read_to_string(agent.join("auth.json")).expect("读 auth"),
+            "{\"openai\": {}}"
+        );
+        assert_eq!(mode_of(&agent.join("auth.json")), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn safety_backup_holds_the_current_state() {
         let temp = TempDir::new("safety");
         let agent = temp.path().join("agent");
@@ -916,13 +939,17 @@ mod tests {
         let data = app_data(&temp);
         write_file(&agent.join("settings.json"), "live");
         write_file(&agent.join("auth.json"), "{\"token\": \"sk-test\"}");
+        write_file(
+            &agent.join("sessions/auth.json"),
+            "{\"token\": \"sk-test\"}",
+        );
         write_file(&agent.join("sessions/old.json"), "{}");
         let id = "2026-01-01T00-00-00Z";
 
         for path in [
             "../escape.json",
             "/etc/passwd",
-            "auth.json",
+            "sessions/auth.json",
             "sessions/old.json",
             "skills/../../escape.json",
         ] {
@@ -1012,7 +1039,7 @@ mod tests {
         write_file(&agent.join("skills/antd/SKILL.md"), "# 技能\n");
         write_file(&agent.join("auth.json"), "{\"token\": \"sk-test\"}");
         fs::create_dir_all(&sync_root).expect("建同步目录");
-        crate::snapshot::export(&agent, &sync_root, false).expect("导出夹具快照");
+        crate::snapshot::export(&agent, &sync_root).expect("导出夹具快照");
         let fingerprint =
             crate::plan::plan_snapshot(&agent, &sync_root, &FakeRunner, HostOs::Posix)
                 .expect("生成夹具计划")

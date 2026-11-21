@@ -6,7 +6,6 @@ use crate::config::{
 use crate::credentials::{self, CredentialError, WebdavCredentials};
 use crate::doctor::{self, ShellRunner};
 use crate::platform::HostOs;
-use crate::secrets::SecretFinding;
 use crate::snapshot;
 use crate::webdav::{self, DavError, ReqwestTransport, WebdavClient};
 use crate::webdav_transfer::{self, TransferError, UploadOutcome};
@@ -249,22 +248,16 @@ pub enum UploadView {
     },
 }
 
-/// 上传失败。码沿用 `40-webdav.md` §8；`secrets_unconfirmed` 与导出流程同义。
+/// 上传失败。码沿用 `40-webdav.md` §8。
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UploadFailure {
     code: &'static str,
     message: String,
-    /// 只有明文密钥阻断才会带待确认条目。
-    findings: Vec<SecretFinding>,
 }
 
 fn upload_failure(code: &'static str, message: String) -> UploadFailure {
-    UploadFailure {
-        code,
-        message,
-        findings: Vec::new(),
-    }
+    UploadFailure { code, message }
 }
 
 /// 失败码：先定码，再取文案（导出失败有自己的码，其余按传输层分类）。
@@ -274,6 +267,7 @@ fn upload_failure_code(error: &TransferError) -> &'static str {
         TransferError::NotFound => "remote_not_found",
         TransferError::Corrupt(_) => "remote_manifest_corrupt",
         TransferError::RemoteChanged => "remote_changed",
+        TransferError::Insecure(_) => "remote_insecure",
         TransferError::Network(DavError::AuthFailed) => "remote_auth_failed",
         TransferError::Network(DavError::Quota) => "remote_quota",
         TransferError::Network(_) => "remote_unreachable",
@@ -287,7 +281,6 @@ fn upload_failure_from(error: TransferError) -> UploadFailure {
         TransferError::Export(failure) => UploadFailure {
             code,
             message: failure.message,
-            findings: failure.findings,
         },
         other => upload_failure(code, transfer_error(other)),
     }
@@ -295,11 +288,7 @@ fn upload_failure_from(error: TransferError) -> UploadFailure {
 
 /// 把当前 live 导出并推到 WebDAV。冲突时远端一个字节都不写，等用户选「覆盖」或「从云端更新」。
 #[tauri::command]
-pub async fn upload_snapshot(
-    app: AppHandle,
-    overwrite: bool,
-    allow_plaintext: Option<bool>,
-) -> Result<UploadView, UploadFailure> {
+pub async fn upload_snapshot(app: AppHandle, overwrite: bool) -> Result<UploadView, UploadFailure> {
     // 导出、逐文件 PUT 与 120s 单文件超时都是阻塞等待，留在 UI 线程会冻住窗口。
     tauri::async_runtime::spawn_blocking(move || {
         let config_dir = app.path().app_config_dir().map_err(|error| {
@@ -349,7 +338,6 @@ pub async fn upload_snapshot(
             &dir,
             &agent_dir,
             &versions,
-            allow_plaintext.unwrap_or(false),
             overwrite,
         )
         .map_err(upload_failure_from)?;
@@ -469,16 +457,15 @@ mod tests {
         );
     }
 
-    /// 明文密钥阻断要能过 IPC：码与待确认条目都得带上。
+    /// 失败码与文案要能过 IPC。
     #[test]
-    fn upload_failure_carries_code_and_findings() {
+    fn upload_failure_carries_code_and_message() {
         let failure = upload_failure("remote_changed", "远端被改写".to_string());
         assert_eq!(
             serde_json::to_value(&failure).unwrap(),
             serde_json::json!({
                 "code": "remote_changed",
                 "message": "远端被改写",
-                "findings": [],
             })
         );
     }

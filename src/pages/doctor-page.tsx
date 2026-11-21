@@ -158,7 +158,7 @@ const actionLabels: Record<string, string> = {
   'node.install': '安装 Node 22.19.0 或更高版本，然后重新检查。',
   'host.install': '安装 Pi CLI，然后重新检查。',
   'host.upgrade': '升级 Pi CLI，然后重新检查。',
-  'auth.configure': '在密钥向导里补齐这个 provider 的凭据。',
+  'auth.configure': '在终端执行 pi auth login <provider>，然后重新检查。',
   'packages.install': '按声明安装缺少的扩展包，然后重新检查。',
   'skills.relink': '重建 skills 下的符号链接。',
 };

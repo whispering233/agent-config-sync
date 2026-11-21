@@ -102,12 +102,8 @@ export type RemoteUpload =
 /**
  * 把当前配置导出并推到 WebDAV。
  *
- * `overwrite` 只在用户看过冲突清单后点「覆盖云端」时为 true；`allowPlaintext`
- * 与导出同名参数同义：用户已确认带明文密钥上传。
+ * `overwrite` 只在用户看过冲突清单后点「覆盖云端」时为 true。
  */
-export function uploadSnapshot(
-  overwrite: boolean,
-  allowPlaintext = false,
-): Promise<RemoteUpload> {
-  return invoke<RemoteUpload>('upload_snapshot', { overwrite, allowPlaintext });
+export function uploadSnapshot(overwrite: boolean): Promise<RemoteUpload> {
+  return invoke<RemoteUpload>('upload_snapshot', { overwrite });
 }

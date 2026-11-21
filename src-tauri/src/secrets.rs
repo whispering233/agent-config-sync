@@ -1,14 +1,10 @@
-//! 密钥扫描与引用化。
+//! 密钥扫描。
 //!
 //! 规则来源：`docs/design/30-secrets.md`。扫描对象是快照内的文本文件；
-//! 自动改写只发生在 `models.json` / `mcp.json` / `web-search.json` 三个已知文件，
-//! 其他文件命中高危时只返回 findings，由调用方决定是否继续。
-//!
-//! 铁律：findings 只带路径、字段名与行号，绝不带密钥值或片段。
+//! 只读，不改写、不阻断。findings 只带路径、字段名与行号，绝不带密钥值或片段。
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use serde::Serialize;
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -36,7 +32,7 @@ const KNOWN_PREFIXES: &[&str] = &[
 const MIN_ENTROPY_LENGTH: usize = 20;
 const MIN_ENTROPY: f64 = 4.5;
 
-/// 语义是摘要/校验值的字段，命中不扫描也永不改写。
+/// 语义是摘要/校验值的字段，命中不扫描。
 const EXCLUDED_FIELD_WORDS: &[&str] = &[
     "sha256",
     "sha1",
@@ -61,7 +57,7 @@ const SECRET_FIELD_WORDS: &[&str] = &[
     "privatekey",
 ];
 
-/// 判定级别。`high` 未确认时阻断导出。
+/// 判定级别。只用于展示，不阻断导出。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretLevel {
@@ -82,98 +78,19 @@ pub struct SecretFinding {
     pub rule: &'static str,
 }
 
-/// manifest 的 `requiredSecrets` 条目。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RequiredSecret {
-    pub name: String,
-    pub used_by: Vec<String>,
-    /// 只放官方申请地址；本版不内置任何第三方站点。
-    pub hint: Option<String>,
-}
-
-/// 一次脱敏的完整结果。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SanitizeOutcome {
-    pub findings: Vec<SecretFinding>,
-    pub required_secrets: Vec<RequiredSecret>,
-    /// 仍有 `high` 级明文：未获显式确认时不能继续导出。
-    pub blocked: bool,
-}
-
-/// 三个已知文件的引用语法。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RefStyle {
-    /// `$NAME`：`models.json`、`web-search.json`。
-    Dollar,
-    /// `${NAME}`：`mcp.json`。
-    Braces,
-}
-
-impl RefStyle {
-    fn reference(self, name: &str) -> String {
-        match self {
-            Self::Dollar => format!("${name}"),
-            Self::Braces => format!("${{{name}}}"),
-        }
-    }
-}
-
-fn style_for(relative: &Path) -> Option<RefStyle> {
-    match relative.to_str()? {
-        "models.json" | "web-search.json" => Some(RefStyle::Dollar),
-        "mcp.json" => Some(RefStyle::Braces),
-        _ => None,
-    }
-}
-
-/// 扫描并引用化整个快照目录。只读范围内的条目，写入仅限三个已知文件。
-pub fn sanitize_snapshot(snapshot_dir: &Path) -> io::Result<SanitizeOutcome> {
+/// 扫描整个快照目录。只读；非 UTF-8 文件视为二进制跳过。
+/// 返回的 findings 只含位置，调用方不得把值写进日志或错误信息。
+pub fn scan_snapshot(snapshot_dir: &Path) -> io::Result<Vec<SecretFinding>> {
     let mut findings = Vec::new();
-    let mut required: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut namer = Namer::default();
-
     for relative in collect_files(snapshot_dir)? {
-        let path = snapshot_dir.join(&relative);
-        let label = format!("snapshot/{}", slash(&relative));
-        let bytes = fs::read(&path)?;
-        // 非 UTF-8 视为二进制：不是文本配置，不扫描也不改写。
+        let bytes = fs::read(snapshot_dir.join(&relative))?;
         let Ok(text) = String::from_utf8(bytes) else {
             continue;
         };
-
-        match style_for(&relative) {
-            Some(style) => {
-                match rewrite_document(&text, style, &label, &mut namer, &mut required) {
-                    // 解析失败时不猜结构：保留原文，交给扫描结果决定是否阻断。
-                    None => findings.extend(scan_text(&label, &text)),
-                    Some(updated) => {
-                        if updated != text {
-                            fs::write(&path, updated)?;
-                        }
-                    }
-                }
-            }
-            None => findings.extend(scan_text(&label, &text)),
-        }
+        let label = format!("snapshot/{}", slash(&relative));
+        findings.extend(scan_text(&label, &text));
     }
-
-    let blocked = findings
-        .iter()
-        .any(|finding| finding.level == SecretLevel::High);
-
-    Ok(SanitizeOutcome {
-        findings,
-        required_secrets: required
-            .into_iter()
-            .map(|(name, used_by)| RequiredSecret {
-                name,
-                used_by,
-                hint: None,
-            })
-            .collect(),
-        blocked,
-    })
+    Ok(findings)
 }
 
 fn collect_files(root: &Path) -> io::Result<Vec<PathBuf>> {
@@ -208,189 +125,11 @@ fn slash(relative: &Path) -> String {
         .join("/")
 }
 
-/// 引用名生成：同一个值复用同一个名字，名字冲突时追加序号。
-#[derive(Default)]
-struct Namer {
-    by_value: HashMap<String, String>,
-    used: HashSet<String>,
-}
-
-impl Namer {
-    fn name_for(&mut self, secret: &str, keys: &[String]) -> String {
-        if let Some(existing) = self.by_value.get(secret) {
-            return existing.clone();
-        }
-
-        let base = derive_name(keys);
-        let mut candidate = base.clone();
-        let mut suffix = 2;
-        while self.used.contains(&candidate) {
-            candidate = format!("{base}_{suffix}");
-            suffix += 1;
-        }
-
-        self.used.insert(candidate.clone());
-        self.by_value.insert(secret.to_string(), candidate.clone());
-        candidate
-    }
-}
-
-/// `PI_` + 最近的归属键（provider / server 等）+ 字段名，转大写 SNAKE。
-fn derive_name(keys: &[String]) -> String {
-    const CONTAINERS: &[&str] = &["providers", "mcpservers", "headers", "servers", "env"];
-
-    let (field, ancestors) = match keys.split_last() {
-        Some((field, ancestors)) => (field.as_str(), ancestors),
-        None => ("secret", &[][..]),
-    };
-    let owner = ancestors
-        .iter()
-        .rev()
-        .find(|key| !CONTAINERS.contains(&key.to_lowercase().as_str()));
-
-    let mut parts = Vec::new();
-    if let Some(owner) = owner {
-        parts.push(snake_upper(owner));
-    }
-    parts.push(snake_upper(field));
-    format!("PI_{}", parts.join("_"))
-}
-
-fn snake_upper(value: &str) -> String {
-    let mut out = String::new();
-    let mut previous_lower = false;
-    for ch in value.chars() {
-        if ch.is_alphanumeric() {
-            if ch.is_uppercase() && previous_lower {
-                out.push('_');
-            }
-            out.push(ch.to_ascii_uppercase());
-            previous_lower = ch.is_lowercase() || ch.is_ascii_digit();
-        } else {
-            if !out.is_empty() && !out.ends_with('_') {
-                out.push('_');
-            }
-            previous_lower = false;
-        }
-    }
-    out.trim_matches('_').to_string()
-}
-
-fn rewrite_document(
-    text: &str,
-    style: RefStyle,
-    label: &str,
-    namer: &mut Namer,
-    required: &mut BTreeMap<String, Vec<String>>,
-) -> Option<String> {
-    let mut document: Value = serde_json::from_str(text).ok()?;
-    let changed = rewrite_value(
-        &mut document,
-        &mut Vec::new(),
-        style,
-        label,
-        namer,
-        required,
-    );
-    // 没有替换就不动原文：格式化本身不是变更，否则刚导出的快照会立刻显示“修改”。
-    if !changed {
-        return Some(text.to_string());
-    }
-    let mut output = serde_json::to_string_pretty(&document).ok()?;
-    output.push('\n');
-    Some(output)
-}
-
-fn rewrite_value(
-    value: &mut Value,
-    keys: &mut Vec<String>,
-    style: RefStyle,
-    label: &str,
-    namer: &mut Namer,
-    required: &mut BTreeMap<String, Vec<String>>,
-) -> bool {
-    match value {
-        Value::Object(map) => {
-            let mut changed = false;
-            for (key, child) in map.iter_mut() {
-                keys.push(key.clone());
-                match child {
-                    Value::String(text) => {
-                        // 用户已写的引用原样保留，只登记环境变量名。
-                        for name in extract_references(text) {
-                            record_secret(required, &name, label);
-                        }
-                        let high = classify(Some(key), text)
-                            .is_some_and(|(level, _)| level == SecretLevel::High);
-                        if let (true, Some((start, end, _))) = (high, detect(text)) {
-                            let name = namer.name_for(&text[start..end], keys);
-                            let reference = style.reference(&name);
-                            text.replace_range(start..end, &reference);
-                            record_secret(required, &name, label);
-                            changed = true;
-                        }
-                    }
-                    other => changed |= rewrite_value(other, keys, style, label, namer, required),
-                }
-                keys.pop();
-            }
-            changed
-        }
-        Value::Array(items) => {
-            let mut changed = false;
-            for item in items.iter_mut() {
-                changed |= rewrite_value(item, keys, style, label, namer, required);
-            }
-            changed
-        }
-        _ => false,
-    }
-}
-
-fn record_secret(required: &mut BTreeMap<String, Vec<String>>, name: &str, label: &str) {
-    let used_by = required.entry(name.to_string()).or_default();
-    if !used_by.iter().any(|item| item == label) {
-        used_by.push(label.to_string());
-        used_by.sort();
-    }
-}
-
-/// 提取已存在的引用里的环境变量名：`$NAME`、`${NAME}`、内嵌 `${NAME}`。
-fn extract_references(value: &str) -> Vec<String> {
+fn is_reference(value: &str) -> bool {
     let value = value.trim();
-    let mut names = Vec::new();
-    // `!command` 是命令引用，不是环境变量，导出端无从登记。
-    if value.starts_with('!') {
-        return names;
-    }
-
-    if let Some(name) = value
-        .strip_prefix("${")
-        .and_then(|rest| rest.strip_suffix('}'))
-    {
-        if is_env_name(name) {
-            names.push(name.to_string());
-            return names;
-        }
-    }
-    if let Some(name) = value.strip_prefix('$') {
-        if is_env_name(name) {
-            names.push(name.to_string());
-            return names;
-        }
-    }
-
-    let mut rest = value;
-    while let Some(start) = rest.find("${") {
-        let after = &rest[start + 2..];
-        let Some(end) = after.find('}') else { break };
-        let name = &after[..end];
-        if is_env_name(name) {
-            names.push(name.to_string());
-        }
-        rest = &after[end + 1..];
-    }
-    names
+    value.starts_with('!')
+        || (value.starts_with("${") && value.ends_with('}'))
+        || value.strip_prefix('$').is_some_and(is_env_name)
 }
 
 fn is_env_name(value: &str) -> bool {
@@ -398,13 +137,6 @@ fn is_env_name(value: &str) -> bool {
         && value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-}
-
-fn is_reference(value: &str) -> bool {
-    let value = value.trim();
-    value.starts_with('!')
-        || (value.starts_with("${") && value.ends_with('}'))
-        || value.strip_prefix('$').is_some_and(is_env_name)
 }
 
 fn normalized_field(field: &str) -> String {
@@ -425,7 +157,7 @@ fn is_secret_field(field: &str) -> bool {
     SECRET_FIELD_WORDS.iter().any(|word| field.contains(word))
 }
 
-/// 判定一条候选值。字段名只提升级别，不单独构成命中（见 30-secrets §4 分级）。
+/// 判定一条候选值。字段名只提升级别，不单独构成命中。
 fn classify(field: Option<&str>, value: &str) -> Option<(SecretLevel, &'static str)> {
     if field.is_some_and(is_excluded_field) {
         return None;
@@ -650,22 +382,10 @@ mod tests {
         fs::write(path, content).expect("写入夹具文件");
     }
 
-    fn read_file(path: &Path) -> String {
-        fs::read_to_string(path).expect("读取夹具文件")
-    }
-
     fn levels(findings: &[SecretFinding]) -> Vec<(String, SecretLevel, &'static str)> {
         findings
             .iter()
             .map(|finding| (finding.path.clone(), finding.level, finding.rule))
-            .collect()
-    }
-
-    fn names(outcome: &SanitizeOutcome) -> Vec<String> {
-        outcome
-            .required_secrets
-            .iter()
-            .map(|secret| secret.name.clone())
             .collect()
     }
 
@@ -723,194 +443,55 @@ mod tests {
     }
 
     #[test]
-    fn three_reference_syntaxes_are_applied_per_file() {
-        let temp = TempDir::new("references");
-        let root = temp.path();
-        write_file(
-            &root.join("models.json"),
-            &format!("{{\"providers\": {{\"openrouter\": {{\"apiKey\": \"sk-or-{RANDOM}\"}}}}}}"),
-        );
-        write_file(
-            &root.join("mcp.json"),
-            &format!("{{\"mcpServers\": {{\"docs\": {{\"headers\": {{\"Authorization\": \"Bearer sk-{RANDOM}\"}}}}}}}}"),
-        );
-        write_file(
-            &root.join("web-search.json"),
-            &format!("{{\"exaApiKey\": \"{RANDOM}\"}}"),
-        );
-
-        let outcome = sanitize_snapshot(root).expect("脱敏");
-        assert!(!outcome.blocked, "{:?}", outcome.findings);
-
-        let models = read_file(&root.join("models.json"));
-        assert!(
-            models.contains("\"apiKey\": \"$PI_OPENROUTER_API_KEY\""),
-            "{models}"
-        );
-        assert!(!models.contains(RANDOM));
-
-        let mcp = read_file(&root.join("mcp.json"));
-        assert!(
-            mcp.contains("\"Authorization\": \"Bearer ${PI_DOCS_AUTHORIZATION}\""),
-            "{mcp}"
-        );
-
-        let web = read_file(&root.join("web-search.json"));
-        assert!(web.contains("\"exaApiKey\": \"$PI_EXA_API_KEY\""), "{web}");
-
-        assert_eq!(
-            names(&outcome),
-            vec![
-                "PI_DOCS_AUTHORIZATION",
-                "PI_EXA_API_KEY",
-                "PI_OPENROUTER_API_KEY"
-            ]
-        );
-        assert_eq!(
-            outcome.required_secrets[2].used_by,
-            vec!["snapshot/models.json".to_string()]
-        );
-    }
-
-    #[test]
-    fn existing_references_are_kept_and_registered() {
-        let temp = TempDir::new("keep-references");
-        let root = temp.path();
-        write_file(
-            &root.join("models.json"),
-            "{\"providers\": {\"openrouter\": {\"apiKey\": \"$OPENROUTER_API_KEY\"}}}",
-        );
-        write_file(
-            &root.join("mcp.json"),
-            "{\"mcpServers\": {\"docs\": {\"headers\": {\"Authorization\": \"Bearer ${DOCS_TOKEN}\"}}}}",
-        );
-        write_file(
-            &root.join("web-search.json"),
+    fn references_are_not_findings() {
+        for text in [
+            "{\"apiKey\": \"$OPENROUTER_API_KEY\"}",
+            "{\"Authorization\": \"Bearer ${DOCS_TOKEN}\"}",
             "{\"exaApiKey\": \"!op read op://private/exa/api-key\"}",
-        );
-
-        let outcome = sanitize_snapshot(root).expect("脱敏");
-        assert!(!outcome.blocked, "{:?}", outcome.findings);
-        assert!(outcome.findings.is_empty());
-
-        assert!(read_file(&root.join("models.json")).contains("\"$OPENROUTER_API_KEY\""));
-        assert!(read_file(&root.join("mcp.json")).contains("\"Bearer ${DOCS_TOKEN}\""));
-        assert!(read_file(&root.join("web-search.json"))
-            .contains("\"!op read op://private/exa/api-key\""));
-        assert_eq!(names(&outcome), vec!["DOCS_TOKEN", "OPENROUTER_API_KEY"]);
+        ] {
+            assert!(scan_text("snapshot/models.json", text).is_empty(), "{text}");
+        }
     }
 
     #[test]
-    fn untouched_documents_keep_their_original_bytes() {
-        let temp = TempDir::new("keep-bytes");
+    fn scan_snapshot_is_read_only_and_finds_auth() {
+        let temp = TempDir::new("snapshot");
         let root = temp.path();
-        let original = "{\"providers\":{\"openrouter\":{\"apiKey\":\"$OPENROUTER_API_KEY\"}}}";
-        write_file(&root.join("models.json"), original);
-
-        let outcome = sanitize_snapshot(root).expect("脱敏");
-        assert_eq!(read_file(&root.join("models.json")), original);
-        assert_eq!(names(&outcome), vec!["OPENROUTER_API_KEY"]);
-    }
-
-    #[test]
-    fn same_value_reuses_one_name_and_used_by_is_deduped() {
-        let temp = TempDir::new("dedupe");
-        let root = temp.path();
+        let auth = format!("{{\"openai\": {{\"type\": \"api_key\", \"key\": \"sk-{RANDOM}\"}}}}");
+        write_file(&root.join("auth.json"), &auth);
         write_file(
-            &root.join("models.json"),
-            &format!("{{\"providers\": {{\"openrouter\": {{\"apiKey\": \"{RANDOM}\"}}}}}}"),
+            &root.join("extensions/demo/index.ts"),
+            &format!("const apiKey = \"sk-{RANDOM}\";\n"),
         );
-        write_file(
-            &root.join("web-search.json"),
-            &format!("{{\"exaApiKey\": \"{RANDOM}\", \"openrouterApiKey\": \"{RANDOM}\"}}"),
-        );
+        write_file(&root.join("skills/demo/SKILL.md"), "# 无密钥\n");
+        write_file(&root.join("binary.bin"), "not utf8 placeholder");
 
-        let outcome = sanitize_snapshot(root).expect("脱敏");
-        // 同一个值只对应一个引用名；同一个文件里出现两次不重复登记 `usedBy`。
-        let referenced = outcome
-            .required_secrets
-            .iter()
-            .filter(|secret| secret.name.starts_with("PI_"))
-            .count();
-        assert_eq!(referenced, 1, "{:?}", outcome.required_secrets);
-        let secret = &outcome.required_secrets[0];
-        assert_eq!(secret.used_by.len(), 2);
+        let findings = scan_snapshot(root).expect("扫描");
         assert_eq!(
-            secret.used_by,
+            levels(&findings),
             vec![
-                "snapshot/models.json".to_string(),
-                "snapshot/web-search.json".to_string()
+                (
+                    "snapshot/auth.json".to_string(),
+                    SecretLevel::High,
+                    "known_prefix"
+                ),
+                (
+                    "snapshot/extensions/demo/index.ts".to_string(),
+                    SecretLevel::High,
+                    "known_prefix"
+                ),
             ]
         );
+        assert!(!format!("{findings:?}").contains(RANDOM));
+        assert_eq!(fs::read_to_string(root.join("auth.json")).unwrap(), auth);
     }
 
     #[test]
-    fn high_findings_outside_known_files_block_and_are_not_rewritten() {
-        let temp = TempDir::new("block");
-        let root = temp.path();
-        let source = format!("const apiKey = \"sk-{RANDOM}\";\n");
-        write_file(&root.join("extensions/demo/index.ts"), &source);
-
-        let outcome = sanitize_snapshot(root).expect("脱敏");
-        assert!(outcome.blocked);
-        assert_eq!(
-            levels(&outcome.findings),
-            vec![(
-                "snapshot/extensions/demo/index.ts".to_string(),
-                SecretLevel::High,
-                "known_prefix"
-            )]
-        );
-        // 非已知文件不自动改写，值也不会出现在 findings 里。
-        assert_eq!(read_file(&root.join("extensions/demo/index.ts")), source);
-        assert!(!format!("{:?}", outcome.findings).contains(RANDOM));
-        assert!(outcome.required_secrets.is_empty());
-    }
-
-    #[test]
-    fn unparsable_known_file_is_scanned_not_rewritten() {
-        let temp = TempDir::new("json5");
-        let root = temp.path();
-        // JSON5 风格的注释：本版不解析，也就不改写，只按文本扫描拦截。
-        write_file(
-            &root.join("models.json"),
-            &format!("// 注释\n{{\"apiKey\": \"sk-{RANDOM}\"}}\n"),
-        );
-
-        let outcome = sanitize_snapshot(root).expect("脱敏");
-        assert!(outcome.blocked);
-        assert_eq!(outcome.findings.len(), 1);
-        assert!(read_file(&root.join("models.json")).contains(RANDOM));
-    }
-
-    #[test]
-    fn names_are_stable_and_conflicts_get_suffixes() {
-        let temp = TempDir::new("conflict");
-        let root = temp.path();
-        write_file(
-            &root.join("models.json"),
-            &format!(
-                "{{\"providers\": {{\"a\": {{\"apiKey\": \"sk-one-{RANDOM}\"}}, \"b\": {{\"apiKey\": \"sk-two-{RANDOM}\"}}}}}}"
-            ),
-        );
-
-        let outcome = sanitize_snapshot(root).expect("脱敏");
-        assert_eq!(
-            names(&outcome),
-            vec!["PI_A_API_KEY", "PI_B_API_KEY"],
-            "不同归属键应产生不同名字"
-        );
-
-        // 归属键相同但值不同：追加序号；同一个值复用同一个名字。
-        let mut namer = Namer::default();
-        let keys = vec![
-            "providers".to_string(),
-            "openrouter".to_string(),
-            "apiKey".to_string(),
-        ];
-        assert_eq!(namer.name_for("one", &keys), "PI_OPENROUTER_API_KEY");
-        assert_eq!(namer.name_for("two", &keys), "PI_OPENROUTER_API_KEY_2");
-        assert_eq!(namer.name_for("one", &keys), "PI_OPENROUTER_API_KEY");
+    fn non_utf8_files_are_skipped() {
+        let temp = TempDir::new("binary");
+        let path = temp.path().join("binary.bin");
+        fs::write(&path, [0xff, 0xfe, 0x00]).expect("写二进制");
+        assert!(scan_snapshot(temp.path()).unwrap().is_empty());
     }
 
     #[test]

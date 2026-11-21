@@ -485,7 +485,7 @@ fn live_relative(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-/// 路径必须落在受管范围内：越界组件或排除项（`auth.json` 等）永不进入计划。
+/// 路径必须落在受管范围内：越界组件或排除项永不进入计划。
 ///
 /// 快照由导出写入，正常情况下全在范围内；这里再挡一次被改过的 manifest，
 /// 复用 `scope` 的常量而不是复制规则表。
@@ -499,7 +499,7 @@ fn is_managed_relative(relative: &Path) -> bool {
         .collect::<Option<Vec<&str>>>()
         .unwrap_or_default();
 
-    if names.is_empty() || names.iter().any(|name| scope::is_excluded_name(name)) {
+    if names.is_empty() || scope::is_excluded_relative(relative) {
         return false;
     }
     if names.len() > 1 {
@@ -814,11 +814,11 @@ mod tests {
         write_file(&agent.join("settings.json"), "{\"theme\": \"dark\"}");
         write_file(&agent.join("AGENTS.md"), "# 指令\n");
         write_file(&agent.join("skills/antd/SKILL.md"), "# 技能\n");
-        // 范围外：既不进快照，也永远不进计划。
+        // auth.json 进快照；sessions 在范围外，永不进计划。
         write_file(&agent.join("auth.json"), "{}");
         write_file(&agent.join("sessions/session.json"), "{}");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        snapshot::export(&agent, &sync_root, false).expect("导出夹具快照");
+        snapshot::export(&agent, &sync_root).expect("导出夹具快照");
         (agent, sync_root)
     }
 
@@ -855,7 +855,7 @@ mod tests {
         write_file(&agent.join("settings.json"), "{\"theme\": \"dark\"}");
         write_file(&outside.join("keep.txt"), "keep");
         fs::create_dir_all(&sync_root).expect("建同步目录");
-        snapshot::export(&agent, &sync_root, false).expect("导出夹具快照");
+        snapshot::export(&agent, &sync_root).expect("导出夹具快照");
         // 导出之后才出现的链接：快照里没有它，只能删链接本身。
         symlink(&outside, agent.join("extra")).expect("建目录链接");
 
@@ -883,7 +883,7 @@ mod tests {
         write_file(&outside.join("keep.txt"), "keep");
         fs::create_dir_all(&sync_root).expect("建同步目录");
         symlink(&outside, agent.join("extra")).expect("建目录链接");
-        snapshot::export(&agent, &sync_root, false).expect("导出夹具快照");
+        snapshot::export(&agent, &sync_root).expect("导出夹具快照");
 
         let report =
             plan_snapshot(&agent, &sync_root, &FakeRunner::ok(), HostOs::Posix).expect("生成计划");
@@ -934,18 +934,17 @@ mod tests {
 
         // live 里多出范围外的文件：永远不出现为删除候选。
         write_file(&agent.join("sessions/late.json"), "{}");
-        write_file(&agent.join("auth.json"), "{\"changed\": true}");
 
         let report =
             plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok()).expect("应生成计划");
         assert!(report.plan.added.is_empty(), "{:?}", report.plan);
         assert!(report.plan.modified.is_empty(), "{:?}", report.plan);
         assert!(report.plan.deleted.is_empty(), "{:?}", report.plan);
-        assert_eq!(report.totals.unchanged, 3);
-        assert_eq!(report.totals.snapshot_files, 3);
-        assert_eq!(report.totals.live_files, 3, "范围外文件不参与比较");
-        assert_eq!(report.verification.checked, 3);
-        assert_eq!(report.manifest_info.files, 3);
+        assert_eq!(report.totals.unchanged, 4);
+        assert_eq!(report.totals.snapshot_files, 4);
+        assert_eq!(report.totals.live_files, 4, "范围外文件不参与比较");
+        assert_eq!(report.verification.checked, 4);
+        assert_eq!(report.manifest_info.files, 4);
         assert_eq!(report.manifest_info.fingerprint.len(), 12);
         assert_eq!(report.manifest_info.source.os, std::env::consts::OS);
         assert_eq!(report.manifest_info.requirements.node, ">=22.19.0");
@@ -986,7 +985,7 @@ mod tests {
         assert_eq!(paths(&report.plan.added), vec!["skills/antd/SKILL.md"]);
         assert_eq!(paths(&report.plan.modified), vec!["settings.json"]);
         assert_eq!(paths(&report.plan.deleted), vec!["web-search.json"]);
-        assert_eq!(report.totals.unchanged, 1, "AGENTS.md 未改动");
+        assert_eq!(report.totals.unchanged, 2, "AGENTS.md 与 auth.json 未改动");
         assert_eq!(
             (
                 report.totals.added,
@@ -1138,10 +1137,20 @@ mod tests {
             plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok()).expect_err("缺字段应失败");
         assert_eq!(failure.code, "manifest_corrupt");
 
-        // 版本对了但字段不全：结构损坏，不是"版本不支持"。
+        // 旧版本同样按"不支持"拒绝，不尝试兼容。
         fs::write(
             sync_root.join(MANIFEST_FILE_NAME),
             "{\"formatVersion\": 1, \"profileId\": \"default\"}",
+        )
+        .expect("写旧版 manifest");
+        let failure =
+            plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok()).expect_err("旧版本应失败");
+        assert_eq!(failure.code, "manifest_unsupported");
+
+        // 版本对了但字段不全：结构损坏，不是"版本不支持"。
+        fs::write(
+            sync_root.join(MANIFEST_FILE_NAME),
+            format!("{{\"formatVersion\": {FORMAT_VERSION}, \"profileId\": \"default\"}}"),
         )
         .expect("写不完整 manifest");
         let failure =
@@ -1154,9 +1163,10 @@ mod tests {
         let temp = TempDir::new("scope-guard");
         let (agent, sync_root) = fixture(&temp);
 
-        // 手改 manifest，把范围外的 auth.json 塞进去（哈希与大小都对得上）。
-        let extra = sync_root.join("snapshot/auth.json");
+        // 手改 manifest，把范围外的 sessions/auth.json 塞进去（哈希与大小都对得上）。
+        let extra = sync_root.join("snapshot/sessions/auth.json");
         let bytes = b"{\"openai\": {}}";
+        fs::create_dir_all(extra.parent().unwrap()).expect("建范围外目录");
         fs::write(&extra, bytes).expect("写范围外快照文件");
         let manifest_path = sync_root.join(MANIFEST_FILE_NAME);
         let mut manifest: serde_json::Value =
@@ -1166,26 +1176,25 @@ mod tests {
             .as_array_mut()
             .expect("files 数组")
             .push(serde_json::json!({
-                "path": "snapshot/auth.json",
+                "path": "snapshot/sessions/auth.json",
                 "sha256": snapshot::sha256_hex(bytes),
                 "size": bytes.len() as u64,
                 "kind": "json",
             }));
         fs::write(&manifest_path, manifest.to_string()).expect("写回 manifest");
 
-        // 计划里不得出现 auth.json：它既不是新增也不参与比较。
+        // 计划里不得出现范围外的 sessions/auth.json：它既不是新增也不参与比较。
         let report =
             plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok()).expect("应生成计划");
         assert!(report.plan.added.is_empty(), "{:?}", report.plan.added);
         assert!(report.plan.modified.is_empty());
         assert!(report.plan.deleted.is_empty());
-        assert_eq!(report.totals.unchanged, 3);
-        assert_eq!(report.totals.snapshot_files, 4);
+        assert_eq!(report.totals.unchanged, 4);
+        assert_eq!(report.totals.snapshot_files, 5);
 
-        // live 侧也有 auth.json，两个方向都不出现在计划里。
         assert!(!paths(&report.plan.deleted)
             .iter()
-            .any(|path| path == "auth.json"));
+            .any(|path| path == "sessions/auth.json"));
     }
 
     #[test]
@@ -1237,7 +1246,7 @@ mod tests {
         assert_eq!(report.requirements[0].satisfied, Some(false));
         assert_eq!(report.requirements[0].found.as_deref(), Some("22.18.0"));
         assert_eq!(report.requirements[1].satisfied, Some(false));
-        assert_eq!(report.totals.unchanged, 3);
+        assert_eq!(report.totals.unchanged, 4);
 
         // 探测失败：记未知，不误报为不满足。
         let report =

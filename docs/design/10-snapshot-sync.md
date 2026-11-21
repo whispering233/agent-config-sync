@@ -28,6 +28,7 @@
 │   ├── settings.json
 │   ├── models.json
 │   ├── mcp.json
+│   ├── auth.json            # 明文凭据，权限 0600
 │   ├── keybindings.json
 │   ├── <其他根级 *.json>      # 扩展私有配置，如 web-search.json
 │   ├── AGENTS.md
@@ -43,7 +44,7 @@
 
 WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结构与本地模式一致（见 `40-webdav.md`）。
 
-快照目录本身不包含：`auth.json`、`sessions/`、`npm/`、`install/`、缓存与状态文件。
+快照目录本身不包含：`sessions/`、`npm/`、`install/`、缓存与状态文件；只包含宿主目录根级的 `auth.json`，子目录同名文件仍排除。
 
 ## 3. 受管范围（白名单 / 排除）
 
@@ -52,6 +53,7 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
 | 项 | 说明 |
 | :--- | :--- |
 | 根级 `*.json` | 含扩展私有配置（实测 `web-search.json`、`lmstudio.json` 均位于根级），逐个枚举无法覆盖新插件 |
+| 根级 `auth.json` | Pi 的凭据文件；明文进入快照，权限 `0600` |
 | `AGENTS.md` / `SYSTEM.md` / `APPEND_SYSTEM.md` | 指令与系统提示 |
 | `keybindings.json` | 偏好，无密钥 |
 | `skills/` `extensions/` `prompts/` `themes/` `agents/` | 资源目录 |
@@ -60,7 +62,7 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
 
 | 项 | 实测体量 | 理由 |
 | :--- | :--- | :--- |
-| `auth.json` | 223 B | 纯密钥；由密钥向导在本机生成 |
+| 子目录中的 `auth.json` | — | 只纳入根级；扩展自带的同名文件不碰 |
 | `sessions/` | 1.6 GB / 2962 文件 | 隐私与体积 |
 | `install/` | 313 MB | 宿主自身安装，平台相关 |
 | `npm/` | 285 MB / 17138 文件 | 包本体，跨平台会损坏；对端改为重装 |
@@ -78,13 +80,14 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
 - 导入：目标存在时**按 manifest 重建链接**；目标缺失、断链或平台不允许建链接（Windows 默认权限下 `ERROR_PRIVILEGE_NOT_HELD`）则退化为**整棵子树物化**并告警：按快照 `<sync_root>/snapshot/<相对路径>` 递归建目录、逐个写普通文件，物化本身失败才 `apply_failed`。计划是按链接视角算的，所以「链接之下」的写入与删除一律跳过（含建不成但已物化的目录）；被跳过的已勾选删除要逐条说明原因并汇总条数。
 - Windows：按目标类型分别调 `symlink_file` / `symlink_dir`；junction 与符号链接都算链接类（判定为 `read_link` 能读到目标）。
 - 快照没声明的链接（导出后新增的陈旧链接）：不读取目标、不参与内容比较，只在计划里列为删除候选（`kind: link`）；确认后只删链接本身，目标内容不动。嵌在另一个待删链接里的链接、以及下面有 manifest 内容的链接都不列。
+- `auth.json` 例外：即使 manifest 里是链接，也不按链接重建，而是按普通文件写入，避免凭据指向受管范围外。
 - 断链：导出前检测，断链仅警告并跳过该条目。
 
 ## 4. manifest
 
 ```json
 {
-  "formatVersion": 1,
+  "formatVersion": 2,
   "profileId": "default",
   "createdAt": "2026-11-20T05:30:00Z",
   "fingerprint": "a1b2c3d4e5f6",
@@ -100,19 +103,16 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
     { "path": "snapshot/settings.json", "sha256": "…", "size": 1234, "kind": "json" }
   ],
   "symlinks": [{ "path": "snapshot/skills/antd", "target": "../../../.agents/skills/antd" }],
-  "requiredSecrets": [
-    { "name": "EXA_API_KEY", "usedBy": ["snapshot/web-search.json"], "hint": "https://exa.ai" }
-  ],
   "requiredPackages": [{ "source": "npm:pi-web-access", "enabled": true }],
-  "plaintextSecrets": false
+  "plaintextSecrets": true
 }
 ```
 
 - `source.pi` / `source.node`：导出时按环境检测同一组探测取版本（能解析就规范成 `x.y.z`），探测不到记 `null`；只作来源记录，不参与指纹与冲突判定。
 - `fingerprint`：对 `formatVersion` 与所有 `{path, sha256}` 排序后取哈希，显示前 12 位。用途：两台机器肉眼核对"是不是同一份快照"。
 - manifest **最后写**：文件先落盘，manifest 落盘即代表快照完整。
-- 未知 `formatVersion` 一律拒绝读取，不尝试兼容。
-- `plaintextSecrets: true` 表示导出时用户在知情下保留了明文密钥，导入端据此告警。
+- 未知或过期的 `formatVersion` 一律拒绝读取，不尝试兼容；v1 快照需在源机升级后重新导出。
+- `plaintextSecrets: true` 表示快照包含 `auth.json` 或扫描到高危明文，导入端据此告警。
 
 ## 5. 导出（上传快照）
 
@@ -122,8 +122,8 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
    ├─ 宿主进程提示："Pi 正在运行，配置可能继续变化"（仅提示，不阻断）
    └─ 应用配置已记录 agent 目录
 2. 收集        按受管范围遍历；符号链接物化；断链跳过并记录
-3. 脱敏        见 30-secrets：字面密钥 → 宿主原生环境变量引用
-4. 扫描        对全部文本文件做密钥扫描；命中则逐条列出，用户必须显式确认才能继续
+3. 扫描        对全部文本文件做只读密钥扫描；命中只记录，不改写、不阻断
+4. 权限        快照目录 0700；根级 auth.json 强制 0600
 5. 写文件      先写临时目录，全部成功后再替换 snapshot/
 6. 写 manifest 最后写；计算并记录 fingerprint
 7. 完成        展示 fingerprint 与文件数，提示"等待云盘上传完成"
@@ -143,19 +143,19 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
    └─ 哈希逐文件校验 → 任一不匹配 → 停止（半套快照）
 2. 环境检查
    ├─ node / pi 版本是否满足 requirements → 不满足：警告 + 允许继续（记录）
-   ├─ 残留字面密钥扫描 → 命中：警告 + 允许继续
+   ├─ 明文密钥扫描 → 命中：警告 + 允许继续
+   ├─ 快照含 auth.json → 警告：会覆盖本机凭据
    └─ 目标目录可写
 3. 生成计划     新增 / 修改 / 删除（删除仅在受管范围内）
 4. 预览         展示每项差异与来源（diff 文本摘要 + 大小 + 时间）
    ├─ 删除项默认不勾选，需逐项确认
-   └─ 展示 requiredSecrets / requiredPackages 待办
+   └─ 展示 requiredPackages 待办
 5. 应用前复核   重算计划并按 fingerprint 比对；不一致 → `plan_stale`，整次拒绝
    备份         把将被覆盖/删除的文件与祖先链接复制到本机备份目录
 6. 落地         重建链接 → 写入/删除（链接之下的项跳过）；沿用原文件权限位（仅 POSIX）；失败即停并保留备份
                  例外：链接建不成时按整棵子树物化并告警（不是失败），物化也失败才停
 7. 收尾
    ├─ 包对齐：按 requiredPackages 调用宿主安装命令（需确认）
-   ├─ 密钥补齐：逐项输入，写入本机配置或给出环境变量命令
    └─ 提示重启宿主或 /reload
 ```
 
@@ -212,7 +212,6 @@ idle → reading → verifying → planning → previewing → backing-up → ap
 | `apply_failed` | 落地中途失败，已停止；可用备份回滚 |
 | `restore_failed` / `backup_invalid` / `backup_missing` | 回滚失败或备份不可用 |
 | `host_version_unsatisfied` | 宿主版本低于要求（警告） |
-| `secret_residue` | 快照内仍有字面密钥（警告） |
 | `root_not_allowed` | 计划或应用指定的目录既不是同步文件夹，也不在本机暂存目录内 |
 | `remote_not_configured` | 未填地址/用户名/密码 |
 | `remote_unreachable` | DNS、TLS、超时或 5xx |
@@ -221,13 +220,14 @@ idle → reading → verifying → planning → previewing → backing-up → ap
 | `remote_manifest_corrupt` | 远端 manifest 无法解析或格式版本不支持 |
 | `remote_not_found` | 下载时远端没有 manifest |
 | `remote_changed` | 提交 manifest 时远端已被改写 |
+| `remote_insecure` | 快照含 `auth.json` 时使用非 HTTPS 的 WebDAV（localhost 例外） |
 
 ## 10. 已知限制
 
 - 全量替换，不传增量（配置总量约 100 KB，增量无意义）。
 - 不感知云盘同步进度，只能靠 manifest 与 fingerprint。
-- 文件被重写时注释不保留（JSON5 → JSON）；本地文件只在"写入字面密钥"时才重写。
-- 导出只在替换字面密钥时改写 JSON；未命中密钥的文件保持原字节（含格式与键序），刚导出的快照再跑计划不会因格式化误报修改。
+- 快照文件保持原字节（含格式、注释与键序）；导出不做 JSON 重写。
+- `auth.json` 整文件覆盖，不按 provider 合并；本机独有登录由覆盖前备份兜底。
 - 计划只读取快照声明的链接；快照没声明的链接整棵跳过，不读取目标，也不把目标内容列为删除候选。
 - 跨平台路径差异（扩展内绝对路径、MCP `cwd`）不做翻译，只在预览中提示。
 - 远端上传是"整份 manifest + 变更文件"，不做断点续传与限流退避。

@@ -16,7 +16,6 @@ mod secrets;
 mod snapshot;
 mod webdav;
 mod webdav_transfer;
-mod wizard;
 
 fn main() {
     tauri::Builder::default()
@@ -41,8 +40,6 @@ fn main() {
             apply::apply_snapshot,
             rollback::list_backups,
             rollback::restore_backup,
-            wizard::check_secrets,
-            wizard::write_secret,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

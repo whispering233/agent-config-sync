@@ -19,14 +19,15 @@ pub const INCLUDED_ROOT_FILES: &[&str] = &[
     "SYSTEM.md",
     "APPEND_SYSTEM.md",
     "keybindings.json",
+    "auth.json",
 ];
 
 /// 根级纳入的资源目录，进入后整棵子树纳入。
 pub const INCLUDED_ROOT_DIRS: &[&str] = &["skills", "extensions", "prompts", "themes", "agents"];
 
-/// 任何层级都排除的名称：密钥、状态、缓存、安装与包本体。
+/// 任何层级都排除的名称：状态、缓存、安装与包本体。
+/// 根级 `auth.json` 是例外，由 [`is_excluded_relative`] 只放行根级。
 pub const EXCLUDED_NAMES: &[&str] = &[
-    "auth.json", // 密钥铁律：auth.json 永不进入快照
     "models-store.json",
     "trust.json",
     "web-push.json",
@@ -53,6 +54,17 @@ pub fn is_excluded_name(name: &str) -> bool {
         || EXCLUDED_NAME_PREFIXES
             .iter()
             .any(|prefix| name.starts_with(prefix))
+}
+
+/// 按相对路径排除：普通排除名按任意层级匹配；`auth.json` 只允许根级。
+pub fn is_excluded_relative(relative: &Path) -> bool {
+    let nested_auth = relative.components().count() > 1
+        && relative.file_name().is_some_and(|name| name == "auth.json");
+    nested_auth
+        || relative.components().any(|component| match component {
+            Component::Normal(name) => is_excluded_name(&name.to_string_lossy()),
+            _ => true,
+        })
 }
 
 /// 根级纳入判定：白名单文件、白名单目录、其余根级 `*.json`。
@@ -304,11 +316,11 @@ impl Walker {
         is_root: bool,
     ) -> Result<(), ScopeError> {
         let label = name.to_string_lossy();
-        if is_excluded_name(&label) || (is_root && !is_included_root_name(&label)) {
+        let relative_path = relative.join(name);
+        if is_excluded_relative(&relative_path) || (is_root && !is_included_root_name(&label)) {
             return Ok(());
         }
 
-        let relative_path = relative.join(name);
         let physical_path = physical.join(name);
 
         let link_metadata = match fs::symlink_metadata(&physical_path) {
@@ -472,6 +484,7 @@ mod tests {
         assert_eq!(
             scan_paths(&outcome),
             vec![
+                "auth.json",
                 "keybindings.json",
                 "mcp.json",
                 "models.json",
@@ -481,6 +494,21 @@ mod tests {
         );
         // 范围外条目不是"跳过"，不进 skipped。
         assert!(outcome.skipped.is_empty());
+    }
+
+    #[test]
+    fn nested_auth_json_is_excluded_but_root_is_included() {
+        let temp = TempDir::new("auth-root-only");
+        let agent = temp.path().join("agent");
+        write_file(&agent.join("auth.json"), "{}");
+        write_file(&agent.join("skills/auth.json"), "{}");
+        write_file(&agent.join("skills/demo/auth.json"), "{}");
+
+        let outcome = scan(&agent).expect("扫描");
+        assert_eq!(
+            scan_paths(&outcome),
+            vec!["auth.json", "skills", "skills/demo"]
+        );
     }
 
     #[test]
