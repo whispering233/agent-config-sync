@@ -62,7 +62,7 @@ npm run tauri -- dev           # 桌面窗口
 npm run dev                    # 仅前端（浏览器预览，命令降级）
 cd src-tauri && cargo test     # Rust 测试
 npm run build                  # 前端构建
-npm run tauri build -- --bundles deb,appimage
+npm run tauri -- build --bundles deb,appimage
 ```
 
 构建与分发的完整说明见 [docs/design/build.md](docs/design/build.md)。
