@@ -25,7 +25,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "appimage"],
+    "targets": ["deb", "appimage", "nsis"],
     "category": "Utility",
     "publisher": "Agent Config Sync",
     "copyright": "Copyright © 2026 whispering233",

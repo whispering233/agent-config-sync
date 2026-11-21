@@ -87,3 +87,68 @@ jobs:
             src-tauri/target/release/bundle/deb/*.deb
             src-tauri/target/release/bundle/appimage/*.AppImage
           if-no-files-found: warn
+
+  windows:
+    # 只在 Windows 上出包（官方不推荐交叉编译）；runner 自带 WebView2 与 MSVC 工具链，无需装系统库
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      # 手动触发时 ref 是分支名，tag 只能用输入值；tag 推送时两者等价
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # Windows 行为的唯一自动化验证点：带 #[cfg(unix)] 的用例在这里不编译
+      - name: Cargo test
+        working-directory: src-tauri
+        run: cargo test
+
+      # beforeBuildCommand 已经跑了前端构建，这里不重复 npm run build
+      # 安装模式取 schema 默认（currentUser，装到 %LOCALAPPDATA%），不写 perMachine
+      - name: Build NSIS installer
+        run: npm run tauri -- build --bundles nsis
+
+      # release 流水线并行创建 Release，可能比本任务晚就绪，所以轮询等待
+      - name: Wait for Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # 用 bash（runner 自带 Git Bash）：与 linux job 同一份逻辑，也避开 pwsh 对原生命令退出码的处理差异
+        shell: bash
+        run: |
+          for attempt in $(seq 1 10); do
+            if gh release view "$TAG" --json tagName >/dev/null; then
+              echo "release $TAG 已就绪"
+              exit 0
+            fi
+            echo "第 $attempt 次探测未找到 release $TAG，6 秒后重试"
+            sleep 6
+          done
+          echo "release $TAG 始终未出现，无法上传资产" >&2
+          exit 1
+
+      - name: Upload assets to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh release upload "$TAG" \
+            src-tauri/target/release/bundle/nsis/*.exe \
+            --clobber
+
+      # 上传失败时仍留一份可下载产物，便于排查是不是打包或权限问题
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-windows
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: warn

@@ -22,7 +22,7 @@
 
 ### Windows 签名与卸载清理
 
-- 现状：Windows NSIS 自测链路已具备（未签名，perUser）。
+- 现状：Windows NSIS 自测链路已具备（未签名，安装范围取 `currentUser`）。
 - 要点：
   - Authenticode 签名，消除 SmartScreen 首次拦截。
   - 卸载钩子：只在用户主动卸载且明确选择时清理 `%APPDATA%\<identifier>`；必须跳过升级路径（`$UpdateMode`）与静默卸载，删除前用 `config.json` 作归属判据，默认按钮为「否」。
