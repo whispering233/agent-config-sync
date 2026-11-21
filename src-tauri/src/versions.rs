@@ -427,6 +427,86 @@ mod tests {
     }
 
     #[test]
+    fn failed_queries_become_notes_without_stopping_the_batch() {
+        let runner = FakeRunner::new(vec![
+            CommandOutcome::Failed {
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "npm ERR! code E404".to_string(),
+            },
+            CommandOutcome::Failed {
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "npm ERR! code E404".to_string(),
+            },
+        ]);
+        let result = query_packages(
+            &["npm:missing".to_string(), "npm:also-missing".to_string()],
+            &runner,
+            HostOs::Posix,
+        );
+
+        assert_eq!(
+            result["npm:missing"].note.as_deref(),
+            Some("未发布或包名不存在")
+        );
+        assert_eq!(
+            result["npm:also-missing"].note.as_deref(),
+            Some("未发布或包名不存在")
+        );
+    }
+
+    #[test]
+    fn timeout_and_auth_failures_are_notes() {
+        let runner = FakeRunner::new(vec![
+            CommandOutcome::Timeout,
+            CommandOutcome::Failed {
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "npm ERR! code E401".to_string(),
+            },
+        ]);
+
+        let timeout = query_one(&runner, HostOs::Posix, "pi-lens");
+        assert_eq!(timeout.note.as_deref(), Some("查询超时（10 秒），未知"));
+
+        let auth = query_one(&runner, HostOs::Posix, "pi-lens");
+        assert_eq!(auth.note.as_deref(), Some("npm 认证失败，未知"));
+    }
+
+    #[test]
+    fn cache_only_read_does_not_start_a_query() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-config-sync-versions-cache-{}-{}.json",
+            std::process::id(),
+            now_seconds()
+        ));
+        save_cache(
+            &path,
+            &LatestVersions {
+                checked_at: Some("2026-11-20T00:00:00Z".to_string()),
+                stale: false,
+                pi: Some(LatestVersion::available("1.0.0".to_string())),
+                packages: BTreeMap::new(),
+                error: None,
+            },
+        );
+        let runner = FakeRunner::new(Vec::new());
+        let result = load_or_query(&path, &[], &runner, HostOs::Posix, false);
+
+        assert_eq!(
+            result.pi.as_ref().and_then(|item| item.version.as_deref()),
+            Some("1.0.0")
+        );
+        assert!(runner
+            .calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn unsafe_sources_are_not_cached_or_queried() {
         let runner = FakeRunner::new(Vec::new());
         let result = query_packages(
