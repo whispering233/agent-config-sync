@@ -204,16 +204,12 @@ pub async fn download_remote_snapshot(app: AppHandle) -> Result<DownloadView, St
         let dir = app_data_dir(&app)?;
         let credentials = credentials::load(&dir)
             .map_err(download_credential_error)?
-            .ok_or_else(|| {
-                "还没有配置 WebDAV：请先在设置页填写地址、用户名与密码".to_string()
-            })?;
+            .ok_or_else(|| "还没有配置 WebDAV：请先在设置页填写地址、用户名与密码".to_string())?;
         let transport = ReqwestTransport::new(&credentials.username, &credentials.password)
             .map_err(dav_error)?;
-        let outcome = webdav_transfer::download(
-            &WebdavClient::new(transport, &credentials.url),
-            &dir,
-        )
-        .map_err(transfer_error)?;
+        let outcome =
+            webdav_transfer::download(&WebdavClient::new(transport, &credentials.url), &dir)
+                .map_err(transfer_error)?;
 
         Ok(DownloadView {
             staging_root: outcome.staging_root,
@@ -309,26 +305,27 @@ pub async fn upload_snapshot(
                 format!("无法定位应用配置目录：{error}"),
             )
         })?;
-        let config = config::load_config(&config_dir).map_err(|error| {
-            upload_failure("app_config_unavailable", error.to_string())
-        })?;
+        let config = config::load_config(&config_dir)
+            .map_err(|error| upload_failure("app_config_unavailable", error.to_string()))?;
         // 只读取这一个文档化的变量；错误信息里不回显其内容。
         let env_agent_dir = std::env::var_os(AGENT_DIR_ENV_VAR).map(PathBuf::from);
         let home_dir = app.path().home_dir().ok();
-        let agent_dir = config::resolve_agent_dir(
-            &config,
-            env_agent_dir.as_deref(),
-            home_dir.as_deref(),
-        )
-        .path
-        .ok_or_else(|| {
-            upload_failure("agent_dir_missing", "无法确定宿主目录，请先在设置页填写".to_string())
-        })?;
+        let agent_dir =
+            config::resolve_agent_dir(&config, env_agent_dir.as_deref(), home_dir.as_deref())
+                .path
+                .ok_or_else(|| {
+                    upload_failure(
+                        "agent_dir_missing",
+                        "无法确定宿主目录，请先在设置页填写".to_string(),
+                    )
+                })?;
 
-        let dir = app_data_dir(&app)
-            .map_err(|error| upload_failure("app_data_unavailable", error))?;
+        let dir =
+            app_data_dir(&app).map_err(|error| upload_failure("app_data_unavailable", error))?;
         let credentials = credentials::load(&dir)
-            .map_err(|error| upload_failure("remote_not_configured", download_credential_error(error)))?
+            .map_err(|error| {
+                upload_failure("remote_not_configured", download_credential_error(error))
+            })?
             .ok_or_else(|| {
                 upload_failure(
                     "remote_not_configured",

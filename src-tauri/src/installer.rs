@@ -251,11 +251,7 @@ fn parse_probe(stdout: &str) -> Option<Probe> {
 }
 
 /// 命令选择：安装走官方 installer（Linux/macOS）或 npm（Windows），升级按安装类型。
-fn select_command(
-    os: &str,
-    installed: bool,
-    kind: InstallKind,
-) -> Result<InstallCommand, String> {
+fn select_command(os: &str, installed: bool, kind: InstallKind) -> Result<InstallCommand, String> {
     let action = if installed {
         InstallAction::Upgrade
     } else {
@@ -271,7 +267,12 @@ fn select_command(
         };
         return Ok(InstallCommand {
             action,
-            argv: vec!["npm".to_string(), "i".to_string(), "-g".to_string(), package],
+            argv: vec![
+                "npm".to_string(),
+                "i".to_string(),
+                "-g".to_string(),
+                package,
+            ],
         });
     }
 
@@ -383,7 +384,9 @@ fn build_preview(agent_dir: Option<&Path>, os: &str, outcome: &CommandOutcome) -
                 "Node {} 低于要求的 {min_text}",
                 version_text(version)
             )),
-            None => preview.blocking.push("Node 版本无法解析（version_unparsable）".to_string()),
+            None => preview
+                .blocking
+                .push("Node 版本无法解析（version_unparsable）".to_string()),
         }
     }
 
@@ -475,12 +478,7 @@ fn result_of(action: InstallAction, outcome: CommandOutcome, elapsed: Duration) 
             stdout,
             stderr,
         } => (InstallStatus::Failed, code, stdout, stderr),
-        CommandOutcome::Timeout => (
-            InstallStatus::Timeout,
-            None,
-            String::new(),
-            String::new(),
-        ),
+        CommandOutcome::Timeout => (InstallStatus::Timeout, None, String::new(), String::new()),
         CommandOutcome::Unavailable(detail) => {
             (InstallStatus::Unavailable, None, String::new(), detail)
         }
@@ -624,7 +622,12 @@ mod tests {
     struct FakeProbe(CommandOutcome);
 
     impl CommandRunner for FakeProbe {
-        fn run(&self, _script: &str, _timeout: Duration, _env: &[(&str, String)]) -> CommandOutcome {
+        fn run(
+            &self,
+            _script: &str,
+            _timeout: Duration,
+            _env: &[(&str, String)],
+        ) -> CommandOutcome {
             self.0.clone()
         }
     }
@@ -663,14 +666,22 @@ mod tests {
     }
 
     /// 真实的探测输出形态：带前缀的行，前后是 shell 启动噪音。
-    fn probe_stdout(node_path: &str, node_version: &str, npm: &str, pi_path: &str, pi_version: &str) -> String {
+    fn probe_stdout(
+        node_path: &str,
+        node_version: &str,
+        npm: &str,
+        pi_path: &str,
+        pi_version: &str,
+    ) -> String {
         format!(
             "shell noise\n{PROBE_PREFIX}node_path:{node_path}\n{PROBE_PREFIX}node_version:{node_version}\n{PROBE_PREFIX}npm_version:{npm}\n{PROBE_PREFIX}pi_path:{pi_path}\n{PROBE_PREFIX}pi_version:{pi_version}\nmore noise\n"
         )
     }
 
     fn healthy(node_path: &str, pi_path: &str, pi_version: &str) -> CommandOutcome {
-        ok(&probe_stdout(node_path, "22.23.0", "10.9.0", pi_path, pi_version))
+        ok(&probe_stdout(
+            node_path, "22.23.0", "10.9.0", pi_path, pi_version,
+        ))
     }
 
     fn preview_for(agent_dir: Option<&Path>, os: &str, outcome: CommandOutcome) -> InstallPreview {
@@ -686,10 +697,16 @@ mod tests {
         let install = select_command("linux", false, InstallKind::Unknown).unwrap();
         assert_eq!(install.action, InstallAction::Install);
         assert_eq!(install.argv[1], "-lc");
-        assert_eq!(script_of(&install), "curl -fsSL https://pi.dev/install.sh | sh");
+        assert_eq!(
+            script_of(&install),
+            "curl -fsSL https://pi.dev/install.sh | sh"
+        );
 
         let macos = select_command("macos", false, InstallKind::Unknown).unwrap();
-        assert_eq!(script_of(&macos), "curl -fsSL https://pi.dev/install.sh | sh");
+        assert_eq!(
+            script_of(&macos),
+            "curl -fsSL https://pi.dev/install.sh | sh"
+        );
 
         let managed = select_command("linux", true, InstallKind::Managed).unwrap();
         assert_eq!(managed.action, InstallAction::Upgrade);
@@ -715,12 +732,7 @@ mod tests {
         assert_eq!(upgrade.action, InstallAction::Upgrade);
         assert_eq!(
             upgrade.argv,
-            vec![
-                "npm",
-                "i",
-                "-g",
-                "@earendil-works/pi-coding-agent@latest"
-            ]
+            vec!["npm", "i", "-g", "@earendil-works/pi-coding-agent@latest"]
         );
     }
 
@@ -762,7 +774,10 @@ mod tests {
         let preview = preview_for(None, "linux", healthy("/usr/bin/node", "", ""));
         let command = preview.command.expect("未安装时给出安装命令");
         assert_eq!(command.action, InstallAction::Install);
-        assert_eq!(script_of(&command), "curl -fsSL https://pi.dev/install.sh | sh");
+        assert_eq!(
+            script_of(&command),
+            "curl -fsSL https://pi.dev/install.sh | sh"
+        );
         assert_eq!(preview.install_kind, None);
         assert_eq!(preview.node_version.as_deref(), Some("22.23.0"));
     }
@@ -808,8 +823,11 @@ mod tests {
         assert!(timeout.command.is_none());
         assert!(timeout.blocking[0].contains("probe_timeout"));
 
-        let unavailable =
-            preview_for(None, "linux", CommandOutcome::Unavailable("no shell".to_string()));
+        let unavailable = preview_for(
+            None,
+            "linux",
+            CommandOutcome::Unavailable("no shell".to_string()),
+        );
         assert!(unavailable.command.is_none());
         assert!(unavailable.blocking[0].contains("no shell"));
 
@@ -884,7 +902,11 @@ mod tests {
         assert_eq!(failed.output, "boom");
         assert_eq!(failed.elapsed_ms, 1200);
 
-        let timeout = result_of(InstallAction::Upgrade, CommandOutcome::Timeout, Duration::ZERO);
+        let timeout = result_of(
+            InstallAction::Upgrade,
+            CommandOutcome::Timeout,
+            Duration::ZERO,
+        );
         assert_eq!(timeout.status, InstallStatus::Timeout);
         assert_eq!(timeout.exit_code, None);
     }

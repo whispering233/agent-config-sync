@@ -178,11 +178,15 @@ fn read_manifest(sync_root: &Path) -> Result<Manifest, WizardFailure> {
             "manifest_missing",
             "同步文件夹里没有 manifest.json，请先在快照页导出一次",
         ),
-        _ => WizardFailure::new("manifest_unreadable", format!("读取 manifest 失败：{error}")),
+        _ => WizardFailure::new(
+            "manifest_unreadable",
+            format!("读取 manifest 失败：{error}"),
+        ),
     })?;
 
-    serde_json::from_str(&text)
-        .map_err(|error| WizardFailure::new("manifest_invalid", format!("manifest 无法解析：{error}")))
+    serde_json::from_str(&text).map_err(|error| {
+        WizardFailure::new("manifest_invalid", format!("manifest 无法解析：{error}"))
+    })
 }
 
 /// 环境变量名限定为 POSIX 形式：既保证 `$NAME` 引用合法，也避免把名字拼进 shell 脚本时被解释。
@@ -215,7 +219,10 @@ fn local_path(agent_dir: &Path, used_by: &str) -> Result<PathBuf, WizardFailure>
     let relative = used_by
         .strip_prefix(&format!("{}/", snapshot::SNAPSHOT_DIR_NAME))
         .ok_or_else(|| {
-            WizardFailure::new("used_by_invalid", format!("usedBy 不在快照目录下：{used_by}"))
+            WizardFailure::new(
+                "used_by_invalid",
+                format!("usedBy 不在快照目录下：{used_by}"),
+            )
         })?;
 
     let relative = Path::new(relative);
@@ -231,8 +238,9 @@ fn local_path(agent_dir: &Path, used_by: &str) -> Result<PathBuf, WizardFailure>
         ));
     }
 
-    scope::resolve_within(agent_dir, relative)
-        .map_err(|_| WizardFailure::new("used_by_invalid", format!("usedBy 越出宿主目录：{used_by}")))
+    scope::resolve_within(agent_dir, relative).map_err(|_| {
+        WizardFailure::new("used_by_invalid", format!("usedBy 越出宿主目录：{used_by}"))
+    })
 }
 
 /// 三种引用语法一起换，单趟扫描：`${NAME}` 优先，其次 `$NAME`（后面不能紧跟标识符字符，
@@ -334,11 +342,12 @@ fn paths(app: &tauri::AppHandle) -> Result<(PathBuf, PathBuf), WizardFailure> {
     // 只读取这一个文档化的环境变量；错误信息里不回显其内容。
     let env_agent_dir = std::env::var_os(AGENT_DIR_ENV_VAR).map(PathBuf::from);
     let home_dir = app.path().home_dir().ok();
-    let agent_dir = config::resolve_agent_dir(&config, env_agent_dir.as_deref(), home_dir.as_deref())
-        .path
-        .ok_or_else(|| {
-            WizardFailure::new("agent_dir_missing", "无法确定宿主目录，请先在设置页填写")
-        })?;
+    let agent_dir =
+        config::resolve_agent_dir(&config, env_agent_dir.as_deref(), home_dir.as_deref())
+            .path
+            .ok_or_else(|| {
+                WizardFailure::new("agent_dir_missing", "无法确定宿主目录，请先在设置页填写")
+            })?;
 
     Ok((agent_dir, sync_root))
 }
@@ -351,7 +360,9 @@ pub async fn check_secrets(app: tauri::AppHandle) -> Result<Vec<SecretStatus>, W
         secret_status(&agent_dir, &sync_root, &ShellRunner::from_env())
     })
     .await
-    .map_err(|error| WizardFailure::new("secret_status_failed", format!("读取密钥状态失败：{error}")))?
+    .map_err(|error| {
+        WizardFailure::new("secret_status_failed", format!("读取密钥状态失败：{error}"))
+    })?
 }
 
 /// 写入本机字面值。写文件与读 manifest 都是阻塞操作。
@@ -459,7 +470,9 @@ mod tests {
 
     /// 真实的探测输出：哨兵夹住结果，前后可能还有 shell 启动噪音。
     fn probe_output(marker: &str) -> CommandOutcome {
-        ok(&format!("welcome\n{ENV_MARKER}{marker}{ENV_MARKER}\ntrailing\n"))
+        ok(&format!(
+            "welcome\n{ENV_MARKER}{marker}{ENV_MARKER}\ntrailing\n"
+        ))
     }
 
     /// 写一份最小可解析的 manifest；`secrets` 是 (name, usedBy)。
@@ -545,8 +558,7 @@ mod tests {
         );
 
         let runner = FakeRunner::new(vec![probe_output("x"), probe_output("")]);
-        let statuses =
-            secret_status(temp.path(), &sync_root, &runner).expect("应读出两个待补密钥");
+        let statuses = secret_status(temp.path(), &sync_root, &runner).expect("应读出两个待补密钥");
 
         assert_eq!(
             statuses,
@@ -591,11 +603,13 @@ mod tests {
     fn status_rejects_invalid_secret_name_in_manifest() {
         let temp = TempDir::new("status-name");
         let sync_root = temp.path().join("cloud");
-        write_manifest(&sync_root, &[("BAD NAME; rm -rf", &["snapshot/mcp.json"], None)]);
+        write_manifest(
+            &sync_root,
+            &[("BAD NAME; rm -rf", &["snapshot/mcp.json"], None)],
+        );
 
         let runner = FakeRunner::new(Vec::new());
-        let failure =
-            secret_status(temp.path(), &sync_root, &runner).expect_err("非法名应报错");
+        let failure = secret_status(temp.path(), &sync_root, &runner).expect_err("非法名应报错");
         assert_eq!(failure.code, "secret_name_invalid");
         // 名字没被拼进 shell。
         assert!(runner.calls().is_empty());
@@ -653,8 +667,8 @@ mod tests {
         fs::write(&web_search, r#"{"exaApiKey": "$EXA_API_KEY"}"#).expect("写夹具");
         fs::set_permissions(&web_search, fs::Permissions::from_mode(0o600)).expect("设置权限");
 
-        let report = secret_write_literal(&agent, &sync_root, "EXA_API_KEY", SECRET)
-            .expect("应写入成功");
+        let report =
+            secret_write_literal(&agent, &sync_root, "EXA_API_KEY", SECRET).expect("应写入成功");
 
         assert_eq!(
             report,
@@ -671,11 +685,18 @@ mod tests {
         // 没有临时文件残留。
         let names: Vec<String> = fs::read_dir(&agent)
             .expect("读目录")
-            .map(|item| item.expect("目录项").file_name().to_string_lossy().into_owned())
+            .map(|item| {
+                item.expect("目录项")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect();
         assert_eq!(names, vec!["web-search.json"]);
         // 序列化结果里没有值。
-        assert!(!serde_json::to_string(&report).expect("序列化").contains(SECRET));
+        assert!(!serde_json::to_string(&report)
+            .expect("序列化")
+            .contains(SECRET));
     }
 
     #[test]
@@ -694,17 +715,17 @@ mod tests {
         )
         .expect("写夹具");
 
-        let failure = secret_write_literal(&agent, &sync_root, "NOPE", SECRET)
-            .expect_err("未知 name 应拒绝");
+        let failure =
+            secret_write_literal(&agent, &sync_root, "NOPE", SECRET).expect_err("未知 name 应拒绝");
         assert_eq!(failure.code, "secret_unknown");
 
-        let failure = secret_write_literal(&agent, &sync_root, "EXA_API_KEY", "")
-            .expect_err("空值应拒绝");
+        let failure =
+            secret_write_literal(&agent, &sync_root, "EXA_API_KEY", "").expect_err("空值应拒绝");
         assert_eq!(failure.code, "secret_value_empty");
 
         let long = "a".repeat(MAX_VALUE_LEN + 1);
-        let failure = secret_write_literal(&agent, &sync_root, "EXA_API_KEY", &long)
-            .expect_err("超长应拒绝");
+        let failure =
+            secret_write_literal(&agent, &sync_root, "EXA_API_KEY", &long).expect_err("超长应拒绝");
         assert_eq!(failure.code, "secret_value_too_long");
 
         let failure = secret_write_literal(&agent, &sync_root, "EXA_API_KEY", ".env 里贴进来\nX=1")
@@ -754,7 +775,10 @@ mod tests {
         }
 
         // 越界路径没有被写入任何内容。
-        assert_eq!(fs::read_to_string(agent.join("auth.json")).expect("读夹具"), "{}");
+        assert_eq!(
+            fs::read_to_string(agent.join("auth.json")).expect("读夹具"),
+            "{}"
+        );
     }
 
     #[test]

@@ -86,7 +86,9 @@ pub struct ReqwestTransport {
 impl fmt::Debug for ReqwestTransport {
     /// 手写 Debug：`auth` 是凭据的等价物，绝不打印。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("ReqwestTransport").finish_non_exhaustive()
+        formatter
+            .debug_struct("ReqwestTransport")
+            .finish_non_exhaustive()
     }
 }
 
@@ -168,7 +170,10 @@ fn network_error(error: reqwest::Error) -> DavError {
 
 /// `Authorization` 头。Basic 认证是 base64 的唯一用途，不为此引 crate。
 fn basic_auth_header(username: &str, password: &str) -> String {
-    format!("Basic {}", base64_encode(format!("{username}:{password}").as_bytes()))
+    format!(
+        "Basic {}",
+        base64_encode(format!("{username}:{password}").as_bytes())
+    )
 }
 
 fn base64_encode(input: &[u8]) -> String {
@@ -473,8 +478,8 @@ fn parse_response(block: &str, base: &str) -> Option<DavEntry> {
         .first()
         .map(|inner| has_element(inner, "collection"))
         .unwrap_or(false);
-    let content_length = element_text(block, "getcontentlength")
-        .and_then(|text| text.trim().parse::<u64>().ok());
+    let content_length =
+        element_text(block, "getcontentlength").and_then(|text| text.trim().parse::<u64>().ok());
 
     Some(DavEntry {
         path: relative_path(&href, base),
@@ -895,10 +900,7 @@ mod tests {
         assert_eq!(base64_encode(b"a"), "YQ==");
         assert_eq!(base64_encode(b"ab"), "YWI=");
         assert_eq!(base64_encode(b"user:pass"), "dXNlcjpwYXNz");
-        assert_eq!(
-            basic_auth_header("user", "pass"),
-            "Basic dXNlcjpwYXNz"
-        );
+        assert_eq!(basic_auth_header("user", "pass"), "Basic dXNlcjpwYXNz");
     }
 
     #[test]
@@ -1010,7 +1012,12 @@ mod tests {
 
         assert_eq!(
             paths,
-            vec!["snapshot", "snapshot/manifest.json", "snapshot/配置 文件.json", "with&entity's.txt"]
+            vec![
+                "snapshot",
+                "snapshot/manifest.json",
+                "snapshot/配置 文件.json",
+                "with&entity's.txt"
+            ]
         );
         assert!(!paths.contains(&""));
     }
@@ -1029,7 +1036,11 @@ mod tests {
         // 被列集合自身（`snapshot`）与工作根自身（空串）都不算子项。
         assert_eq!(
             paths,
-            vec!["snapshot/manifest.json", "snapshot/配置 文件.json", "with&entity's.txt"]
+            vec![
+                "snapshot/manifest.json",
+                "snapshot/配置 文件.json",
+                "with&entity's.txt"
+            ]
         );
     }
 
@@ -1042,7 +1053,11 @@ mod tests {
             <d:href>/dav/PiAgentSync/empty/</d:href>
             <d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop></d:propstat>
         </d:response></d:multistatus>"#;
-        let (client, _) = client(vec![Ok(response_with(207, Vec::new(), self_only.as_bytes()))]);
+        let (client, _) = client(vec![Ok(response_with(
+            207,
+            Vec::new(),
+            self_only.as_bytes(),
+        ))]);
 
         assert_eq!(client.propfind("empty").unwrap(), Some(Vec::new()));
     }
@@ -1082,11 +1097,16 @@ mod tests {
         let (client, transport) = client(vec![Ok(response(201))]);
         let headers = vec![("If-Match".to_string(), "\"v1\"".to_string())];
 
-        client.put("snapshot/manifest.json", b"{}", &headers).unwrap();
+        client
+            .put("snapshot/manifest.json", b"{}", &headers)
+            .unwrap();
 
         let request = transport.last();
         assert_eq!(request.method, "PUT");
-        assert_eq!(request.url, "https://dav.example.com/dav/PiAgentSync/snapshot/manifest.json");
+        assert_eq!(
+            request.url,
+            "https://dav.example.com/dav/PiAgentSync/snapshot/manifest.json"
+        );
         assert_eq!(request.body.as_deref(), Some(&b"{}"[..]));
         assert_eq!(header(&request, "If-Match").as_deref(), Some("\"v1\""));
         assert_eq!(request.timeout, TRANSFER_TIMEOUT);
@@ -1156,7 +1176,11 @@ mod tests {
             (507, "", DavError::Quota),
             (403, "Insufficient Storage", DavError::Quota),
             (403, "空间不足", DavError::Quota),
-            (500, "", DavError::Unreachable("服务端返回 HTTP 500".to_string())),
+            (
+                500,
+                "",
+                DavError::Unreachable("服务端返回 HTTP 500".to_string()),
+            ),
             (418, "", DavError::Other("服务端返回 HTTP 418".to_string())),
         ];
 
@@ -1180,7 +1204,10 @@ mod tests {
 
     #[test]
     fn urls_join_base_with_and_without_trailing_slash() {
-        for base in ["https://dav.example.com/dav", "https://dav.example.com/dav/"] {
+        for base in [
+            "https://dav.example.com/dav",
+            "https://dav.example.com/dav/",
+        ] {
             let transport = FakeTransport::new(vec![Ok(response(207))]);
             let client = WebdavClient::new(transport.clone(), base);
 
@@ -1224,7 +1251,11 @@ mod tests {
         let (client, transport) = client(vec![
             Ok(response(404)),
             Ok(response(201)),
-            Ok(response_with(207, Vec::new(), ROOT_ONLY_MULTISTATUS.as_bytes())),
+            Ok(response_with(
+                207,
+                Vec::new(),
+                ROOT_ONLY_MULTISTATUS.as_bytes(),
+            )),
             Ok(response(201)),
             Ok(response(204)),
         ]);
@@ -1244,11 +1275,11 @@ mod tests {
             .iter()
             .map(|request| request.method.as_str())
             .collect();
-        assert_eq!(methods, vec!["PROPFIND", "MKCOL", "PROPFIND", "PUT", "DELETE"]);
         assert_eq!(
-            requests[1].url,
-            "https://dav.example.com/dav/PiAgentSync"
+            methods,
+            vec!["PROPFIND", "MKCOL", "PROPFIND", "PUT", "DELETE"]
         );
+        assert_eq!(requests[1].url, "https://dav.example.com/dav/PiAgentSync");
         assert_eq!(
             requests[3].url,
             "https://dav.example.com/dav/PiAgentSync/.tmp-writetest"
@@ -1322,7 +1353,11 @@ mod tests {
         let (client, _) = client(vec![
             Ok(response(404)),
             Ok(response(405)),
-            Ok(response_with(207, Vec::new(), ROOT_ONLY_MULTISTATUS.as_bytes())),
+            Ok(response_with(
+                207,
+                Vec::new(),
+                ROOT_ONLY_MULTISTATUS.as_bytes(),
+            )),
             Ok(response(201)),
             Ok(response(204)),
         ]);

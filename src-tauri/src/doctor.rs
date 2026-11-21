@@ -101,7 +101,6 @@ impl ShellRunner {
             shell: std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("sh")),
         }
     }
-
 }
 
 impl CommandRunner for ShellRunner {
@@ -183,9 +182,7 @@ fn join_reader(handle: Option<std::thread::JoinHandle<String>>) -> String {
 
 /// 一段探测：前后各打印一个哨兵，shell 启动脚本的噪音落在哨兵之外。
 fn section(id: &str, body: &str) -> String {
-    format!(
-        "printf '\\n{SECTION_BEGIN}{id}__\\n'\n{body}\nprintf '\\n{SECTION_END}{id}__\\n'"
-    )
+    format!("printf '\\n{SECTION_BEGIN}{id}__\\n'\n{body}\nprintf '\\n{SECTION_END}{id}__\\n'")
 }
 
 /// 解析哨兵分隔的多段输出，返回 `id → 段内容`。哨兵外的内容一律丢弃。
@@ -289,11 +286,23 @@ fn pass(id: &str, value: Option<String>, detail: Option<String>) -> Check {
 }
 
 fn fail(id: &str, detail: &str, action: Option<&str>) -> Check {
-    record(id, CheckStatus::Fail, None, Some(detail.to_string()), action)
+    record(
+        id,
+        CheckStatus::Fail,
+        None,
+        Some(detail.to_string()),
+        action,
+    )
 }
 
 fn unknown(id: &str, detail: &str) -> Check {
-    record(id, CheckStatus::Unknown, None, Some(detail.to_string()), None)
+    record(
+        id,
+        CheckStatus::Unknown,
+        None,
+        Some(detail.to_string()),
+        None,
+    )
 }
 
 /// 快速组：一条登录 shell 命令里跑全部 5 秒级探测。
@@ -337,7 +346,12 @@ else
   "$p" list 2>/dev/null
 fi"#;
 
-    [section("node", node), section("npm", npm), section("pi", pi)].join("\n")
+    [
+        section("node", node),
+        section("npm", npm),
+        section("pi", pi),
+    ]
+    .join("\n")
 }
 
 fn auth_script(pi_path: &str, provider: &str) -> String {
@@ -551,10 +565,7 @@ fn pi_checks(outcome: &CommandOutcome) -> (Vec<Check>, Option<String>, Option<St
             None,
         ),
         SectionData::Unavailable(detail) => (
-            vec![
-                unknown("pi.path", &detail),
-                unknown("pi.version", &detail),
-            ],
+            vec![unknown("pi.path", &detail), unknown("pi.version", &detail)],
             None,
             None,
         ),
@@ -666,7 +677,11 @@ fn auth_checks(
     providers
         .into_iter()
         .map(|provider| {
-            let outcome = runner.run(&auth_script(pi_path.unwrap_or_default(), &provider), AUTH_TIMEOUT, &env);
+            let outcome = runner.run(
+                &auth_script(pi_path.unwrap_or_default(), &provider),
+                AUTH_TIMEOUT,
+                &env,
+            );
             auth_check(&provider, &outcome)
         })
         .collect()
@@ -677,25 +692,31 @@ fn auth_check(provider: &str, outcome: &CommandOutcome) -> Check {
     match section_data(outcome, "auth") {
         SectionData::Timeout => unknown(&id, "凭据检查超时（probe_timeout）"),
         SectionData::Unavailable(detail) => unknown(&id, &detail),
-        SectionData::Missing => fail(&id, "pi 未找到，无法检查凭据（tool_not_found）", Some("host.install")),
-        SectionData::Absent => fail(&id, "凭据检查没有输出（tool_broken）", Some("auth.configure")),
-        SectionData::Body { raw, .. } => {
-            match parse_auth_status(&raw).as_deref() {
-                Some("ready") => pass(&id, Some("ready".to_string()), None),
-                Some("not_ready") => fail(
-                    &id,
-                    "凭据未就绪（not_ready），需要补齐 key 或重新登录",
-                    Some("auth.configure"),
-                ),
-                Some("invalid") => fail(
-                    &id,
-                    "凭据无效（invalid），需要重新填写",
-                    Some("auth.configure"),
-                ),
-                Some(other) => unknown(&id, &format!("未知的凭据状态 {other}")),
-                None => unknown(&id, "凭据检查输出无法解析（version_unparsable）"),
-            }
-        }
+        SectionData::Missing => fail(
+            &id,
+            "pi 未找到，无法检查凭据（tool_not_found）",
+            Some("host.install"),
+        ),
+        SectionData::Absent => fail(
+            &id,
+            "凭据检查没有输出（tool_broken）",
+            Some("auth.configure"),
+        ),
+        SectionData::Body { raw, .. } => match parse_auth_status(&raw).as_deref() {
+            Some("ready") => pass(&id, Some("ready".to_string()), None),
+            Some("not_ready") => fail(
+                &id,
+                "凭据未就绪（not_ready），需要补齐 key 或重新登录",
+                Some("auth.configure"),
+            ),
+            Some("invalid") => fail(
+                &id,
+                "凭据无效（invalid），需要重新填写",
+                Some("auth.configure"),
+            ),
+            Some(other) => unknown(&id, &format!("未知的凭据状态 {other}")),
+            None => unknown(&id, "凭据检查输出无法解析（version_unparsable）"),
+        },
     }
 }
 
@@ -749,7 +770,11 @@ fn packages_check(agent_dir: Option<&Path>, list: Option<&str>) -> Check {
         return record(
             "packages",
             CheckStatus::Fail,
-            Some(format!("声明 {} 个，实装 {} 个", declared.len(), installed.len())),
+            Some(format!(
+                "声明 {} 个，实装 {} 个",
+                declared.len(),
+                installed.len()
+            )),
             Some(format!(
                 "缺包：{}",
                 missing
@@ -765,7 +790,11 @@ fn packages_check(agent_dir: Option<&Path>, list: Option<&str>) -> Check {
         return record(
             "packages",
             CheckStatus::Warn,
-            Some(format!("声明 {} 个，实装 {} 个", declared.len(), installed.len())),
+            Some(format!(
+                "声明 {} 个，实装 {} 个",
+                declared.len(),
+                installed.len()
+            )),
             Some(format!(
                 "多装：{}",
                 extra
@@ -787,8 +816,8 @@ fn packages_check(agent_dir: Option<&Path>, list: Option<&str>) -> Check {
 
 fn declared_packages(agent_dir: &Path) -> Result<BTreeSet<String>, String> {
     let path = agent_dir.join("settings.json");
-    let text = fs::read_to_string(&path)
-        .map_err(|error| format!("无法读取 settings.json（{error}）"))?;
+    let text =
+        fs::read_to_string(&path).map_err(|error| format!("无法读取 settings.json（{error}）"))?;
     let value: serde_json::Value = serde_json::from_str(&text)
         .map_err(|error| format!("settings.json 无法解析（{error}）"))?;
 
@@ -836,11 +865,7 @@ fn skills_check(agent_dir: Option<&Path>) -> Check {
     };
 
     if broken.is_empty() {
-        return pass(
-            "skills.links",
-            Some(format!("{links} 个链接")),
-            None,
-        );
+        return pass("skills.links", Some(format!("{links} 个链接")), None);
     }
 
     record(
@@ -1015,7 +1040,11 @@ pub fn iso8601_from_unix(seconds: u64) -> String {
 /// Howard Hinnant 的 days → 公历日期换算。
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let shifted = days + 719_468;
-    let era = (if shifted >= 0 { shifted } else { shifted - 146_096 }) / 146_097;
+    let era = (if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    }) / 146_097;
     let day_of_era = (shifted - era * 146_097) as u64;
     let year_of_era =
         (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
@@ -1072,7 +1101,8 @@ fn probe(app: &tauri::AppHandle) -> Result<DoctorReport, String> {
     let config = config::load_config(&config_dir).map_err(|error| error.to_string())?;
     let env_agent_dir = std::env::var_os(AGENT_DIR_ENV_VAR).map(std::path::PathBuf::from);
     let home_dir = app.path().home_dir().ok();
-    let resolved = config::resolve_agent_dir(&config, env_agent_dir.as_deref(), home_dir.as_deref());
+    let resolved =
+        config::resolve_agent_dir(&config, env_agent_dir.as_deref(), home_dir.as_deref());
 
     Ok(check(resolved.path.as_deref(), &ShellRunner::from_env()))
 }
@@ -1203,7 +1233,10 @@ mod tests {
     fn parse_version_takes_first_clean_fragment() {
         assert_eq!(parse_version("22.23.0"), Some((22, 23, 0)));
         assert_eq!(parse_version("v1.5.2"), Some((1, 5, 2)));
-        assert_eq!(parse_version("pi 1.5.2 (build 2026-11-20)"), Some((1, 5, 2)));
+        assert_eq!(
+            parse_version("pi 1.5.2 (build 2026-11-20)"),
+            Some((1, 5, 2))
+        );
         assert_eq!(parse_version("npm 10.9.2\n"), Some((10, 9, 2)));
         assert_eq!(parse_version("version 0.1.0-beta.2"), Some((0, 1, 0)));
         assert_eq!(parse_version("2026-11-20T05:30:00Z"), None);
@@ -1229,7 +1262,10 @@ mod tests {
     fn parse_sections_keeps_multiline_list() {
         let stdout = format!(
             "noise\n{}",
-            fake_section("pi", "path:/usr/bin/pi\nlist:\nUser packages:\n  npm:pi-lens")
+            fake_section(
+                "pi",
+                "path:/usr/bin/pi\nlist:\nUser packages:\n  npm:pi-lens"
+            )
         );
 
         let sections = parse_sections(&stdout);
@@ -1250,12 +1286,23 @@ mod tests {
         for id in ["node.path", "node.version", "npm", "pi.path", "pi.version"] {
             let check = find(&report, id);
             assert_eq!(check.status, CheckStatus::Unknown, "{id}");
-            assert!(check.detail.clone().unwrap_or_default().contains("probe_timeout"));
+            assert!(check
+                .detail
+                .clone()
+                .unwrap_or_default()
+                .contains("probe_timeout"));
         }
 
         let calls = runner.calls();
-        assert_eq!(calls.first().map(|(_, timeout)| *timeout), Some(PROBE_TIMEOUT));
-        assert!(calls.first().unwrap().0.contains("__PI_DOCTOR__BEGIN__node__"));
+        assert_eq!(
+            calls.first().map(|(_, timeout)| *timeout),
+            Some(PROBE_TIMEOUT)
+        );
+        assert!(calls
+            .first()
+            .unwrap()
+            .0
+            .contains("__PI_DOCTOR__BEGIN__node__"));
     }
 
     #[test]
@@ -1278,7 +1325,11 @@ mod tests {
 
         let broken = check(
             None,
-            &FakeRunner::new(vec![fast_ok("path:/usr/bin/node\nversion:", "path:/usr/bin/npm\nversion:\nprefix:/usr", "path:/usr/bin/pi\nversion:")]),
+            &FakeRunner::new(vec![fast_ok(
+                "path:/usr/bin/node\nversion:",
+                "path:/usr/bin/npm\nversion:\nprefix:/usr",
+                "path:/usr/bin/pi\nversion:",
+            )]),
         );
         assert_eq!(find(&broken, "node.path").status, CheckStatus::Pass);
         assert_eq!(find(&broken, "node.version").status, CheckStatus::Fail);
@@ -1372,7 +1423,10 @@ mod tests {
     #[test]
     fn auth_without_models_file_is_unknown() {
         let dir = TempDir::new("auth-missing");
-        let report = check(Some(dir.path()), &FakeRunner::single(CommandOutcome::Timeout));
+        let report = check(
+            Some(dir.path()),
+            &FakeRunner::single(CommandOutcome::Timeout),
+        );
 
         assert_eq!(find(&report, "auth").status, CheckStatus::Unknown);
         assert!(find(&report, "auth").detail.is_some());
@@ -1385,7 +1439,8 @@ mod tests {
             "settings.json",
             r#"{"packages":["npm:pi-lens","npm:missing-pkg"]}"#,
         );
-        let list = "User packages:\n  npm:pi-lens\n    /tmp/pi-lens\n  npm:extra-pkg\n    /tmp/extra-pkg";
+        let list =
+            "User packages:\n  npm:pi-lens\n    /tmp/pi-lens\n  npm:extra-pkg\n    /tmp/extra-pkg";
 
         let report = check(
             Some(dir.path()),
@@ -1399,7 +1454,11 @@ mod tests {
         let packages = find(&report, "packages");
         assert_eq!(packages.status, CheckStatus::Fail);
         assert_eq!(packages.action.as_deref(), Some("packages.install"));
-        assert!(packages.detail.clone().unwrap_or_default().contains("npm:missing-pkg"));
+        assert!(packages
+            .detail
+            .clone()
+            .unwrap_or_default()
+            .contains("npm:missing-pkg"));
     }
 
     #[test]
@@ -1429,11 +1488,18 @@ mod tests {
         assert_eq!(links, 2);
         assert_eq!(broken, vec!["bad".to_string()]);
 
-        let report = check(Some(dir.path()), &FakeRunner::single(CommandOutcome::Timeout));
+        let report = check(
+            Some(dir.path()),
+            &FakeRunner::single(CommandOutcome::Timeout),
+        );
         let skills_check = find(&report, "skills.links");
         assert_eq!(skills_check.status, CheckStatus::Warn);
         assert_eq!(skills_check.action.as_deref(), Some("skills.relink"));
-        assert!(skills_check.detail.clone().unwrap_or_default().contains("bad"));
+        assert!(skills_check
+            .detail
+            .clone()
+            .unwrap_or_default()
+            .contains("bad"));
     }
 
     #[test]
@@ -1529,7 +1595,11 @@ mod tests {
         let packages = find(&report, "packages");
         assert_eq!(packages.status, CheckStatus::Fail);
         assert!(!format!("{packages:?}").contains("sk-live-9999"));
-        assert!(packages.detail.clone().unwrap_or_default().contains("<redacted>"));
+        assert!(packages
+            .detail
+            .clone()
+            .unwrap_or_default()
+            .contains("<redacted>"));
     }
 
     #[test]

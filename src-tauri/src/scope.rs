@@ -650,8 +650,14 @@ mod tests {
         assert_eq!(
             outcome.symlinks(),
             vec![
-                (PathBuf::from("agents/pi-shared"), PathBuf::from("../../external/tree")),
-                (PathBuf::from("skills/linked.md"), PathBuf::from("../../external/shared.md")),
+                (
+                    PathBuf::from("agents/pi-shared"),
+                    PathBuf::from("../../external/tree")
+                ),
+                (
+                    PathBuf::from("skills/linked.md"),
+                    PathBuf::from("../../external/shared.md")
+                ),
             ]
         );
 
@@ -667,8 +673,14 @@ mod tests {
 
         let linked = dest.join("skills/linked.md");
         let linked_metadata = fs::symlink_metadata(&linked).expect("目标文件存在");
-        assert!(linked_metadata.file_type().is_file(), "链接必须物化为真实文件");
-        assert_eq!(fs::read_to_string(&linked).expect("读取物化文件"), "外部文件");
+        assert!(
+            linked_metadata.file_type().is_file(),
+            "链接必须物化为真实文件"
+        );
+        assert_eq!(
+            fs::read_to_string(&linked).expect("读取物化文件"),
+            "外部文件"
+        );
         assert_eq!(
             fs::read_to_string(dest.join("agents/pi-shared/inside.md")).expect("读取物化目录内容"),
             "外部目录"
@@ -713,7 +725,10 @@ mod tests {
 
         let dest = temp.path().join("dest");
         let materialized = materialize(&agent, &dest).expect("断链不应导致物化失败");
-        assert_eq!(materialized.written, vec![PathBuf::from("settings.json"), PathBuf::from("skills")]);
+        assert_eq!(
+            materialized.written,
+            vec![PathBuf::from("settings.json"), PathBuf::from("skills")]
+        );
         assert_eq!(materialized.skipped.len(), 2);
         assert!(!dest.join("AGENTS.md").exists());
         assert!(!dest.join("skills/gone.md").exists());
@@ -730,7 +745,10 @@ mod tests {
         symlink("..", agent.join("agents/loop")).expect("创建回环链接");
 
         let outcome = scan(&agent).expect("扫描");
-        assert_eq!(scan_paths(&outcome), vec!["agents", "agents/helper.md", "agents/loop"]);
+        assert_eq!(
+            scan_paths(&outcome),
+            vec!["agents", "agents/helper.md", "agents/loop"]
+        );
         assert_eq!(
             skipped_paths(&outcome),
             vec![("agents/loop".to_string(), SkipReason::LinkLoop)]

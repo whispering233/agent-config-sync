@@ -1,5 +1,5 @@
-mod commands;
 mod apply;
+mod commands;
 mod config;
 mod conflicts;
 mod credentials;

@@ -398,9 +398,8 @@ fn upload_into<T: DavTransport>(
     }
 
     // 6. 提交 manifest。条件头缺一不可：无条件写就会盖掉别人刚推的版本。
-    let body = fs::read(input.workspace.join(MANIFEST_FILE_NAME)).map_err(|error| {
-        TransferError::Storage(format!("读取待上传 manifest 失败：{error}"))
-    })?;
+    let body = fs::read(input.workspace.join(MANIFEST_FILE_NAME))
+        .map_err(|error| TransferError::Storage(format!("读取待上传 manifest 失败：{error}")))?;
     client
         .put(
             MANIFEST_FILE_NAME,
@@ -455,7 +454,10 @@ fn read_remote_manifest<T: DavTransport>(
     }
 
     match parse_manifest(&bytes) {
-        Ok(manifest) => Ok(RemoteManifestState::Parsed(RemoteManifest { etag, manifest })),
+        Ok(manifest) => Ok(RemoteManifestState::Parsed(RemoteManifest {
+            etag,
+            manifest,
+        })),
         // 清单坏了但 ETag 还在：覆盖时仍能靠条件请求确认“坏的就是我读到的那一版”。
         Err(_) => Ok(RemoteManifestState::Corrupt { etag }),
     }
@@ -494,7 +496,10 @@ fn hash_index(manifest: &Manifest) -> BTreeMap<String, String> {
 /// 远端相对上次记录的变化：新增 / 修改 / 删除的路径。
 ///
 /// 方向是「远端 vs 记录」，因为这正是用户要判断的那件事：云端被别人改了什么。
-fn diff_manifests(remote: &Manifest, recorded: &Manifest) -> (Vec<String>, Vec<String>, Vec<String>) {
+fn diff_manifests(
+    remote: &Manifest,
+    recorded: &Manifest,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     let recorded_index = hash_index(recorded);
     let remote_index = hash_index(remote);
 
@@ -564,11 +569,13 @@ fn prepare_upload_workspace(app_data: &Path) -> Result<PathBuf, TransferError> {
 
 /// 解析远端 manifest。版本单独先看：结构不认识时也要报「版本不支持」而不是「文件损坏」。
 fn parse_manifest(bytes: &[u8]) -> Result<Manifest, TransferError> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
-        TransferError::Corrupt(format!("远端 manifest 不是合法 JSON：{error}"))
-    })?;
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| TransferError::Corrupt(format!("远端 manifest 不是合法 JSON：{error}")))?;
 
-    match value.get("formatVersion").and_then(serde_json::Value::as_u64) {
+    match value
+        .get("formatVersion")
+        .and_then(serde_json::Value::as_u64)
+    {
         Some(version) if version == u64::from(FORMAT_VERSION) => {}
         Some(version) => {
             return Err(TransferError::Corrupt(format!(
@@ -582,9 +589,8 @@ fn parse_manifest(bytes: &[u8]) -> Result<Manifest, TransferError> {
         }
     }
 
-    serde_json::from_value(value).map_err(|error| {
-        TransferError::Corrupt(format!("远端 manifest 字段不完整：{error}"))
-    })
+    serde_json::from_value(value)
+        .map_err(|error| TransferError::Corrupt(format!("远端 manifest 字段不完整：{error}")))
 }
 
 /// 建本次暂存目录。命名与备份目录同一套：UTC 时间戳，同一秒内加序号。
@@ -671,9 +677,8 @@ fn fill_staging<T: DavTransport>(
 /// manifest 原样落盘：云端写什么就存什么，不重新序列化，免得指纹与字节都对不上。
 fn write_staged_manifest(staging_root: &Path, bytes: &[u8]) -> Result<(), TransferError> {
     let target = staging_root.join(MANIFEST_FILE_NAME);
-    config::write_private_file(&target, bytes).map_err(|error| {
-        TransferError::Storage(format!("写入暂存 manifest 失败：{error}"))
-    })
+    config::write_private_file(&target, bytes)
+        .map_err(|error| TransferError::Storage(format!("写入暂存 manifest 失败：{error}")))
 }
 
 /// 只保留本次的暂存目录：旧暂存对应的是上一份远端快照，留着只会让人误以为还能用。
@@ -883,7 +888,11 @@ mod tests {
             .strip_prefix(app_data.join(STAGING_DIR_NAME))
             .expect("暂存目录应在 staging 之下")
             .to_path_buf();
-        assert_eq!(relative.components().count(), 1, "暂存目录是 staging 的直接子目录");
+        assert_eq!(
+            relative.components().count(),
+            1,
+            "暂存目录是 staging 的直接子目录"
+        );
         assert_eq!(
             fs::read_to_string(outcome.staging_root.join("snapshot/settings.json")).unwrap(),
             settings
@@ -953,7 +962,10 @@ mod tests {
         )
         .unwrap();
 
-        let manifest = manifest_with(vec![manifest_file("snapshot/settings.json", "{ \"a\": 1 }")]);
+        let manifest = manifest_with(vec![manifest_file(
+            "snapshot/settings.json",
+            "{ \"a\": 1 }",
+        )]);
         let (client, _) = fake_client(vec![
             response_with_body(&manifest_bytes(&manifest)),
             response_with_body(b"{ \"a\": 1 }"),
@@ -1282,7 +1294,10 @@ mod tests {
         // 暂存目录顶替同步根：只读校验与计划一行都不用改。
         let report = crate::plan::plan_snapshot(&agent_dir, &outcome.staging_root, &FakeRunner)
             .expect("计划应成功");
-        assert_eq!(report.manifest_info.fingerprint, outcome.manifest.fingerprint);
+        assert_eq!(
+            report.manifest_info.fingerprint,
+            outcome.manifest.fingerprint
+        );
         assert_eq!(report.verification.checked, 1);
         assert_eq!(report.plan.added.len(), 1);
         assert_eq!(report.plan.added[0].path, "settings.json");
@@ -1431,7 +1446,10 @@ mod tests {
         let state = load_state(&app_data).expect("读状态").expect("状态应存在");
         assert_eq!(state.manifest.fingerprint, fingerprint);
         assert!(!app_data.join(UPLOAD_WORKSPACE_DIR_NAME).exists());
-        assert!(!app_data.join(STAGING_DIR_NAME).exists(), "上传不碰下载暂存目录");
+        assert!(
+            !app_data.join(STAGING_DIR_NAME).exists(),
+            "上传不碰下载暂存目录"
+        );
     }
 
     #[test]
@@ -1447,7 +1465,8 @@ mod tests {
         });
         let (client, transport) = fake_client(vec![corrupt]);
 
-        let outcome = upload(&client, &app_data, &agent, false, false).expect("应返回冲突而不是报错");
+        let outcome =
+            upload(&client, &app_data, &agent, false, false).expect("应返回冲突而不是报错");
 
         match outcome {
             UploadOutcome::Conflict {
@@ -1485,7 +1504,9 @@ mod tests {
 
         match outcome {
             // 清单坏了就没法增量：全部重传。
-            UploadOutcome::Uploaded { uploaded, skipped, .. } => {
+            UploadOutcome::Uploaded {
+                uploaded, skipped, ..
+            } => {
                 assert_eq!(uploaded, 3);
                 assert_eq!(skipped, 0);
             }
@@ -1537,8 +1558,7 @@ mod tests {
                     fingerprint
                 }
                 UploadOutcome::Conflict { .. } => {
-                    match upload(&client, &app_data, &agent, false, true)
-                        .expect("确认覆盖后应成功")
+                    match upload(&client, &app_data, &agent, false, true).expect("确认覆盖后应成功")
                     {
                         UploadOutcome::Uploaded {
                             fingerprint,
@@ -1859,8 +1879,8 @@ mod tests {
         );
 
         let (client, transport) = fake_client(Vec::new());
-        let error = upload(&client, &app_data, &agent, false, false)
-            .expect_err("明文密钥未确认时不能上传");
+        let error =
+            upload(&client, &app_data, &agent, false, false).expect_err("明文密钥未确认时不能上传");
         match error {
             TransferError::Export(failure) => {
                 assert_eq!(failure.code, "secrets_unconfirmed");
@@ -1872,8 +1892,8 @@ mod tests {
 
         // 用户确认后同一个入口能继续：复用导出的 allow_plaintext 语义。
         let (confirming_client, _) = fake_client(first_upload_responses());
-        let outcome = upload(&confirming_client, &app_data, &agent, true, false)
-            .expect("确认后应上传成功");
+        let outcome =
+            upload(&confirming_client, &app_data, &agent, true, false).expect("确认后应上传成功");
         assert!(matches!(outcome, UploadOutcome::Uploaded { .. }));
     }
 }

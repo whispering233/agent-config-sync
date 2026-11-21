@@ -179,7 +179,10 @@ pub fn apply(
     let mut written = 0;
     for item in report.plan.added.iter().chain(&report.plan.modified) {
         // 链接之下的内容由链接目标提供，不再写真实文件（也不写穿链接）。
-        if links.iter().any(|link| is_under(&item.path, &link.relative)) {
+        if links
+            .iter()
+            .any(|link| is_under(&item.path, &link.relative))
+        {
             continue;
         }
         write_snapshot_file(agent_dir, sync_root, &item.path)
@@ -268,9 +271,7 @@ fn reject_delete_through_symlink(
         if let Some(ancestor) = ancestor {
             return Err(ApplyFailure::new(
                 "delete_through_symlink",
-                format!(
-                    "{relative} 的路径经过符号链接 {ancestor}，拒绝删除；请先手动处理该目录"
-                ),
+                format!("{relative} 的路径经过符号链接 {ancestor}，拒绝删除；请先手动处理该目录"),
             ));
         }
     }
@@ -335,9 +336,7 @@ fn rebuildable_links(
         if !is_managed_link(relative_path)
             || scope::resolve_within(agent_dir, relative_path).is_err()
         {
-            warnings.push(format!(
-                "{relative} 不在受管范围内，未重建链接"
-            ));
+            warnings.push(format!("{relative} 不在受管范围内，未重建链接"));
             continue;
         }
         let Some(parent) = relative_path.parent() else {
@@ -644,7 +643,10 @@ fn record(
     let mode = (!file_type.is_symlink()).then(|| metadata.permissions().mode() & 0o777);
     let link_target = if file_type.is_symlink() {
         let target = fs::read_link(&live).map_err(|error| {
-            ApplyFailure::new("backup_failed", format!("读取 {relative} 的链接目标失败：{error}"))
+            ApplyFailure::new(
+                "backup_failed",
+                format!("读取 {relative} 的链接目标失败：{error}"),
+            )
         })?;
         Some(target.to_string_lossy().into_owned())
     } else {
@@ -887,10 +889,11 @@ fn run(
     // 只读取这一个文档化的环境变量；错误信息里不回显其内容。
     let env_agent_dir = std::env::var_os(config::AGENT_DIR_ENV_VAR).map(PathBuf::from);
     let home_dir = app.path().home_dir().ok();
-    let resolved = config::resolve_agent_dir(&config, env_agent_dir.as_deref(), home_dir.as_deref());
-    let agent_dir = resolved
-        .path
-        .ok_or_else(|| ApplyFailure::new("agent_dir_missing", "无法确定宿主目录，请先在设置页填写"))?;
+    let resolved =
+        config::resolve_agent_dir(&config, env_agent_dir.as_deref(), home_dir.as_deref());
+    let agent_dir = resolved.path.ok_or_else(|| {
+        ApplyFailure::new("agent_dir_missing", "无法确定宿主目录，请先在设置页填写")
+    })?;
 
     apply(
         &agent_dir,
@@ -1013,7 +1016,11 @@ mod tests {
         let mut entries = Vec::new();
         for item in fs::read_dir(root).expect("读取目录") {
             let path = item.expect("目录项").path();
-            let name = path.file_name().expect("文件名").to_string_lossy().into_owned();
+            let name = path
+                .file_name()
+                .expect("文件名")
+                .to_string_lossy()
+                .into_owned();
             if path.is_dir() {
                 for (relative, bytes) in tree(&path) {
                     entries.push((format!("{name}/{relative}"), bytes));
@@ -1099,7 +1106,10 @@ mod tests {
             fs::read_to_string(agent.join("skills/antd/SKILL.md")).expect("读技能"),
             "# 技能\n"
         );
-        assert!(agent.join("prompts/leftover.md").is_file(), "未勾选的删除项保留");
+        assert!(
+            agent.join("prompts/leftover.md").is_file(),
+            "未勾选的删除项保留"
+        );
         assert!(!agent.join("themes/old.json").exists(), "勾选的删除项被删");
         // 范围外文件从未被碰。
         assert_eq!(
@@ -1155,11 +1165,18 @@ mod tests {
 
         // 云盘只传了一半：manifest 还在，但文件内容不符。
         crate::snapshot::export(&agent, &sync_root, false).expect("重新导出快照");
-        write_file(&sync_root.join("snapshot/settings.json"), "{\"theme\": \"half\"}");
+        write_file(
+            &sync_root.join("snapshot/settings.json"),
+            "{\"theme\": \"half\"}",
+        );
         let failure = apply(&agent, &sync_root, &expected, &[], &data, &FakeRunner::ok())
             .expect_err("哈希不符必须拒绝");
         assert_eq!(failure.code, "manifest_invalid", "{}", failure.message);
-        assert!(failure.message.contains("hash_mismatch"), "{}", failure.message);
+        assert!(
+            failure.message.contains("hash_mismatch"),
+            "{}",
+            failure.message
+        );
         assert!(backup_ids(&data).is_empty());
     }
 
@@ -1171,7 +1188,12 @@ mod tests {
         let expected = fingerprint(&agent, &sync_root);
         let before = tree(&agent);
 
-        for path in ["../escape.json", "auth.json", "settings.json", "/etc/passwd"] {
+        for path in [
+            "../escape.json",
+            "auth.json",
+            "settings.json",
+            "/etc/passwd",
+        ] {
             let failure = apply(
                 &agent,
                 &sync_root,
@@ -1200,8 +1222,11 @@ mod tests {
         write_file(&temp.path().join("outside/real.md"), "原始内容\n");
         fs::create_dir_all(agent.join("skills/antd")).expect("创建技能目录");
         // 链接指向宿主目录之外：应用时不得写穿。
-        symlink("../../../outside/real.md", agent.join("skills/antd/SKILL.md"))
-            .expect("创建符号链接");
+        symlink(
+            "../../../outside/real.md",
+            agent.join("skills/antd/SKILL.md"),
+        )
+        .expect("创建符号链接");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
         crate::snapshot::export(&agent, &sync_root, false).expect("导出快照");
 
@@ -1217,7 +1242,10 @@ mod tests {
 
         // 链接按 manifest 记录重建，外部目标保持原样。
         let metadata = fs::symlink_metadata(agent.join("skills/antd/SKILL.md")).expect("读信息");
-        assert!(metadata.file_type().is_symlink(), "链接按 manifest 记录重建");
+        assert!(
+            metadata.file_type().is_symlink(),
+            "链接按 manifest 记录重建"
+        );
         assert_eq!(
             fs::read_to_string(agent.join("skills/antd/SKILL.md")).expect("读技能"),
             "外部被改\n",
@@ -1234,7 +1262,11 @@ mod tests {
             fs::read_to_string(agent.join("settings.json")).expect("读 settings"),
             "{\"theme\": \"dark\"}"
         );
-        assert_eq!(mode_of(&agent.join("settings.json")), 0o640, "覆盖后保留原 mode");
+        assert_eq!(
+            mode_of(&agent.join("settings.json")),
+            0o640,
+            "覆盖后保留原 mode"
+        );
 
         // 备份目录 0700；restore.json 契约。
         assert_eq!(mode_of(&report.backup_dir), 0o700);
@@ -1259,9 +1291,15 @@ mod tests {
         assert_eq!(link.kind, RestoreKind::Symlink);
         assert!(link.existed);
         assert_eq!(link.mode, None);
-        assert_eq!(link.link_target.as_deref(), Some("../../../outside/real.md"));
+        assert_eq!(
+            link.link_target.as_deref(),
+            Some("../../../outside/real.md")
+        );
         assert!(
-            !report.backup_dir.join("files/skills/antd/SKILL.md").exists(),
+            !report
+                .backup_dir
+                .join("files/skills/antd/SKILL.md")
+                .exists(),
             "符号链接只记目标，不复制内容"
         );
     }
@@ -1327,7 +1365,10 @@ mod tests {
         let backed_up =
             fs::read_to_string(backup_dir.join("files/settings.json")).expect("读备份内容");
         assert_eq!(backed_up, "{\"theme\": \"light\"}");
-        assert_eq!(mode_of(&backup_dir.join("files/settings.json")), settings.mode.unwrap());
+        assert_eq!(
+            mode_of(&backup_dir.join("files/settings.json")),
+            settings.mode.unwrap()
+        );
     }
 
     #[test]
@@ -1411,7 +1452,10 @@ mod tests {
         let skills = entry(&restore, "skills");
         assert_eq!(skills.kind, RestoreKind::Symlink);
         assert!(skills.existed);
-        assert_eq!(skills.link_target.as_deref(), Some("../outside/skills-live"));
+        assert_eq!(
+            skills.link_target.as_deref(),
+            Some("../outside/skills-live")
+        );
     }
 
     #[test]
@@ -1430,7 +1474,11 @@ mod tests {
         assert_eq!(report.linked, 0, "目标不存在就不重建");
         assert_eq!(report.written, 1);
         assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
-        assert!(report.warnings[0].contains("skills"), "{:?}", report.warnings);
+        assert!(
+            report.warnings[0].contains("skills"),
+            "{:?}",
+            report.warnings
+        );
 
         let metadata = fs::symlink_metadata(agent.join("skills")).expect("读 skills 信息");
         assert!(!metadata.file_type().is_symlink(), "断链退回物化");
@@ -1447,7 +1495,10 @@ mod tests {
         assert_eq!(skills.kind, RestoreKind::Symlink);
         assert!(skills.existed);
         assert_eq!(skills.mode, None);
-        assert_eq!(skills.link_target.as_deref(), Some("../outside/skills-live"));
+        assert_eq!(
+            skills.link_target.as_deref(),
+            Some("../outside/skills-live")
+        );
         assert_eq!(
             restore.entries.first().map(|entry| entry.path.as_str()),
             Some("skills"),
@@ -1569,11 +1620,18 @@ mod tests {
         )
         .expect_err("经符号链接删除必须整次拒绝");
 
-        assert_eq!(failure.code, "delete_through_symlink", "{}", failure.message);
+        assert_eq!(
+            failure.code, "delete_through_symlink",
+            "{}",
+            failure.message
+        );
         assert!(failure.message.contains("skills"), "{}", failure.message);
         assert_eq!(failure.completed, 0);
         assert_eq!(failure.backup_dir, None);
-        assert!(outside.join("extra.md").is_file(), "链接目标里的文件不得被删");
+        assert!(
+            outside.join("extra.md").is_file(),
+            "链接目标里的文件不得被删"
+        );
         assert_eq!(tree(&outside), outside_before);
         assert_eq!(tree(&agent), agent_before, "拒绝时不得写任何文件");
         assert!(backup_ids(&data).is_empty(), "拒绝时不得建备份");

@@ -16,8 +16,20 @@ use std::path::{Path, PathBuf};
 
 /// 已知前缀，命中即 `high`。
 const KNOWN_PREFIXES: &[&str] = &[
-    "sk-ant-", "sk-", "ghp_", "github_pat_", "xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-",
-    "AKIA", "AIza", "hf_", "bce-v3/", "oc_sk_",
+    "sk-ant-",
+    "sk-",
+    "ghp_",
+    "github_pat_",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "xoxr-",
+    "xoxs-",
+    "AKIA",
+    "AIza",
+    "hf_",
+    "bce-v3/",
+    "oc_sk_",
 ];
 
 /// 熵规则的阈值：长度与 Shannon 熵下限。
@@ -131,16 +143,17 @@ pub fn sanitize_snapshot(snapshot_dir: &Path) -> io::Result<SanitizeOutcome> {
         };
 
         match style_for(&relative) {
-            Some(style) => match rewrite_document(&text, style, &label, &mut namer, &mut required)
-            {
-                // 解析失败时不猜结构：保留原文，交给扫描结果决定是否阻断。
-                None => findings.extend(scan_text(&label, &text)),
-                Some(updated) => {
-                    if updated != text {
-                        fs::write(&path, updated)?;
+            Some(style) => {
+                match rewrite_document(&text, style, &label, &mut namer, &mut required) {
+                    // 解析失败时不猜结构：保留原文，交给扫描结果决定是否阻断。
+                    None => findings.extend(scan_text(&label, &text)),
+                    Some(updated) => {
+                        if updated != text {
+                            fs::write(&path, updated)?;
+                        }
                     }
                 }
-            },
+            }
             None => findings.extend(scan_text(&label, &text)),
         }
     }
@@ -271,7 +284,14 @@ fn rewrite_document(
     required: &mut BTreeMap<String, Vec<String>>,
 ) -> Option<String> {
     let mut document: Value = serde_json::from_str(text).ok()?;
-    rewrite_value(&mut document, &mut Vec::new(), style, label, namer, required);
+    rewrite_value(
+        &mut document,
+        &mut Vec::new(),
+        style,
+        label,
+        namer,
+        required,
+    );
     let mut output = serde_json::to_string_pretty(&document).ok()?;
     output.push('\n');
     Some(output)
@@ -375,9 +395,7 @@ fn is_reference(value: &str) -> bool {
     let value = value.trim();
     value.starts_with('!')
         || (value.starts_with("${") && value.ends_with('}'))
-        || value
-            .strip_prefix('$')
-            .is_some_and(is_env_name)
+        || value.strip_prefix('$').is_some_and(is_env_name)
 }
 
 fn normalized_field(field: &str) -> String {
@@ -565,7 +583,9 @@ fn quoted_spans(line: &str) -> Vec<(usize, usize)> {
 }
 
 fn field_before(line: &str, start: usize) -> Option<String> {
-    let prefix = line[..start].trim_end().trim_end_matches([':', '=', ' ', '\t']);
+    let prefix = line[..start]
+        .trim_end()
+        .trim_end_matches([':', '=', ' ', '\t']);
     let name: String = prefix
         .chars()
         .rev()
@@ -699,9 +719,7 @@ mod tests {
         let root = temp.path();
         write_file(
             &root.join("models.json"),
-            &format!(
-                "{{\"providers\": {{\"openrouter\": {{\"apiKey\": \"sk-or-{RANDOM}\"}}}}}}"
-            ),
+            &format!("{{\"providers\": {{\"openrouter\": {{\"apiKey\": \"sk-or-{RANDOM}\"}}}}}}"),
         );
         write_file(
             &root.join("mcp.json"),
@@ -716,7 +734,10 @@ mod tests {
         assert!(!outcome.blocked, "{:?}", outcome.findings);
 
         let models = read_file(&root.join("models.json"));
-        assert!(models.contains("\"apiKey\": \"$PI_OPENROUTER_API_KEY\""), "{models}");
+        assert!(
+            models.contains("\"apiKey\": \"$PI_OPENROUTER_API_KEY\""),
+            "{models}"
+        );
         assert!(!models.contains(RANDOM));
 
         let mcp = read_file(&root.join("mcp.json"));

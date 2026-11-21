@@ -258,10 +258,11 @@ pub fn load_config(config_dir: &Path) -> Result<AppConfig, ConfigError> {
         Err(source) => return Err(ConfigError::Read { path, source }),
     };
 
-    let parsed: AppConfig = serde_json::from_str(&contents).map_err(|error| ConfigError::Corrupt {
-        path: path.clone(),
-        detail: error.to_string(),
-    })?;
+    let parsed: AppConfig =
+        serde_json::from_str(&contents).map_err(|error| ConfigError::Corrupt {
+            path: path.clone(),
+            detail: error.to_string(),
+        })?;
 
     if parsed.version > CONFIG_VERSION {
         return Err(ConfigError::UnsupportedVersion {
@@ -416,7 +417,8 @@ pub fn validate(
         }
     };
 
-    if let (Some(sync_root), Some(agent_dir)) = (config.sync_root.as_deref(), resolved.path.as_deref())
+    if let (Some(sync_root), Some(agent_dir)) =
+        (config.sync_root.as_deref(), resolved.path.as_deref())
     {
         if is_plain_absolute(sync_root) && is_plain_absolute(agent_dir) {
             if let Some(message) = overlap_message(sync_root, agent_dir) {
@@ -730,7 +732,10 @@ mod tests {
 
         let text = fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap();
         assert!(text.contains("\"transport\": \"webdav\""), "{text}");
-        assert_eq!(load_config(dir.path()).unwrap().transport, Transport::Webdav);
+        assert_eq!(
+            load_config(dir.path()).unwrap().transport,
+            Transport::Webdav
+        );
     }
 
     #[test]
@@ -814,10 +819,7 @@ mod tests {
         for key in &keys {
             let lowered = key.to_lowercase();
             for banned in ["secret", "token", "password", "apikey", "api_key", "auth"] {
-                assert!(
-                    !lowered.contains(banned),
-                    "配置键 {key} 不应出现密钥语义"
-                );
+                assert!(!lowered.contains(banned), "配置键 {key} 不应出现密钥语义");
             }
         }
     }
@@ -974,7 +976,11 @@ mod tests {
 
         let config = config_with(Some(&cloud), Some(&agent));
         let validation = validate(&config, None, Some(dir.path()));
-        assert!(validation.ok, "同级目录应通过校验: {:?}", validation.findings);
+        assert!(
+            validation.ok,
+            "同级目录应通过校验: {:?}",
+            validation.findings
+        );
 
         let prefix_config = config_with(Some(&sibling), Some(&agent));
         let prefix_validation = validate(&prefix_config, None, Some(dir.path()));
@@ -1049,12 +1055,19 @@ mod tests {
             assert!(!dir.join(CONFIG_FILE_NAME).exists());
         }
 
-        for value in [MIN_BACKUP_RETENTION, DEFAULT_BACKUP_RETENTION, MAX_BACKUP_RETENTION] {
+        for value in [
+            MIN_BACKUP_RETENTION,
+            DEFAULT_BACKUP_RETENTION,
+            MAX_BACKUP_RETENTION,
+        ] {
             let config = AppConfig {
                 backup_retention: value,
                 ..AppConfig::default()
             };
-            assert!(validate(&config, None, Some(&home)).ok, "retention={value} 应允许");
+            assert!(
+                validate(&config, None, Some(&home)).ok,
+                "retention={value} 应允许"
+            );
         }
     }
 
@@ -1109,8 +1122,12 @@ mod tests {
         assert_eq!(object["effectiveAgentDir"], serde_json::Value::Null);
 
         let finding = &object["findings"][0];
-        let finding_keys: BTreeSet<&str> =
-            finding.as_object().unwrap().keys().map(String::as_str).collect();
+        let finding_keys: BTreeSet<&str> = finding
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert_eq!(
             finding_keys,
             BTreeSet::from(["code", "field", "level", "message"])

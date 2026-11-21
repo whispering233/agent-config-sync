@@ -353,8 +353,8 @@ fn restore_point(sync_root: &Path, manifest: &Manifest) -> Result<(), ExportFail
     let manifest_path = sync_root.join(MANIFEST_FILE_NAME);
     let previous = fs::read(&manifest_path).ok();
 
-    let result = write_manifest(sync_root, manifest)
-        .and_then(|()| verify_files(sync_root, &manifest.files));
+    let result =
+        write_manifest(sync_root, manifest).and_then(|()| verify_files(sync_root, &manifest.files));
     if result.is_err() {
         match previous {
             Some(bytes) => {
@@ -378,11 +378,17 @@ fn write_manifest(sync_root: &Path, manifest: &Manifest) -> Result<(), ExportFai
     text.push('\n');
 
     fs::write(&temp, text).map_err(|error| {
-        ExportFailure::new("no_write_permission", format!("写入 manifest 失败：{error}"))
+        ExportFailure::new(
+            "no_write_permission",
+            format!("写入 manifest 失败：{error}"),
+        )
     })?;
     fs::rename(&temp, &target).map_err(|error| {
         let _ = fs::remove_file(&temp);
-        ExportFailure::new("no_write_permission", format!("替换 manifest 失败：{error}"))
+        ExportFailure::new(
+            "no_write_permission",
+            format!("替换 manifest 失败：{error}"),
+        )
     })
 }
 
@@ -588,9 +594,8 @@ pub fn export_snapshot(
             format!("无法定位应用配置目录：{error}"),
         )
     })?;
-    let config = config::load_config(&config_dir).map_err(|error| {
-        ExportFailure::new("app_config_unavailable", error.to_string())
-    })?;
+    let config = config::load_config(&config_dir)
+        .map_err(|error| ExportFailure::new("app_config_unavailable", error.to_string()))?;
 
     let sync_root = config.sync_root.clone().ok_or_else(|| {
         ExportFailure::new(
@@ -602,11 +607,8 @@ pub fn export_snapshot(
     // 只读取这一个文档化的环境变量；错误信息里不回显其内容。
     let env_agent_dir = std::env::var_os(AGENT_DIR_ENV_VAR).map(PathBuf::from);
     let home_dir = app.path().home_dir().ok();
-    let resolved = config::resolve_agent_dir(
-        &config,
-        env_agent_dir.as_deref(),
-        home_dir.as_deref(),
-    );
+    let resolved =
+        config::resolve_agent_dir(&config, env_agent_dir.as_deref(), home_dir.as_deref());
     let agent_dir = resolved.path.ok_or_else(|| {
         ExportFailure::new("agent_dir_missing", "无法确定宿主目录，请先在设置页填写")
     })?;
@@ -673,7 +675,10 @@ mod tests {
         write_file(&root.join("AGENTS.md"), "# 指令\n");
         write_file(&root.join("skills/antd/SKILL.md"), "# 技能\n");
         // 范围外：永不进入快照。
-        write_file(&root.join("auth.json"), "{\"openai\": {\"key\": \"sk-secret\"}}");
+        write_file(
+            &root.join("auth.json"),
+            "{\"openai\": {\"key\": \"sk-secret\"}}",
+        );
         write_file(&root.join("sessions/session.json"), "{}");
     }
 
@@ -685,7 +690,12 @@ mod tests {
     fn dir_entries(root: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(root)
             .expect("读取目录")
-            .map(|item| item.expect("目录项").file_name().to_string_lossy().into_owned())
+            .map(|item| {
+                item.expect("目录项")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect();
         names.sort();
         names
@@ -717,7 +727,11 @@ mod tests {
         assert_eq!(manifest.requirements.node, REQUIREMENT_NODE);
 
         // manifest 的文件表与磁盘一致：路径、大小、哈希都能复算。
-        let mut paths: Vec<String> = manifest.files.iter().map(|file| file.path.clone()).collect();
+        let mut paths: Vec<String> = manifest
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect();
         paths.sort();
         assert_eq!(
             paths,
@@ -732,7 +746,10 @@ mod tests {
         verify_files(&sync_root, &manifest.files).expect("自检哈希");
 
         // 指纹只由 formatVersion 与 {path, sha256} 决定，可复算。
-        assert_eq!(fingerprint(FORMAT_VERSION, &manifest.files), report.fingerprint);
+        assert_eq!(
+            fingerprint(FORMAT_VERSION, &manifest.files),
+            report.fingerprint
+        );
 
         // 包声明：字符串与对象两种写法都进 requiredPackages。
         assert_eq!(
@@ -831,7 +848,8 @@ mod tests {
         fs::create_dir_all(&sync_root).expect("创建同步目录");
         export(&agent, &sync_root, false).expect("首次导出应成功");
 
-        let manifest_before = fs::read_to_string(sync_root.join(MANIFEST_FILE_NAME)).expect("读 manifest");
+        let manifest_before =
+            fs::read_to_string(sync_root.join(MANIFEST_FILE_NAME)).expect("读 manifest");
         let settings_before =
             fs::read_to_string(sync_root.join("snapshot/settings.json")).expect("读快照文件");
 
@@ -843,7 +861,10 @@ mod tests {
         let failure = export(&agent, &sync_root, false).expect_err("应阻断");
         assert_eq!(failure.code, "secrets_unconfirmed");
         assert_eq!(failure.findings.len(), 1);
-        assert_eq!(failure.findings[0].path, "snapshot/extensions/leak/index.ts");
+        assert_eq!(
+            failure.findings[0].path,
+            "snapshot/extensions/leak/index.ts"
+        );
 
         assert_eq!(
             fs::read_to_string(sync_root.join(MANIFEST_FILE_NAME)).expect("读 manifest"),
@@ -878,7 +899,8 @@ mod tests {
         let failure = export(&agent, &missing, false).expect_err("缺失应被拒绝");
         assert_eq!(failure.code, "sync_root_missing");
 
-        let failure = export(&agent, Path::new("relative/path"), false).expect_err("相对路径应被拒绝");
+        let failure =
+            export(&agent, Path::new("relative/path"), false).expect_err("相对路径应被拒绝");
         assert_eq!(failure.code, "sync_root_invalid");
     }
 
@@ -939,11 +961,11 @@ mod tests {
         ] {
             assert!(value.get(key).is_some(), "manifest 缺少字段 {key}");
         }
-        assert!(value.get("plaintextSecrets").is_none(), "false 时不写该字段");
-        assert_eq!(
-            value["files"][0]["sha256"].as_str().map(str::len),
-            Some(64)
+        assert!(
+            value.get("plaintextSecrets").is_none(),
+            "false 时不写该字段"
         );
+        assert_eq!(value["files"][0]["sha256"].as_str().map(str::len), Some(64));
 
         let parsed: Manifest = serde_json::from_str(&text).expect("反序列化");
         assert_eq!(parsed, manifest);

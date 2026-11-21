@@ -127,7 +127,8 @@ pub fn read_backups(app_data_dir: &Path) -> BackupList {
 /// 读一份备份的 `restore.json`。版本不认识也算损坏：宁可跳过，不按旧格式猜。
 fn read_manifest(backup_dir: &Path) -> Result<RestoreManifest, String> {
     let path = backup_dir.join(RESTORE_FILE_NAME);
-    let text = fs::read_to_string(&path).map_err(|error| format!("restore.json 读不出来：{error}"))?;
+    let text =
+        fs::read_to_string(&path).map_err(|error| format!("restore.json 读不出来：{error}"))?;
     let manifest: RestoreManifest =
         serde_json::from_str(&text).map_err(|error| format!("restore.json 无法解析：{error}"))?;
     if manifest.version != RESTORE_VERSION {
@@ -153,7 +154,10 @@ pub fn restore(
     let root = app_data_dir.join(BACKUPS_DIR_NAME);
     // 备份目录名只允许一级目录名：`..` 与绝对路径在这里就被挡下。
     let backup_dir = scope::resolve_within(&root, Path::new(backup_id)).map_err(|error| {
-        RestoreFailure::new("backup_missing", format!("备份 {backup_id} 不可用：{error}"))
+        RestoreFailure::new(
+            "backup_missing",
+            format!("备份 {backup_id} 不可用：{error}"),
+        )
     })?;
     if !backup_dir.is_dir() {
         return Err(RestoreFailure::new(
@@ -184,13 +188,14 @@ pub fn restore(
         .map(|entry| entry.path.as_str())
         .collect();
     let (safety_backup_id, _) =
-        apply::back_up_paths(agent_dir, app_data_dir, &touched, &manifest.fingerprint)
-    .map_err(|failure| {
-        RestoreFailure::new(
-            "backup_failed",
-            format!("还原前备份失败，未改动任何文件：{}", failure.message),
-        )
-    })?;
+        apply::back_up_paths(agent_dir, app_data_dir, &touched, &manifest.fingerprint).map_err(
+            |failure| {
+                RestoreFailure::new(
+                    "backup_failed",
+                    format!("还原前备份失败，未改动任何文件：{}", failure.message),
+                )
+            },
+        )?;
 
     let mut restored = 0;
     let mut removed = 0;
@@ -238,9 +243,10 @@ fn restore_entry(agent_dir: &Path, backup_dir: &Path, entry: &RestoreEntry) -> i
     let target = resolve(agent_dir, &entry.path)?;
     match entry.kind {
         RestoreKind::Symlink => {
-            let link_target = entry.link_target.as_deref().ok_or_else(|| {
-                io::Error::other(format!("{} 的记录里没有链接目标", entry.path))
-            })?;
+            let link_target = entry
+                .link_target
+                .as_deref()
+                .ok_or_else(|| io::Error::other(format!("{} 的记录里没有链接目标", entry.path)))?;
             remove_any(&target)?;
             apply::create_link(link_target, &target)
         }
@@ -369,7 +375,8 @@ fn run(app: &AppHandle, backup_id: &str, confirm: bool) -> Result<RestoreReport,
     // 只读取这一个文档化的环境变量；错误信息里不回显其内容。
     let env_agent_dir = std::env::var_os(config::AGENT_DIR_ENV_VAR).map(PathBuf::from);
     let home_dir = app.path().home_dir().ok();
-    let resolved = config::resolve_agent_dir(&config, env_agent_dir.as_deref(), home_dir.as_deref());
+    let resolved =
+        config::resolve_agent_dir(&config, env_agent_dir.as_deref(), home_dir.as_deref());
     let agent_dir = resolved.path.ok_or_else(|| {
         RestoreFailure::new("agent_dir_missing", "无法确定宿主目录，请先在设置页填写")
     })?;
@@ -418,7 +425,12 @@ mod tests {
     struct FakeRunner;
 
     impl CommandRunner for FakeRunner {
-        fn run(&self, _script: &str, _timeout: Duration, _env: &[(&str, String)]) -> CommandOutcome {
+        fn run(
+            &self,
+            _script: &str,
+            _timeout: Duration,
+            _env: &[(&str, String)],
+        ) -> CommandOutcome {
             CommandOutcome::Ok {
                 stdout: "node:22.23.0\npi:1.5.2\n".to_string(),
                 stderr: String::new(),
@@ -515,7 +527,11 @@ mod tests {
         let data = app_data(&temp);
         write_file(&agent.join("settings.json"), "live");
         let id = "2026-01-01T00-00-00Z";
-        craft_backup(&data, id, &manifest(vec![file_entry("settings.json", true, 0o600)]));
+        craft_backup(
+            &data,
+            id,
+            &manifest(vec![file_entry("settings.json", true, 0o600)]),
+        );
         craft_content(&data, id, "settings.json", "backup");
 
         let failure = restore(&agent, &data, id, false).expect_err("未确认必须拒绝");
@@ -537,7 +553,11 @@ mod tests {
         write_file(&agent.join("settings.json"), "live");
         set_mode(&agent.join("settings.json"), 0o644);
         let id = "2026-01-01T00-00-00Z";
-        craft_backup(&data, id, &manifest(vec![file_entry("settings.json", true, 0o600)]));
+        craft_backup(
+            &data,
+            id,
+            &manifest(vec![file_entry("settings.json", true, 0o600)]),
+        );
         craft_content(&data, id, "settings.json", "backup");
 
         let report = restore(&agent, &data, id, true).expect("回滚应成功");
@@ -561,7 +581,11 @@ mod tests {
         write_file(&agent.join("settings.json"), "live");
         set_mode(&agent.join("settings.json"), 0o640);
         let id = "2026-01-01T00-00-00Z";
-        craft_backup(&data, id, &manifest(vec![file_entry("settings.json", true, 0o600)]));
+        craft_backup(
+            &data,
+            id,
+            &manifest(vec![file_entry("settings.json", true, 0o600)]),
+        );
         craft_content(&data, id, "settings.json", "backup");
 
         let report = restore(&agent, &data, id, true).expect("回滚应成功");
@@ -614,7 +638,11 @@ mod tests {
         let data = app_data(&temp);
         write_file(&agent.join("skills/antd/SKILL.md"), "# 在目录里\n");
         let id = "2026-01-01T00-00-00Z";
-        craft_backup(&data, id, &manifest(vec![file_entry("skills/antd", false, 0o644)]));
+        craft_backup(
+            &data,
+            id,
+            &manifest(vec![file_entry("skills/antd", false, 0o644)]),
+        );
 
         let failure = restore(&agent, &data, id, true).expect_err("目录不能当作新增文件删");
 
@@ -624,10 +652,7 @@ mod tests {
             failure.safety_backup_id.is_some(),
             "失败时也要报出还原前备份"
         );
-        assert!(
-            agent.join("skills/antd/SKILL.md").is_file(),
-            "不递归删目录"
-        );
+        assert!(agent.join("skills/antd/SKILL.md").is_file(), "不递归删目录");
     }
 
     #[test]
@@ -654,7 +679,11 @@ mod tests {
 
         assert_eq!(failure.code, "restore_failed", "{}", failure.message);
         assert_eq!(failure.completed, 1, "第一条已完成");
-        assert!(failure.message.contains("skills/antd"), "{}", failure.message);
+        assert!(
+            failure.message.contains("skills/antd"),
+            "{}",
+            failure.message
+        );
         assert!(failure.safety_backup_id.is_some());
         assert_eq!(
             fs::read_to_string(agent.join("settings.json")).expect("读 live"),
@@ -803,13 +832,21 @@ mod tests {
         let total = BACKUP_RETENTION + 15;
         for day in 1..=total {
             let id = format!("2026-01-{day:02}T00-00-00Z");
-            craft_backup(&data, &id, &manifest(vec![file_entry("settings.json", true, 0o644)]));
+            craft_backup(
+                &data,
+                &id,
+                &manifest(vec![file_entry("settings.json", true, 0o644)]),
+            );
         }
 
         let list = read_backups(&data);
 
         assert_eq!(list.backups.len(), BACKUP_LIST_LIMIT);
-        assert_eq!(list.backups[0].id, format!("2026-01-{total:02}T00-00-00Z"), "最新在前");
+        assert_eq!(
+            list.backups[0].id,
+            format!("2026-01-{total:02}T00-00-00Z"),
+            "最新在前"
+        );
         assert_eq!(
             list.backups[BACKUP_LIST_LIMIT - 1].id,
             format!("2026-01-{:02}T00-00-00Z", total - BACKUP_LIST_LIMIT + 1)
@@ -844,7 +881,10 @@ mod tests {
             .expect("重算计划")
             .manifest_info
             .fingerprint;
-        assert_eq!(expected, fingerprint, "改的是受管范围内的内容，指纹只看快照");
+        assert_eq!(
+            expected, fingerprint,
+            "改的是受管范围内的内容，指纹只看快照"
+        );
 
         let applied = crate::apply::apply(
             &agent,
@@ -859,7 +899,10 @@ mod tests {
             fs::read_to_string(agent.join("settings.json")).expect("读 settings"),
             "{\"theme\": \"dark\"}"
         );
-        assert!(agent.join("skills/antd/SKILL.md").is_file(), "快照文件已落地");
+        assert!(
+            agent.join("skills/antd/SKILL.md").is_file(),
+            "快照文件已落地"
+        );
         assert!(!agent.join("prompts/leftover.md").exists());
 
         let report = restore(&agent, &data, &applied.backup_id, true).expect("回滚应成功");
@@ -877,7 +920,10 @@ mod tests {
             "回滚后内容与回滚前一致"
         );
         assert_eq!(mode_of(&agent.join("settings.json")), 0o640, "权限也一致");
-        assert!(!agent.join("skills/antd/SKILL.md").exists(), "应用新增的文件被删");
+        assert!(
+            !agent.join("skills/antd/SKILL.md").exists(),
+            "应用新增的文件被删"
+        );
         assert_eq!(
             fs::read_to_string(agent.join("auth.json")).expect("读 auth.json"),
             "{\"token\": \"sk-test\"}",
@@ -892,8 +938,8 @@ mod tests {
         let data = app_data(&temp);
         fs::create_dir_all(&agent).expect("建宿主目录");
 
-        let failure = restore(&agent, &data, "2026-01-01T00-00-00Z", true)
-            .expect_err("不存在的备份必须拒绝");
+        let failure =
+            restore(&agent, &data, "2026-01-01T00-00-00Z", true).expect_err("不存在的备份必须拒绝");
         assert_eq!(failure.code, "backup_missing");
 
         let failure = restore(&agent, &data, "../agent", true).expect_err("越界目录名必须拒绝");
@@ -911,7 +957,11 @@ mod tests {
         fs::create_dir_all(agent.join("prompts")).expect("建 prompts");
         symlink("../shared/target.md", agent.join("prompts/linked.md")).expect("建夹具链接");
         let id = "2026-01-01T00-00-00Z";
-        craft_backup(&data, id, &manifest(vec![file_entry("prompts/linked.md", true, 0o600)]));
+        craft_backup(
+            &data,
+            id,
+            &manifest(vec![file_entry("prompts/linked.md", true, 0o600)]),
+        );
         craft_content(&data, id, "prompts/linked.md", "快照内容");
 
         restore(&agent, &data, id, true).expect("回滚应成功");

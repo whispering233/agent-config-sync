@@ -150,7 +150,8 @@ pub fn scan_conflicts(app: AppHandle) -> Result<ConflictReport, String> {
     // 同样只读这一个文档化的变量，错误信息里不回显其取值。
     let env_agent_dir = std::env::var_os(config::AGENT_DIR_ENV_VAR).map(PathBuf::from);
     let home_dir = app.path().home_dir().ok();
-    let resolved = config::resolve_agent_dir(&config, env_agent_dir.as_deref(), home_dir.as_deref());
+    let resolved =
+        config::resolve_agent_dir(&config, env_agent_dir.as_deref(), home_dir.as_deref());
 
     let agent_dir = resolved.path.ok_or_else(|| {
         format!(
@@ -336,7 +337,9 @@ fn root_file_included(name: &str) -> bool {
 fn is_included_root_name(name: &str) -> bool {
     scope::INCLUDED_ROOT_FILES.contains(&name)
         || scope::INCLUDED_ROOT_DIRS.contains(&name)
-        || Path::new(name).extension().is_some_and(|extension| extension == "json")
+        || Path::new(name)
+            .extension()
+            .is_some_and(|extension| extension == "json")
 }
 
 /// 从冲突文件名还原原名：去掉冲突标记与成员昵称后缀，保留扩展名。
@@ -454,7 +457,10 @@ mod tests {
             Some("a.b.json")
         );
         // 无扩展名。
-        assert_eq!(conflict_original_name("LICENSE-冲突").as_deref(), Some("LICENSE"));
+        assert_eq!(
+            conflict_original_name("LICENSE-冲突").as_deref(),
+            Some("LICENSE")
+        );
 
         for name in [
             "settings.json",
@@ -501,7 +507,10 @@ mod tests {
         assert_eq!(orphan.pair_status, PairStatus::Orphan);
         assert_eq!(orphan.original, PathBuf::from("web-search.json"));
         assert_eq!(orphan.original_size, None);
-        assert_eq!(orphan.summary, ConflictSummary::plain(SummaryKind::Unpaired));
+        assert_eq!(
+            orphan.summary,
+            ConflictSummary::plain(SummaryKind::Unpaired)
+        );
         assert_eq!(orphan.size, 8);
     }
 
@@ -582,10 +591,7 @@ mod tests {
         let temp = TempDir::new("scope");
         let agent = temp.path();
         write_file(&agent.join("skills/reviewer/SKILL.md"), b"skill\n");
-        write_file(
-            &agent.join("skills/reviewer/SKILL-冲突.md"),
-            b"skill v2\n",
-        );
+        write_file(&agent.join("skills/reviewer/SKILL-冲突.md"), b"skill v2\n");
         // 根级指令文件的冲突副本：原名在范围内，副本也要被识别。
         write_file(&agent.join("AGENTS.md"), b"agents\n");
         write_file(&agent.join("AGENTS-冲突.md"), b"agents v2\n");
@@ -660,10 +666,7 @@ mod tests {
         assert_eq!(item["pairStatus"], serde_json::json!("paired"));
         assert_eq!(item["original"], serde_json::json!("settings.json"));
         assert_eq!(item["summary"]["kind"], serde_json::json!("identical"));
-        assert_eq!(
-            item["summary"]["firstDiffLine"],
-            serde_json::Value::Null
-        );
+        assert_eq!(item["summary"]["firstDiffLine"], serde_json::Value::Null);
         assert_eq!(value["totals"]["orphan"], serde_json::json!(0));
     }
 }

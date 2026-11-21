@@ -64,10 +64,20 @@ impl fmt::Display for CredentialError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CredentialError::Read { path, source } => {
-                write!(formatter, "无法读取 WebDAV 凭据 {}：{}", path.display(), source)
+                write!(
+                    formatter,
+                    "无法读取 WebDAV 凭据 {}：{}",
+                    path.display(),
+                    source
+                )
             }
             CredentialError::Write { path, source } => {
-                write!(formatter, "无法保存 WebDAV 凭据 {}：{}", path.display(), source)
+                write!(
+                    formatter,
+                    "无法保存 WebDAV 凭据 {}：{}",
+                    path.display(),
+                    source
+                )
             }
             CredentialError::Corrupt { path, detail } => write!(
                 formatter,
@@ -76,7 +86,10 @@ impl fmt::Display for CredentialError {
                 detail
             ),
             CredentialError::InvalidUrl => {
-                write!(formatter, "WebDAV 地址必须以 http:// 或 https:// 开头，并包含主机名")
+                write!(
+                    formatter,
+                    "WebDAV 地址必须以 http:// 或 https:// 开头，并包含主机名"
+                )
             }
             CredentialError::MissingUsername => write!(formatter, "WebDAV 用户名不能为空"),
             CredentialError::MissingPassword => {
@@ -181,10 +194,7 @@ fn is_http_url(url: &str) -> bool {
     };
 
     // 主机名在第一个 `/`、`?`、`#` 之前；空主机名（如 `https:///dav`）不算可解析。
-    let host = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
     !host.is_empty() && !host.contains(char::is_whitespace)
 }
 
@@ -208,9 +218,7 @@ pub fn resolve(
         Some(value) if !value.is_empty() => value.to_string(),
         _ => match load(dir)? {
             // 只在端点未变时沿用旧密码：否则“换个地址 + 密码留空”会把旧密码发给新主机。
-            Some(stored)
-                if same_endpoint(&stored.url, &url) && stored.username == username =>
-            {
+            Some(stored) if same_endpoint(&stored.url, &url) && stored.username == username => {
                 stored.password
             }
             _ => return Err(CredentialError::MissingPassword),
@@ -358,7 +366,12 @@ mod tests {
 
     #[test]
     fn validation_rejects_non_http_urls_and_empty_usernames() {
-        for url in ["", "dav.jianguoyun.com/dav", "ftp://example.com", "https://"] {
+        for url in [
+            "",
+            "dav.jianguoyun.com/dav",
+            "ftp://example.com",
+            "https://",
+        ] {
             let error = validate(url, "someone").expect_err("地址应被拒绝");
             assert!(matches!(error, CredentialError::InvalidUrl), "{url}");
         }
@@ -389,8 +402,13 @@ mod tests {
         let dir = TempDir::new("replace-password");
         save(dir.path(), &sample()).expect("保存应成功");
 
-        upsert(dir.path(), "https://example.com/dav", "someone", Some("next"))
-            .expect("保存应成功");
+        upsert(
+            dir.path(),
+            "https://example.com/dav",
+            "someone",
+            Some("next"),
+        )
+        .expect("保存应成功");
         assert_eq!(load(dir.path()).unwrap().unwrap().password, "next");
     }
 
@@ -399,8 +417,13 @@ mod tests {
         let dir = TempDir::new("resolve-keep");
         save(dir.path(), &sample()).expect("保存应成功");
 
-        let resolved = resolve(dir.path(), " https://dav.jianguoyun.com/dav ", " someone@example.com ", Some("  "))
-            .expect("应沿用已存密码");
+        let resolved = resolve(
+            dir.path(),
+            " https://dav.jianguoyun.com/dav ",
+            " someone@example.com ",
+            Some("  "),
+        )
+        .expect("应沿用已存密码");
 
         assert_eq!(resolved.url, "https://dav.jianguoyun.com/dav");
         assert_eq!(resolved.username, "someone@example.com");
@@ -414,8 +437,13 @@ mod tests {
         let dir = TempDir::new("resolve-host");
         save(dir.path(), &sample()).expect("保存应成功");
 
-        let error = resolve(dir.path(), "https://evil.example/dav", "someone@example.com", None)
-            .expect_err("换了主机就不能沿用旧密码");
+        let error = resolve(
+            dir.path(),
+            "https://evil.example/dav",
+            "someone@example.com",
+            None,
+        )
+        .expect_err("换了主机就不能沿用旧密码");
         assert!(matches!(error, CredentialError::MissingPassword));
     }
 
@@ -424,8 +452,13 @@ mod tests {
         let dir = TempDir::new("resolve-user");
         save(dir.path(), &sample()).expect("保存应成功");
 
-        let error = resolve(dir.path(), "https://dav.jianguoyun.com/dav", "another@example.com", None)
-            .expect_err("换了用户名就不能沿用旧密码");
+        let error = resolve(
+            dir.path(),
+            "https://dav.jianguoyun.com/dav",
+            "another@example.com",
+            None,
+        )
+        .expect_err("换了用户名就不能沿用旧密码");
         assert!(matches!(error, CredentialError::MissingPassword));
     }
 
@@ -434,8 +467,13 @@ mod tests {
         let dir = TempDir::new("resolve-slash");
         save(dir.path(), &sample()).expect("保存应成功");
 
-        let resolved = resolve(dir.path(), "https://dav.jianguoyun.com/dav/", "someone@example.com", None)
-            .expect("仅尾斜杠不同应沿用旧密码");
+        let resolved = resolve(
+            dir.path(),
+            "https://dav.jianguoyun.com/dav/",
+            "someone@example.com",
+            None,
+        )
+        .expect("仅尾斜杠不同应沿用旧密码");
         assert_eq!(resolved.password, sample().password);
     }
 
@@ -444,8 +482,13 @@ mod tests {
         let dir = TempDir::new("resolve-new");
         save(dir.path(), &sample()).expect("保存应成功");
 
-        let resolved = resolve(dir.path(), "https://example.com/dav", "someone", Some(" next "))
-            .expect("应使用传入密码");
+        let resolved = resolve(
+            dir.path(),
+            "https://example.com/dav",
+            "someone",
+            Some(" next "),
+        )
+        .expect("应使用传入密码");
 
         assert_eq!(resolved.password, "next");
         assert_eq!(load(dir.path()).unwrap(), Some(sample()));

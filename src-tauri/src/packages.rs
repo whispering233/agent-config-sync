@@ -252,7 +252,9 @@ pub fn align(
 
 fn align_result(source: &str, outcome: CommandOutcome) -> AlignResult {
     let (status, exit_code, stdout, stderr) = match outcome {
-        CommandOutcome::Ok { stdout, stderr } => (InstallStatus::Succeeded, Some(0), stdout, stderr),
+        CommandOutcome::Ok { stdout, stderr } => {
+            (InstallStatus::Succeeded, Some(0), stdout, stderr)
+        }
         CommandOutcome::Failed {
             code,
             stdout,
@@ -573,11 +575,8 @@ mod tests {
         .unwrap_err();
         assert!(missing.contains("tool_not_found"), "{missing}");
 
-        let timeout = status(
-            dir.path(),
-            &FakeProbe::new(vec![CommandOutcome::Timeout]),
-        )
-        .unwrap_err();
+        let timeout =
+            status(dir.path(), &FakeProbe::new(vec![CommandOutcome::Timeout])).unwrap_err();
         assert!(timeout.contains("probe_timeout"), "{timeout}");
     }
 

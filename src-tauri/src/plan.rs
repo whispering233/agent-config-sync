@@ -222,9 +222,15 @@ fn read_manifest(sync_root: &Path) -> Result<Manifest, PlanFailure> {
 
     // 先单独看 formatVersion：结构不认识时也要报"版本不支持"，而不是"文件损坏"。
     let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
-        PlanFailure::new("manifest_corrupt", format!("manifest 不是合法 JSON：{error}"))
+        PlanFailure::new(
+            "manifest_corrupt",
+            format!("manifest 不是合法 JSON：{error}"),
+        )
     })?;
-    match value.get("formatVersion").and_then(serde_json::Value::as_u64) {
+    match value
+        .get("formatVersion")
+        .and_then(serde_json::Value::as_u64)
+    {
         Some(version) if version == u64::from(FORMAT_VERSION) => {}
         Some(version) => {
             return Err(PlanFailure::new(
@@ -240,8 +246,9 @@ fn read_manifest(sync_root: &Path) -> Result<Manifest, PlanFailure> {
         }
     }
 
-    serde_json::from_value(value)
-        .map_err(|error| PlanFailure::new("manifest_corrupt", format!("manifest 字段不完整：{error}")))
+    serde_json::from_value(value).map_err(|error| {
+        PlanFailure::new("manifest_corrupt", format!("manifest 字段不完整：{error}"))
+    })
 }
 
 /// 逐文件重算大小与哈希。返回（最多 [`MAX_LISTED_MISMATCHES`] 条明细, 不符总数）。
@@ -502,7 +509,10 @@ fn probe(app: &AppHandle, root: Option<String>) -> Result<PlanReport, PlanFailur
                 .map_err(|message| PlanFailure::new("root_not_allowed", message))?
         }
         None => config.sync_root.clone().ok_or_else(|| {
-            PlanFailure::new("sync_root_missing", "还没有设置同步文件夹，请先在设置页选择")
+            PlanFailure::new(
+                "sync_root_missing",
+                "还没有设置同步文件夹，请先在设置页选择",
+            )
         })?,
     };
 
@@ -511,9 +521,9 @@ fn probe(app: &AppHandle, root: Option<String>) -> Result<PlanReport, PlanFailur
     let home_dir = app.path().home_dir().ok();
     let resolved =
         config::resolve_agent_dir(&config, env_agent_dir.as_deref(), home_dir.as_deref());
-    let agent_dir = resolved
-        .path
-        .ok_or_else(|| PlanFailure::new("agent_dir_missing", "无法确定宿主目录，请先在设置页填写"))?;
+    let agent_dir = resolved.path.ok_or_else(|| {
+        PlanFailure::new("agent_dir_missing", "无法确定宿主目录，请先在设置页填写")
+    })?;
 
     plan_snapshot(&agent_dir, &sync_root, &ShellRunner::from_env())
 }
@@ -630,7 +640,12 @@ mod tests {
     fn dir_entries(root: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(root)
             .expect("读取目录")
-            .map(|item| item.expect("目录项").file_name().to_string_lossy().into_owned())
+            .map(|item| {
+                item.expect("目录项")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect();
         names.sort();
         names
@@ -746,8 +761,7 @@ mod tests {
         let (agent, sync_root) = fixture(&temp);
         let sync_before = dir_entries(&sync_root);
         let live_before = tree(&agent);
-        let manifest_before =
-            fs::read(sync_root.join(MANIFEST_FILE_NAME)).expect("读 manifest");
+        let manifest_before = fs::read(sync_root.join(MANIFEST_FILE_NAME)).expect("读 manifest");
 
         let target = sync_root.join("snapshot/settings.json");
         let mut bytes = fs::read(&target).expect("读取快照文件");
@@ -757,7 +771,11 @@ mod tests {
         let failure =
             plan_snapshot(&agent, &sync_root, &FakeRunner::ok()).expect_err("应报哈希不符");
         assert_eq!(failure.code, "hash_mismatch");
-        assert!(failure.message.contains("1 个文件不匹配"), "{}", failure.message);
+        assert!(
+            failure.message.contains("1 个文件不匹配"),
+            "{}",
+            failure.message
+        );
         assert_eq!(failure.mismatches.len(), 1);
         assert_eq!(failure.mismatches[0].path, "snapshot/settings.json");
         assert_eq!(failure.mismatches[0].reason, MismatchReason::Size);
@@ -814,11 +832,15 @@ mod tests {
         }
         fs::write(&manifest_path, manifest.to_string()).expect("写回 manifest");
 
-        let failure = plan_snapshot(&agent, &sync_root, &FakeRunner::ok())
-            .expect_err("25 条不符应中止");
+        let failure =
+            plan_snapshot(&agent, &sync_root, &FakeRunner::ok()).expect_err("25 条不符应中止");
         assert_eq!(failure.code, "hash_mismatch");
         assert_eq!(failure.mismatches.len(), MAX_LISTED_MISMATCHES);
-        assert!(failure.message.contains("25 个文件不匹配"), "{}", failure.message);
+        assert!(
+            failure.message.contains("25 个文件不匹配"),
+            "{}",
+            failure.message
+        );
     }
 
     #[test]
@@ -844,13 +866,15 @@ mod tests {
         assert!(failure.message.contains("99"), "{}", failure.message);
 
         fs::write(sync_root.join(MANIFEST_FILE_NAME), "not json").expect("写坏 manifest");
-        let failure =
-            plan_snapshot(&agent, &sync_root, &FakeRunner::ok()).expect_err("损坏应失败");
+        let failure = plan_snapshot(&agent, &sync_root, &FakeRunner::ok()).expect_err("损坏应失败");
         assert_eq!(failure.code, "manifest_corrupt");
 
         // 合法 JSON 但缺 formatVersion：同样是损坏。
-        fs::write(sync_root.join(MANIFEST_FILE_NAME), "{\"profileId\": \"default\"}")
-            .expect("写缺字段 manifest");
+        fs::write(
+            sync_root.join(MANIFEST_FILE_NAME),
+            "{\"profileId\": \"default\"}",
+        )
+        .expect("写缺字段 manifest");
         let failure =
             plan_snapshot(&agent, &sync_root, &FakeRunner::ok()).expect_err("缺字段应失败");
         assert_eq!(failure.code, "manifest_corrupt");
@@ -899,7 +923,9 @@ mod tests {
         assert_eq!(report.totals.snapshot_files, 4);
 
         // live 侧也有 auth.json，两个方向都不出现在计划里。
-        assert!(!paths(&report.plan.deleted).iter().any(|path| path == "auth.json"));
+        assert!(!paths(&report.plan.deleted)
+            .iter()
+            .any(|path| path == "auth.json"));
     }
 
     #[test]
