@@ -12,6 +12,7 @@ mod scope;
 mod secrets;
 mod snapshot;
 mod webdav;
+mod webdav_transfer;
 mod wizard;
 
 fn main() {
@@ -24,6 +25,7 @@ fn main() {
             commands::load_webdav_summary,
             commands::save_webdav_credentials,
             commands::test_webdav_connection,
+            commands::download_remote_snapshot,
             doctor::run_check,
             installer::preview_install,
             installer::install_or_upgrade,

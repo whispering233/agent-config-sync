@@ -3,8 +3,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { TriangleAlert } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card } from '../components/ui/card';
-import { loadAppConfig, type PathStatus } from '../lib/app-config';
-import { isDesktop } from '../lib/desktop';
+import { loadAppConfig, type PathStatus, type Transport } from '../lib/app-config';
+import { downloadRemoteSnapshot, isDesktop, type RemoteDownload } from '../lib/desktop';
 import { cn } from '../lib/utils';
 
 /** 与 Rust 侧 `SecretFinding` 一一对应；只含位置，不含密钥值。 */
@@ -167,7 +167,13 @@ type PlanFailure = {
 type ConfigState =
   | { kind: 'loading' }
   | { kind: 'browser' }
-  | { kind: 'ready'; syncRoot: string | null; status: PathStatus }
+  | { kind: 'ready'; syncRoot: string | null; status: PathStatus; transport: Transport }
+  | { kind: 'failed'; message: string };
+
+type DownloadState =
+  | { kind: 'idle' }
+  | { kind: 'downloading' }
+  | { kind: 'done'; view: RemoteDownload }
   | { kind: 'failed'; message: string };
 
 type ExportState =
@@ -290,6 +296,9 @@ function asRestoreFailure(error: unknown): RestoreFailure | null {
 
 export function SnapshotPage() {
   const [config, setConfig] = useState<ConfigState>({ kind: 'loading' });
+  const [downloaded, setDownloaded] = useState<DownloadState>({ kind: 'idle' });
+  /** 计划与应用的根：未下载时为 null（用同步根），下载后是暂存目录。 */
+  const [planRoot, setPlanRoot] = useState<string | null>(null);
   const [exported, setExported] = useState<ExportState>({ kind: 'idle' });
   const [planning, setPlanning] = useState<PlanState>({ kind: 'idle' });
   const [selected, setSelected] = useState<string[]>([]);
@@ -313,6 +322,7 @@ export function SnapshotPage() {
           kind: 'ready',
           syncRoot: view.config.syncRoot,
           status: view.validation.syncRootStatus,
+          transport: view.config.transport,
         });
       })
       .catch((error: unknown) => {
@@ -335,18 +345,22 @@ export function SnapshotPage() {
   }, []);
 
   const syncRoot = config.kind === 'ready' ? config.syncRoot : null;
+  const isWebdav = config.kind === 'ready' && config.transport === 'webdav';
   const exporting = exported.kind === 'exporting';
   const canExport = isDesktop && syncRoot !== null && !exporting;
+  const downloading = downloaded.kind === 'downloading';
+  const canDownload = isDesktop && isWebdav && !downloading;
   const checking = planning.kind === 'checking';
-  const canCheck = isDesktop && syncRoot !== null && !checking;
+  // 下载之后检查的是暂存快照，此时没有同步文件夹也能走完预览与应用。
+  const canCheck = isDesktop && (syncRoot !== null || planRoot !== null) && !checking;
 
-  async function runCheck() {
+  async function runCheck(root: string | null) {
     setPlanning({ kind: 'checking' });
     // 计划重算后旧的勾选与结果都不再对应，清空。
     setSelected([]);
     setApplying({ kind: 'idle' });
     try {
-      const report = await invoke<PlanReport>('verify_and_plan');
+      const report = await invoke<PlanReport>('verify_and_plan', { root });
       setPlanning({ kind: 'done', report });
     } catch (error) {
       const failure = asPlanFailure(error);
@@ -355,6 +369,19 @@ export function SnapshotPage() {
         message: failure?.message ?? errorMessage(error),
         mismatches: failure?.mismatches ?? [],
       });
+    }
+  }
+
+  async function runDownload() {
+    setDownloaded({ kind: 'downloading' });
+    try {
+      const view = await downloadRemoteSnapshot();
+      setDownloaded({ kind: 'done', view });
+      // 后面的检查与应用都针对这份暂存快照，不再指向同步文件夹。
+      setPlanRoot(view.stagingRoot);
+      await runCheck(view.stagingRoot);
+    } catch (error) {
+      setDownloaded({ kind: 'failed', message: errorMessage(error) });
     }
   }
 
@@ -368,6 +395,7 @@ export function SnapshotPage() {
       const report = await invoke<ApplyReport>('apply_snapshot', {
         expectedFingerprint: fingerprint,
         deletePaths: selected,
+        root: planRoot,
       });
       setApplying({ kind: 'done', report });
     } catch (error) {
@@ -488,6 +516,60 @@ export function SnapshotPage() {
         )}
       </Card>
 
+      {isWebdav && (
+        <Card className="p-lg">
+          <h2 className="text-sm font-semibold text-foreground">从 WebDAV 下载</h2>
+          <p className="mt-xs text-sm text-muted-foreground">
+            按远端 manifest 把快照取到本机暂存目录：逐文件核对字节数与 sha256，全部通过才写盘；不写本机配置。
+          </p>
+          <div className="mt-md flex flex-wrap items-center gap-md">
+            <Button onClick={() => void runDownload()} disabled={!canDownload}>
+              {downloading ? '下载中…' : '从 WebDAV 下载'}
+            </Button>
+            {!isDesktop && (
+              <span className="text-sm text-muted-foreground">下载仅桌面版可用</span>
+            )}
+            {downloading && (
+              <span className="text-sm text-muted-foreground" aria-live="polite">
+                正在读取远端 manifest 并下载快照文件…
+              </span>
+            )}
+          </div>
+
+          {downloaded.kind === 'failed' && (
+            <div className="mt-md flex flex-col gap-sm">
+              <p className="flex items-start gap-sm text-sm text-danger">
+                <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
+                <span>下载失败：{downloaded.message}</span>
+              </p>
+              <p className="text-xs text-muted-foreground">
+                失败即停：本次暂存目录已删除，本机配置与远端状态都保持原样；修正后可以重新下载。
+              </p>
+            </div>
+          )}
+
+          {downloaded.kind === 'done' && (
+            <div className="mt-md flex flex-col gap-sm">
+              <dl className="flex flex-col gap-sm">
+                <ResultRow label="远端指纹" value={downloaded.view.fingerprint} mono />
+                <ResultRow label="文件数" value={String(downloaded.view.fileCount)} />
+                <ResultRow label="快照创建时间" value={downloaded.view.createdAt} />
+                <ResultRow
+                  label="上次同步时间"
+                  value={
+                    downloaded.view.previousSeenAt ?? '首次下载：本机还没有远端记录'
+                  }
+                />
+                <ResultRow label="暂存目录" value={downloaded.view.stagingRoot} mono />
+              </dl>
+              <p className="text-xs text-muted-foreground">
+                下面的检查与应用都针对这份暂存快照；只保留最新的暂存目录。
+              </p>
+            </div>
+          )}
+        </Card>
+      )}
+
       <div className="flex flex-wrap items-center gap-md">
         <Button onClick={() => void runExport(false)} disabled={!canExport}>
           {exporting ? '导出中…' : '导出快照'}
@@ -508,7 +590,11 @@ export function SnapshotPage() {
           只读校验：重算快照每个文件的大小与哈希，再和本机配置比较，得出新增 / 修改 / 删除候选；不写任何文件。
         </p>
         <div className="mt-md flex flex-wrap items-center gap-md">
-          <Button variant="secondary" onClick={() => void runCheck()} disabled={!canCheck}>
+          <Button
+            variant="secondary"
+            onClick={() => void runCheck(planRoot)}
+            disabled={!canCheck}
+          >
             {checking ? '检查中…' : '检查快照'}
           </Button>
           {!isDesktop && (

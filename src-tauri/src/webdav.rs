@@ -321,8 +321,6 @@ impl<T: DavTransport> WebdavClient<T> {
     }
 
     /// 下载文件：404 → `Ok(None)`；成功时连响应头的 ETag 一起返回。
-    // 下载还没接到 UI（当前只有上传方向的探测与导出）；接线时连同 header_value 一并启用。
-    #[allow(dead_code)]
     pub fn get(&self, rel: &str) -> Result<Option<(Vec<u8>, Option<String>)>, DavError> {
         let response = self.transport.send(DavRequest {
             method: "GET".to_string(),
@@ -436,8 +434,6 @@ fn looks_like_quota(body: &[u8]) -> bool {
 }
 
 /// 响应头按名字取值，大小写不敏感。
-// 只服务 get：两处会在下载接线时一起启用。
-#[allow(dead_code)]
 fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
     headers
         .iter()
