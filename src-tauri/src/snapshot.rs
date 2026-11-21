@@ -416,7 +416,7 @@ pub fn fingerprint(format_version: u32, files: &[ManifestFile]) -> String {
         hasher.update(file.path.as_bytes());
         hasher.update([0u8]);
         hasher.update(file.sha256.as_bytes());
-        hasher.update([b'\n']);
+        hasher.update(*b"\n");
     }
 
     sha256_hex(&hasher.finalize())[..12].to_string()

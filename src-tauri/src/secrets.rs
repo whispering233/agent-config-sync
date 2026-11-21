@@ -377,7 +377,7 @@ fn is_reference(value: &str) -> bool {
         || (value.starts_with("${") && value.ends_with('}'))
         || value
             .strip_prefix('$')
-            .is_some_and(|rest| is_env_name(rest))
+            .is_some_and(is_env_name)
 }
 
 fn normalized_field(field: &str) -> String {

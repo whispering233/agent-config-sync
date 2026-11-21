@@ -174,7 +174,7 @@ fn basic_auth_header(username: &str, password: &str) -> String {
 fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-    let mut output = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let first = chunk[0] as u32;
         let second = chunk.get(1).copied().unwrap_or(0) as u32;
