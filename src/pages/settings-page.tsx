@@ -24,6 +24,8 @@ import {
   loadWebdavSummary,
   pickDirectory,
   saveWebdavCredentials,
+  testWebdavConnection,
+  type WebdavProbe,
   type WebdavSummary,
 } from '../lib/desktop';
 import { previewPathFindings } from '../lib/path-input';
@@ -860,6 +862,22 @@ type WebdavForm = {
 
 const EMPTY_WEBDAV_FORM: WebdavForm = { url: '', username: '', password: '' };
 
+/** 探测结果的一句话；`warn` 用来把「能连、删不掉」与真正失败分开。 */
+type ProbeNote = { tone: 'ok' | 'warn' | 'error'; text: string };
+
+function probeNote(probe: WebdavProbe): ProbeNote {
+  if (probe.leftoverWriteTestFile) {
+    return {
+      tone: 'warn',
+      text: '连接正常，但测试文件 .tmp-writetest 删不掉（账号可能只有读权限），请到网盘里手动删除',
+    };
+  }
+  if (probe.created) {
+    return { tone: 'ok', text: '连接正常，已创建 PiAgentSync 目录' };
+  }
+  return { tone: 'ok', text: '连接正常' };
+}
+
 /**
  * 凭据单独保存：它不参与配置校验，也不进快照。
  * 密码永远是空白输入框，只在输入非空时覆盖已保存的值。
@@ -868,6 +886,8 @@ function WebdavCard() {
   const [summary, setSummary] = useState<WebdavSummary | null>(null);
   const [form, setForm] = useState<WebdavForm>(EMPTY_WEBDAV_FORM);
   const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [probe, setProbe] = useState<ProbeNote | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
 
@@ -907,14 +927,19 @@ function WebdavCard() {
   function update(field: keyof WebdavForm, value: string) {
     setForm((current) => ({ ...current, [field]: value }));
     setError(null);
+    setProbe(null);
     setSaved(false);
   }
 
   const canSave =
     isDesktop &&
     !saving &&
+    !testing &&
     form.url.trim() !== '' &&
     form.username.trim() !== '';
+
+  // 测试与保存前置条件相同，而且同一时刻只跑一个，所以两个按钮共用一套判断。
+  const canTest = canSave;
 
   async function handleSave() {
     if (!canSave) {
@@ -940,6 +965,29 @@ function WebdavCard() {
     }
   }
 
+  async function handleTest() {
+    if (!canTest) {
+      return;
+    }
+
+    setTesting(true);
+    setError(null);
+    setProbe(null);
+    try {
+      const result = await testWebdavConnection({
+        url: form.url,
+        username: form.username,
+        // 空串代表"用已保存的密码"：后端按同一语义取值，不必先保存再测。
+        password: form.password === '' ? undefined : form.password,
+      });
+      setProbe(probeNote(result));
+    } catch (failure) {
+      setProbe({ tone: 'error', text: failureMessage(failure) });
+    } finally {
+      setTesting(false);
+    }
+  }
+
   return (
     <Card className="p-lg">
       <h2 className="text-sm font-semibold text-foreground">WebDAV 凭据</h2>
@@ -950,7 +998,7 @@ function WebdavCard() {
 
       {!isDesktop && (
         <p className="mt-md text-sm text-muted-foreground">
-          浏览器预览不读写本机凭据；桌面版才能保存。
+          浏览器预览不读写本机凭据；桌面版才能测试与保存。
         </p>
       )}
 
@@ -1020,7 +1068,22 @@ function WebdavCard() {
         <Button onClick={handleSave} disabled={!canSave}>
           {saving ? '保存中…' : '保存凭据'}
         </Button>
+        <Button variant="secondary" onClick={handleTest} disabled={!canTest}>
+          {testing ? '测试中…' : '测试连接'}
+        </Button>
         {saved && <span className="text-sm text-success">已保存</span>}
+        {probe !== null && (
+          <span
+            className={cn(
+              'text-sm',
+              probe.tone === 'ok' && 'text-success',
+              probe.tone === 'warn' && 'text-warning',
+              probe.tone === 'error' && 'text-danger',
+            )}
+          >
+            {probe.text}
+          </span>
+        )}
         {error !== null && <span className="text-sm text-danger">{error}</span>}
       </div>
     </Card>
