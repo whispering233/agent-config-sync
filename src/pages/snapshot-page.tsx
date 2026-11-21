@@ -4,7 +4,13 @@ import { TriangleAlert } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card } from '../components/ui/card';
 import { loadAppConfig, type PathStatus, type Transport } from '../lib/app-config';
-import { downloadRemoteSnapshot, isDesktop, type RemoteDownload } from '../lib/desktop';
+import {
+  downloadRemoteSnapshot,
+  isDesktop,
+  uploadSnapshot,
+  type RemoteDownload,
+  type RemoteUpload,
+} from '../lib/desktop';
 import { cn } from '../lib/utils';
 
 /** 与 Rust 侧 `SecretFinding` 一一对应；只含位置，不含密钥值。 */
@@ -176,6 +182,18 @@ type DownloadState =
   | { kind: 'done'; view: RemoteDownload }
   | { kind: 'failed'; message: string };
 
+/** 上传失败的结构与导出失败一致：`code` 区分明文密钥阻断，`findings` 只因此才有内容。 */
+type UploadFailure = ExportFailure;
+
+type UploadState =
+  | { kind: 'idle' }
+  | { kind: 'uploading' }
+  | { kind: 'uploaded'; view: Extract<RemoteUpload, { kind: 'uploaded' }> }
+  | { kind: 'conflict'; view: Extract<RemoteUpload, { kind: 'conflict' }> }
+  /** `overwrite` 记下用户当时的选择，确认明文后接着原路走。 */
+  | { kind: 'blocked'; failure: UploadFailure; overwrite: boolean }
+  | { kind: 'failed'; message: string };
+
 type ExportState =
   | { kind: 'idle' }
   | { kind: 'exporting' }
@@ -217,6 +235,9 @@ const APPLY_WARNING_LIMIT = 5;
 
 /** 备份卡片最多列出的份数；更旧的仍在磁盘上。 */
 const BACKUP_LIST_SHOWN = 5;
+
+/** 冲突清单最多列出的条数；其余只计数。 */
+const CONFLICT_LIST_LIMIT = 10;
 
 const mismatchReasonText: Record<HashMismatch['reason'], string> = {
   missing: '快照里没有这个文件',
@@ -297,6 +318,7 @@ function asRestoreFailure(error: unknown): RestoreFailure | null {
 export function SnapshotPage() {
   const [config, setConfig] = useState<ConfigState>({ kind: 'loading' });
   const [downloaded, setDownloaded] = useState<DownloadState>({ kind: 'idle' });
+  const [upload, setUpload] = useState<UploadState>({ kind: 'idle' });
   /** 计划与应用的根：未下载时为 null（用同步根），下载后是暂存目录。 */
   const [planRoot, setPlanRoot] = useState<string | null>(null);
   const [exported, setExported] = useState<ExportState>({ kind: 'idle' });
@@ -350,6 +372,8 @@ export function SnapshotPage() {
   const canExport = isDesktop && syncRoot !== null && !exporting;
   const downloading = downloaded.kind === 'downloading';
   const canDownload = isDesktop && isWebdav && !downloading;
+  const uploading = upload.kind === 'uploading';
+  const canUpload = isDesktop && isWebdav && !uploading;
   const checking = planning.kind === 'checking';
   // 下载之后检查的是暂存快照，此时没有同步文件夹也能走完预览与应用。
   const canCheck = isDesktop && (syncRoot !== null || planRoot !== null) && !checking;
@@ -377,11 +401,35 @@ export function SnapshotPage() {
     try {
       const view = await downloadRemoteSnapshot();
       setDownloaded({ kind: 'done', view });
+      // 刚对齐过远端，之前那份冲突提示已经过时。
+      setUpload({ kind: 'idle' });
       // 后面的检查与应用都针对这份暂存快照，不再指向同步文件夹。
       setPlanRoot(view.stagingRoot);
       await runCheck(view.stagingRoot);
     } catch (error) {
       setDownloaded({ kind: 'failed', message: errorMessage(error) });
+    }
+  }
+
+  async function runUpload(overwrite: boolean, allowPlaintext = false) {
+    setUpload({ kind: 'uploading' });
+    try {
+      const view = await uploadSnapshot(overwrite, allowPlaintext);
+      setUpload(
+        view.kind === 'conflict'
+          ? { kind: 'conflict', view }
+          : { kind: 'uploaded', view },
+      );
+    } catch (error) {
+      const failure = asFailure(error);
+      if (failure !== null && failure.code === 'secrets_unconfirmed') {
+        setUpload({ kind: 'blocked', failure, overwrite });
+        return;
+      }
+      setUpload({
+        kind: 'failed',
+        message: failure?.message ?? errorMessage(error),
+      });
     }
   }
 
@@ -518,7 +566,140 @@ export function SnapshotPage() {
 
       {isWebdav && (
         <Card className="p-lg">
-          <h2 className="text-sm font-semibold text-foreground">从 WebDAV 下载</h2>
+          <h2 className="text-sm font-semibold text-foreground">WebDAV</h2>
+          <p className="mt-xs text-sm text-muted-foreground">
+            上传把当前配置导出成快照推到远端；下载按远端 manifest 取回本机暂存目录。两边共用同一套快照格式与校验。
+          </p>
+
+          <div className="mt-md flex flex-wrap items-center gap-md">
+            <Button onClick={() => void runUpload(false)} disabled={!canUpload}>
+              {uploading ? '上传中…' : '上传到 WebDAV'}
+            </Button>
+            {!isDesktop && (
+              <span className="text-sm text-muted-foreground">上传仅桌面版可用</span>
+            )}
+            {uploading && (
+              <span className="text-sm text-muted-foreground" aria-live="polite">
+                正在导出快照、比对远端清单并上传变化的文件…
+              </span>
+            )}
+          </div>
+
+          {upload.kind === 'uploaded' && (
+            <div className="mt-md flex flex-col gap-sm">
+              <dl className="flex flex-col gap-sm">
+                <ResultRow label="远端指纹" value={upload.view.fingerprint} mono />
+                <ResultRow label="本次上传" value={`${upload.view.uploaded} 个文件`} />
+                <ResultRow
+                  label="已一致跳过"
+                  value={`${upload.view.skipped} 个文件`}
+                />
+                <ResultRow label="上次同步时间" value={upload.view.seenAt} />
+              </dl>
+              <p className="text-sm text-success">
+                上传完成：manifest 最后写入，远端现在指向这份快照。
+              </p>
+              <p className="text-xs text-muted-foreground">
+                旧快照里的多余文件不会自动删除；需要清理时在网盘里手动处理。
+              </p>
+            </div>
+          )}
+
+          {upload.kind === 'conflict' && (
+            <div className="mt-md flex flex-col gap-md rounded-md bg-surface-muted px-md py-sm">
+              <p className="flex items-start gap-sm text-sm text-warning">
+                <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
+                <span>
+                  {upload.view.remoteCorrupt ? (
+                    '远端 manifest 已损坏：还没有往远端写入任何内容，只能覆盖重建。'
+                  ) : (
+                    <>
+                      云端快照与本机记录不一致（远端指纹{' '}
+                      <span className="font-mono">{upload.view.remoteFingerprint}</span>
+                      ）：还没有往远端写入任何内容，先选一边再继续。
+                    </>
+                  )}
+                </span>
+              </p>
+              <ConflictDiff view={upload.view} />
+              <div className="flex flex-wrap gap-sm">
+                <Button onClick={() => void runUpload(true)} disabled={uploading}>
+                  覆盖云端
+                </Button>
+                {!upload.view.remoteCorrupt && (
+                  <Button
+                    variant="secondary"
+                    onClick={() => void runDownload()}
+                    disabled={!canDownload}
+                  >
+                    {downloading ? '下载中…' : '从云端更新'}
+                  </Button>
+                )}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                覆盖云端 = 用当前配置导出新快照替换远端；从云端更新 = 走下面的下载 → 检查 → 应用。
+              </p>
+            </div>
+          )}
+
+          {upload.kind === 'blocked' && (
+            <div className="mt-md flex flex-col gap-sm">
+              <p className="flex items-start gap-sm text-sm text-warning">
+                <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
+                <span>
+                  {upload.failure.message}；这些位置不会自动改写，确认后才会把明文带进远端快照。
+                </span>
+              </p>
+              <ul className="flex flex-col gap-sm">
+                {upload.failure.findings.map((finding) => (
+                  <li
+                    key={`${finding.path}-${finding.line}-${finding.field ?? ''}`}
+                    className="rounded-md bg-surface-muted px-md py-sm"
+                  >
+                    <p className="break-all font-mono text-xs text-foreground">
+                      {finding.path}:{finding.line}
+                    </p>
+                    <p className="mt-xs text-xs text-muted-foreground">
+                      {finding.field ?? '未识别字段'} ·{' '}
+                      {finding.level === 'high' ? '高危' : '提示'} · {finding.rule}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+              <div className="flex flex-wrap gap-sm">
+                <Button
+                  onClick={() => void runUpload(upload.overwrite, true)}
+                  disabled={uploading}
+                >
+                  仍然上传
+                </Button>
+                <Button
+                  variant="secondary"
+                  onClick={() => setUpload({ kind: 'idle' })}
+                  disabled={uploading}
+                >
+                  取消
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                更稳妥的做法是先把这些值改成 $NAME / ${'${NAME}'} 形式的引用，再重新上传。
+              </p>
+            </div>
+          )}
+
+          {upload.kind === 'failed' && (
+            <div className="mt-md flex flex-col gap-sm">
+              <p className="flex items-start gap-sm text-sm text-danger">
+                <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
+                <span>上传失败：{upload.message}</span>
+              </p>
+              <p className="text-xs text-muted-foreground">
+                失败停在原地：已上传的文件留在远端，但旧 manifest 仍指向旧快照；本机远端状态没有更新。
+              </p>
+            </div>
+          )}
+
+          <h3 className="mt-lg text-sm font-semibold text-foreground">从 WebDAV 下载</h3>
           <p className="mt-xs text-sm text-muted-foreground">
             按远端 manifest 把快照取到本机暂存目录：逐文件核对字节数与 sha256，全部通过才写盘；不写本机配置。
           </p>
@@ -1052,6 +1233,62 @@ function sourceText(source: PlanReport['manifestInfo']['source']): string {
   return `${source.app} · ${source.os}/${source.arch} · pi ${
     source.pi ?? '未知'
   } · node ${source.node ?? '未知'}`;
+}
+
+/** 冲突清单：只列文件名，完整路径放在悬停提示里。 */
+/** 冲突时把“差在哪”讲清楚：清单坏了、没有基准、或逐项列出三类变化。 */
+function ConflictDiff({ view }: { view: Extract<RemoteUpload, { kind: 'conflict' }> }) {
+  if (view.remoteCorrupt) {
+    return (
+      <p className="text-xs text-danger">
+        远端清单无法解析（多半是上次写入中断）。这里只能覆盖：会用当前配置重建整份快照。
+      </p>
+    );
+  }
+  if (view.added.length === 0 && view.modified.length === 0 && view.removed.length === 0) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        本机没有上次同步的记录（换机器或换过地址），算不出文件级差异；覆盖会把云端快照整份换成当前配置。
+      </p>
+    );
+  }
+  return (
+    <div className="flex flex-col gap-sm">
+      <ConflictList title="云端新增" paths={view.added} />
+      <ConflictList title="云端修改" paths={view.modified} />
+      <ConflictList title="云端删除" paths={view.removed} />
+    </div>
+  );
+}
+
+function ConflictList({ title, paths }: { title: string; paths: string[] }) {
+  if (paths.length === 0) {
+    return null;
+  }
+  const shown = paths.slice(0, CONFLICT_LIST_LIMIT);
+  return (
+    <div>
+      <h3 className="text-xs font-semibold text-foreground">
+        {title} {paths.length} 项
+      </h3>
+      <ul className="mt-xs flex flex-col gap-xs">
+        {shown.map((path) => (
+          <li
+            key={path}
+            title={path}
+            className="truncate font-mono text-xs text-foreground"
+          >
+            {path.split('/').pop() ?? path}
+          </li>
+        ))}
+      </ul>
+      {paths.length > shown.length && (
+        <p className="mt-xs text-xs text-muted-foreground">
+          还有 {paths.length - shown.length} 项
+        </p>
+      )}
+    </div>
+  );
 }
 
 /** 一组计划项：只列前 20 条，其余只报数量。 */

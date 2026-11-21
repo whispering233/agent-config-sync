@@ -26,6 +26,7 @@ fn main() {
             commands::save_webdav_credentials,
             commands::test_webdav_connection,
             commands::download_remote_snapshot,
+            commands::upload_snapshot,
             doctor::run_check,
             installer::preview_install,
             installer::install_or_upgrade,

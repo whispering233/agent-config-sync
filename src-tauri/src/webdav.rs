@@ -28,7 +28,12 @@ pub enum DavError {
     Quota,
     /// 网络、超时、其它 5xx。带上底层原因，便于用户自查 DNS/TLS/代理。
     Unreachable(String),
-    /// 其余状态（含 412 这类条件请求失败）与协议层错误。
+    /// 412：条件请求（`If-Match` / `If-None-Match`）不成立。
+    ///
+    /// 单独一类是因为它不代表网络失败，而是远端在本次操作期间被改写过；
+    /// 上传据此报 `remote_changed` 并停下，不重试。
+    PreconditionFailed,
+    /// 其余状态与协议层错误。
     Other(String),
 }
 
@@ -37,6 +42,9 @@ impl fmt::Display for DavError {
         match self {
             Self::AuthFailed => write!(formatter, "认证失败（凭据无效或权限不足）"),
             Self::Quota => write!(formatter, "远端空间或流量不足"),
+            Self::PreconditionFailed => {
+                write!(formatter, "远端在本次操作期间被改写（条件请求未通过）")
+            }
             Self::Unreachable(detail) | Self::Other(detail) => write!(formatter, "{detail}"),
         }
     }
@@ -420,6 +428,7 @@ fn error_for(status: u16, body: &[u8]) -> DavError {
 
     match status {
         401 | 403 => DavError::AuthFailed,
+        412 => DavError::PreconditionFailed,
         500..=599 => DavError::Unreachable(format!("服务端返回 HTTP {status}")),
         _ => DavError::Other(format!("服务端返回 HTTP {status}")),
     }
@@ -1084,13 +1093,13 @@ mod tests {
     }
 
     #[test]
-    fn put_reports_conditional_failure_as_other() {
+    fn put_reports_conditional_failure_as_precondition_failed() {
         let (client, _) = client(vec![Ok(response(412))]);
 
-        match client.put("snapshot/manifest.json", b"{}", &[]) {
-            Err(DavError::Other(detail)) => assert!(detail.contains("412")),
-            other => panic!("期望 Other，得到 {other:?}"),
-        }
+        assert_eq!(
+            client.put("snapshot/manifest.json", b"{}", &[]),
+            Err(DavError::PreconditionFailed)
+        );
     }
 
     #[test]
