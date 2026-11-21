@@ -6,15 +6,15 @@
 //!
 //! 绝不修改 shell 启动文件，绝不自动安装 Node，失败不自动重试也不换方案。
 //! 探测复用医生的 [`CommandRunner`]/[`ShellRunner`]；安装命令的执行走 [`GroupRunner`]，
-//! 因为它必须在超时后终止整个进程组（`curl | sh` 会派生孙进程，ShellRunner 只杀直接子进程）。
+//! 因为它必须在超时后终止整个进程树（`curl | sh` 会派生孙进程，Windows 上 npm 的子进程
+//! 也会留在 `cmd.exe` 之外）。
 
 use crate::config::{self, AGENT_DIR_ENV_VAR};
 use crate::doctor::{self, CommandOutcome, CommandRunner, ShellRunner, Version};
+use crate::platform::{self, HostOs, ProgramPath};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tauri::Manager;
 
@@ -104,90 +104,16 @@ pub trait InstallRunner {
     fn run(&self, argv: &[String], timeout: Duration) -> CommandOutcome;
 }
 
-/// 生产执行器：子进程独立成进程组，超时后终止整组。
+/// 生产执行器：POSIX 下子进程独立成进程组、超时整组终止；Windows 上超时按进程树终止。
 pub struct GroupRunner;
 
 impl InstallRunner for GroupRunner {
     fn run(&self, argv: &[String], timeout: Duration) -> CommandOutcome {
-        let Some((program, args)) = argv.split_first() else {
-            return CommandOutcome::Unavailable("命令为空".to_string());
-        };
-
-        let mut command = Command::new(program);
-        command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(&mut command, 0);
-
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => return CommandOutcome::Unavailable(error.to_string()),
-        };
-
-        let stdout_reader = child.stdout.take().map(read_async);
-        let stderr_reader = child.stderr.take().map(read_async);
-        let deadline = Instant::now() + timeout;
-
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) if Instant::now() >= deadline => {
-                    kill_group(&mut child);
-                    break None;
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                Err(error) => {
-                    kill_group(&mut child);
-                    return CommandOutcome::Unavailable(error.to_string());
-                }
-            }
-        };
-
-        let stdout = join_reader(stdout_reader);
-        let stderr = join_reader(stderr_reader);
-
-        match status {
-            Some(status) if status.success() => CommandOutcome::Ok { stdout, stderr },
-            Some(status) => CommandOutcome::Failed {
-                code: status.code(),
-                stdout,
-                stderr,
-            },
-            None => CommandOutcome::Timeout,
+        match platform::build_command(argv) {
+            Ok(command) => doctor::run_child(command, timeout, true),
+            Err(detail) => CommandOutcome::Unavailable(detail),
         }
     }
-}
-
-fn read_async(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
-    std::thread::spawn(move || {
-        let mut buffer = String::new();
-        let _ = pipe.read_to_string(&mut buffer);
-        buffer
-    })
-}
-
-fn join_reader(handle: Option<std::thread::JoinHandle<String>>) -> String {
-    handle
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default()
-}
-
-/// 先终止整个进程组，再兜底杀直接子进程并回收。
-fn kill_group(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        // 子进程是组长（`process_group(0)`），组号等于它的 pid。
-        let _ = Command::new("kill")
-            .arg("-KILL")
-            .arg("--")
-            .arg(format!("-{}", child.id()))
-            .status();
-    }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// 前置探测的输出。
@@ -221,6 +147,69 @@ echo "{PROBE_PREFIX}pi_path:$p"
 echo "{PROBE_PREFIX}pi_version:$([ -n "$p" ] && "$p" --version 2>/dev/null | head -n 1)"
 "#
     )
+}
+
+/// 前置探测：POSIX 用一条登录 shell 脚本，Windows 逐命令跑。
+fn probe(agent_dir: Option<&Path>, runner: &dyn CommandRunner) -> Result<Probe, String> {
+    if HostOs::current() == HostOs::Windows {
+        return probe_windows(agent_dir, runner, &ProgramPath::from_env());
+    }
+
+    let env = [(
+        "PI_INSTALL_AGENT_DIR",
+        agent_dir
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default(),
+    )];
+    let outcome = runner.run(&probe_script(), doctor::PROBE_TIMEOUT, &env);
+    probe_from_script(&outcome)
+}
+
+/// 脚本探测的失败原因沿用医生的文案：超时、起不来、一行都没打。
+fn probe_from_script(outcome: &CommandOutcome) -> Result<Probe, String> {
+    match outcome {
+        CommandOutcome::Timeout => Err("探测前置条件超时（probe_timeout），请重新检测".to_string()),
+        CommandOutcome::Unavailable(detail) => Err(format!("无法执行探测命令（{detail}）")),
+        CommandOutcome::Ok { stdout, .. } | CommandOutcome::Failed { stdout, .. } => {
+            parse_probe(stdout)
+                .ok_or_else(|| "探测没有返回结果（tool_broken），请重新检测".to_string())
+        }
+    }
+}
+
+/// Windows 的逐命令探测：node、npm、pi 各起一个进程，`.cmd` 中间层经 `cmd /C`。
+/// 程序按 PATH 与 PATHEXT 解析，pi 再兜底 `<agent_dir>/bin`；解析不到就是没装。
+fn probe_windows(
+    agent_dir: Option<&Path>,
+    runner: &dyn CommandRunner,
+    search: &ProgramPath,
+) -> Result<Probe, String> {
+    let mut probe = Probe::default();
+
+    if let Some(program) = search.find("node") {
+        probe.node_version = one_line(runner, &program, &["-p", "process.versions.node"])?;
+        probe.node_path = program.display().to_string();
+    }
+    if let Some(program) = search.find("npm") {
+        probe.npm_version = one_line(runner, &program, &["-v"])?;
+    }
+    if let Some(program) = doctor::find_pi(search, agent_dir, None) {
+        probe.pi_version = one_line(runner, &program, &["--version"])?;
+        probe.pi_path = program.display().to_string();
+    }
+
+    Ok(probe)
+}
+
+/// 取命令输出的第一行。超时或起不来就报整体失败：前置条件不完整时不给命令。
+fn one_line(runner: &dyn CommandRunner, program: &Path, args: &[&str]) -> Result<String, String> {
+    match doctor::probe_program(runner, program, args) {
+        CommandOutcome::Timeout => Err("探测前置条件超时（probe_timeout），请重新检测".to_string()),
+        CommandOutcome::Unavailable(detail) => Err(format!("无法执行探测命令（{detail}）")),
+        CommandOutcome::Ok { stdout, .. } | CommandOutcome::Failed { stdout, .. } => {
+            Ok(doctor::first_line(&stdout))
+        }
+    }
 }
 
 /// 只认带前缀的行，其余噪音一律丢弃。返回 `None` 表示探测一行都没打印。
@@ -267,12 +256,7 @@ fn select_command(os: &str, installed: bool, kind: InstallKind) -> Result<Instal
         };
         return Ok(InstallCommand {
             action,
-            argv: vec![
-                "npm".to_string(),
-                "i".to_string(),
-                "-g".to_string(),
-                package,
-            ],
+            argv: platform::program_argv(HostOs::Windows, "npm", &["i", "-g", &package])?,
         });
     }
 
@@ -302,6 +286,8 @@ fn select_command(os: &str, installed: bool, kind: InstallKind) -> Result<Instal
 }
 
 /// POSIX 命令统一走登录 shell：只有这样才拿得到 nvm/fnm/mise 的 PATH。
+/// Windows 的安装命令不经它：`npm` / `pi` 是 `.cmd` 中间层，整条命令行由
+/// [`platform::program_argv`] 按 `cmd /C` 拼，参数逐个转义。
 pub(crate) fn shell_argv(script: &str) -> Vec<String> {
     let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("sh"));
     vec![
@@ -309,6 +295,17 @@ pub(crate) fn shell_argv(script: &str) -> Vec<String> {
         "-lc".to_string(),
         script.to_string(),
     ]
+}
+
+/// 装一个包的命令。包名来自用户配置，必须按平台转义后再拼进命令行。
+pub(crate) fn install_package_argv(os: HostOs, source: &str) -> Result<Vec<String>, String> {
+    match os {
+        HostOs::Posix => Ok(shell_argv(&format!(
+            "pi install {}",
+            platform::sh_quote(source)
+        ))),
+        HostOs::Windows => platform::program_argv(HostOs::Windows, "pi", &["install", source]),
+    }
 }
 
 /// 托管安装看标记文件，npm 全局安装看入口路径。
@@ -319,7 +316,7 @@ fn install_kind(agent_dir: Option<&Path>, pi_path: &str) -> InstallKind {
 
     if marker.is_some() {
         InstallKind::Managed
-    } else if pi_path.contains("node_modules") {
+    } else if platform::is_npm_install_path(pi_path) {
         InstallKind::Npm
     } else {
         InstallKind::Unknown
@@ -328,19 +325,16 @@ fn install_kind(agent_dir: Option<&Path>, pi_path: &str) -> InstallKind {
 
 /// 探测前置条件并给出命令，不执行。
 pub fn preview(agent_dir: Option<&Path>, runner: &dyn CommandRunner) -> InstallPreview {
-    let env = [(
-        "PI_INSTALL_AGENT_DIR",
-        agent_dir
-            .map(|dir| dir.display().to_string())
-            .unwrap_or_default(),
-    )];
-    let outcome = runner.run(&probe_script(), doctor::PROBE_TIMEOUT, &env);
-
-    build_preview(agent_dir, std::env::consts::OS, &outcome)
+    let probe = probe(agent_dir, runner);
+    build_preview(agent_dir, std::env::consts::OS, probe)
 }
 
 /// 预览的纯逻辑部分，平台由调用方给定，便于单测覆盖命令选择矩阵。
-fn build_preview(agent_dir: Option<&Path>, os: &str, outcome: &CommandOutcome) -> InstallPreview {
+fn build_preview(
+    agent_dir: Option<&Path>,
+    os: &str,
+    probe: Result<Probe, String>,
+) -> InstallPreview {
     let mut preview = InstallPreview {
         node_version: None,
         npm_version: None,
@@ -351,21 +345,12 @@ fn build_preview(agent_dir: Option<&Path>, os: &str, outcome: &CommandOutcome) -
         blocking: Vec::new(),
     };
 
-    let stdout = match outcome {
-        CommandOutcome::Ok { stdout, .. } | CommandOutcome::Failed { stdout, .. } => stdout,
-        CommandOutcome::Timeout => {
-            preview.blocking = vec!["探测前置条件超时（probe_timeout），请重新检测".to_string()];
+    let probe = match probe {
+        Ok(probe) => probe,
+        Err(reason) => {
+            preview.blocking = vec![reason];
             return preview;
         }
-        CommandOutcome::Unavailable(detail) => {
-            preview.blocking = vec![format!("无法执行探测命令（{detail}）")];
-            return preview;
-        }
-    };
-
-    let Some(probe) = parse_probe(stdout) else {
-        preview.blocking = vec!["探测没有返回结果（tool_broken），请重新检测".to_string()];
-        return preview;
     };
 
     let min = doctor::MIN_NODE_VERSION;
@@ -684,8 +669,9 @@ mod tests {
         ))
     }
 
+    /// POSIX 预览：探测输出走脚本解析那条路，与生产一致。
     fn preview_for(agent_dir: Option<&Path>, os: &str, outcome: CommandOutcome) -> InstallPreview {
-        build_preview(agent_dir, os, &outcome)
+        build_preview(agent_dir, os, probe_from_script(&outcome))
     }
 
     fn script_of(command: &InstallCommand) -> &str {
@@ -719,20 +705,167 @@ mod tests {
         );
     }
 
+    /// 假逐命令执行器：按顺序回放结果并记录 argv；脚本入口一律不当真。
+    struct FakePrograms {
+        outcomes: RefCell<Vec<CommandOutcome>>,
+        calls: RefCell<Vec<Vec<String>>>,
+    }
+
+    impl FakePrograms {
+        fn new(outcomes: Vec<CommandOutcome>) -> Self {
+            Self {
+                outcomes: RefCell::new(outcomes),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// 记下来的 `cmd /C` 命令行原文。
+        fn lines(&self) -> Vec<String> {
+            self.calls
+                .borrow()
+                .iter()
+                .map(|argv| {
+                    assert_eq!(argv[0], "cmd", "Windows 上程序名必须是 cmd");
+                    assert_eq!(argv[1], "/C", "Windows 上参数必须是 /C");
+                    argv[2].clone()
+                })
+                .collect()
+        }
+    }
+
+    impl CommandRunner for FakePrograms {
+        fn run(
+            &self,
+            _script: &str,
+            _timeout: Duration,
+            _env: &[(&str, String)],
+        ) -> CommandOutcome {
+            CommandOutcome::Unavailable("Windows 探测不该走脚本入口".to_string())
+        }
+
+        fn run_program(
+            &self,
+            argv: &[String],
+            _timeout: Duration,
+            _env: &[(&str, String)],
+        ) -> CommandOutcome {
+            self.calls.borrow_mut().push(argv.to_vec());
+            let mut outcomes = self.outcomes.borrow_mut();
+            if outcomes.is_empty() {
+                CommandOutcome::Timeout
+            } else {
+                outcomes.remove(0)
+            }
+        }
+    }
+
+    /// Windows 的 PATH 与 PATHEXT 替身。
+    fn windows_search(dirs: &[&Path]) -> ProgramPath {
+        ProgramPath::new(
+            dirs.iter().map(|dir| dir.to_path_buf()).collect(),
+            vec![".cmd".to_string(), ".exe".to_string(), ".bat".to_string()],
+        )
+    }
+
     #[test]
-    fn windows_always_uses_npm() {
+    fn windows_probe_runs_each_command() {
+        let dir = TempDir::new("windows-probe");
+        let bin = dir.path().join("bin");
+        let global = dir
+            .path()
+            .join("node_modules/@earendil-works/pi-coding-agent");
+        fs::create_dir_all(&bin).expect("建目录");
+        fs::create_dir_all(&global).expect("建目录");
+        fs::write(bin.join("node.exe"), "").expect("写文件");
+        fs::write(bin.join("npm.cmd"), "").expect("写文件");
+        fs::write(global.join("pi.cmd"), "").expect("写文件");
+        let search = windows_search(&[&bin, &global]);
+
+        let runner = FakePrograms::new(vec![ok("22.23.0\n"), ok("10.9.2\n"), ok("1.5.2\n")]);
+        let probe = probe_windows(None, &runner, &search).unwrap();
+
+        let node = bin.join("node.exe").display().to_string();
+        let npm = bin.join("npm.cmd").display().to_string();
+        let pi = global.join("pi.cmd").display().to_string();
+        assert_eq!(
+            runner.lines(),
+            vec![
+                format!("\"{node}\" \"-p\" \"process.versions.node\""),
+                format!("\"{npm}\" \"-v\""),
+                format!("\"{pi}\" \"--version\""),
+            ]
+        );
+        assert_eq!(probe.node_path, node);
+        assert_eq!(probe.node_version, "22.23.0");
+        assert_eq!(probe.npm_version, "10.9.2");
+        assert_eq!(probe.pi_path, pi);
+        assert_eq!(probe.pi_version, "1.5.2");
+
+        let preview = build_preview(None, "windows", Ok(probe));
+        assert_eq!(preview.install_kind, Some(InstallKind::Npm));
+        assert_eq!(
+            preview.command.expect("已装 pi 给出升级命令").argv[2],
+            "\"npm\" \"i\" \"-g\" \"@earendil-works/pi-coding-agent@latest\""
+        );
+    }
+
+    #[test]
+    fn windows_probe_reports_missing_and_timeout() {
+        let dir = TempDir::new("windows-probe-missing");
+        let search = windows_search(&[dir.path()]);
+        let runner = FakePrograms::new(Vec::new());
+
+        let probe = probe_windows(None, &runner, &search).unwrap();
+        assert!(runner.lines().is_empty(), "解析不到程序就不起进程");
+
+        let preview = build_preview(None, "windows", Ok(probe));
+        assert!(preview.command.is_none());
+        assert!(
+            preview.blocking[0].contains("Node"),
+            "{:?}",
+            preview.blocking
+        );
+
+        // 解析到了但超时：整体按 probe_timeout 上报，不给命令。
+        fs::write(dir.path().join("node.exe"), "").expect("写文件");
+        let runner = FakePrograms::new(vec![CommandOutcome::Timeout]);
+        let error = probe_windows(None, &runner, &search).unwrap_err();
+        assert!(error.contains("probe_timeout"), "{error}");
+    }
+
+    #[test]
+    fn windows_npm_layout_counts_as_npm_install() {
+        assert_eq!(
+            install_kind(
+                None,
+                "C:\\Users\\u\\AppData\\Roaming\\npm\\node_modules\\@earendil-works\\pi-coding-agent\\bin\\pi.cmd"
+            ),
+            InstallKind::Npm
+        );
+        assert_eq!(
+            install_kind(None, "C:\\Users\\u\\.pi\\agent\\bin\\pi.cmd"),
+            InstallKind::Unknown
+        );
+    }
+
+    #[test]
+    fn windows_always_uses_npm_through_cmd() {
         let install = select_command("windows", false, InstallKind::Unknown).unwrap();
         assert_eq!(install.action, InstallAction::Install);
         assert_eq!(
             install.argv,
-            vec!["npm", "i", "-g", "@earendil-works/pi-coding-agent"]
+            vec![
+                "cmd".to_string(),
+                "/C".to_string(),
+                "\"npm\" \"i\" \"-g\" \"@earendil-works/pi-coding-agent\"".to_string()
+            ]
         );
 
         let upgrade = select_command("windows", true, InstallKind::Npm).unwrap();
         assert_eq!(upgrade.action, InstallAction::Upgrade);
         assert_eq!(
-            upgrade.argv,
-            vec!["npm", "i", "-g", "@earendil-works/pi-coding-agent@latest"]
+            upgrade.argv[2],
+            "\"npm\" \"i\" \"-g\" \"@earendil-works/pi-coding-agent@latest\""
         );
     }
 

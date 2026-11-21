@@ -1119,15 +1119,16 @@ fn skills_check(agent_dir: Option<&Path>) -> Check {
 }
 
 /// 统计 `skills/` 下的链接类条目与断链，返回 (链接数, 断链名)。
-/// Windows 的 junction 也算链接，所以判定走 [`platform::is_link_like`]。
+/// Windows 的 junction 也算链接，所以判定走 [`platform::link_like`]。
 pub fn skills_links(skills: &Path) -> Result<(usize, Vec<String>), std::io::Error> {
     let mut links = 0;
     let mut broken = Vec::new();
 
     for entry in fs::read_dir(skills)? {
         let entry = entry?;
+        let file_type = entry.file_type()?;
         let path = entry.path();
-        if !platform::is_link_like(&path) {
+        if !platform::link_like(file_type.is_symlink(), &fs::read_link(&path)) {
             continue;
         }
         links += 1;

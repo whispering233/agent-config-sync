@@ -6,7 +6,7 @@
 
 use crate::doctor::{self, CommandOutcome, CommandRunner, ShellRunner};
 use crate::installer::{self, GroupRunner, InstallRunner, InstallStatus};
-use crate::platform;
+use crate::platform::{HostOs, ProgramPath};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::fs;
@@ -148,6 +148,22 @@ fn installed_packages(
     agent_dir: &Path,
     runner: &dyn CommandRunner,
 ) -> Result<Vec<InstalledPackage>, String> {
+    let stdout = if HostOs::current() == HostOs::Windows {
+        pi_list_windows(agent_dir, runner, &ProgramPath::from_env())?
+    } else {
+        pi_list_scripted(runner)?
+    };
+
+    parse_user_packages(&stdout).map(|mut installed| {
+        for item in &mut installed {
+            item.version = installed_package_version(agent_dir, &item.path);
+        }
+        installed
+    })
+}
+
+/// POSIX：一条登录 shell 脚本，找不到 pi 时打印标记，输出里混着脚本噪音。
+fn pi_list_scripted(runner: &dyn CommandRunner) -> Result<String, String> {
     let stdout = match runner.run(&pi_list_script(), doctor::PROBE_TIMEOUT, &[]) {
         CommandOutcome::Ok { stdout, .. } | CommandOutcome::Failed { stdout, .. } => stdout,
         CommandOutcome::Timeout => {
@@ -162,12 +178,26 @@ fn installed_packages(
         return Err("tool_not_found：找不到 pi 命令，无法读取实装列表".to_string());
     }
 
-    parse_user_packages(&stdout).map(|mut installed| {
-        for item in &mut installed {
-            item.version = installed_package_version(agent_dir, &item.path);
+    Ok(stdout)
+}
+
+/// Windows：解析到 `pi.cmd` 就直接跑 `pi list`，没有标记可用。
+fn pi_list_windows(
+    agent_dir: &Path,
+    runner: &dyn CommandRunner,
+    search: &ProgramPath,
+) -> Result<String, String> {
+    let Some(program) = doctor::find_pi(search, Some(agent_dir), None) else {
+        return Err("tool_not_found：找不到 pi 命令，无法读取实装列表".to_string());
+    };
+
+    match doctor::probe_program(runner, &program, &["list"]) {
+        CommandOutcome::Ok { stdout, .. } | CommandOutcome::Failed { stdout, .. } => Ok(stdout),
+        CommandOutcome::Timeout => Err("probe_timeout：pi list 超时（5 秒），未重试".to_string()),
+        CommandOutcome::Unavailable(detail) => {
+            Err(format!("tool_broken：无法执行 pi list（{detail}）"))
         }
-        installed
-    })
+    }
 }
 
 /// 版本号读自安装目录的 `package.json`。
@@ -267,11 +297,19 @@ pub fn align(
         }
     }
 
+    // 包名先全部按平台转义好：有一条过不了就一行命令都不执行。
+    let mut commands = Vec::with_capacity(sources.len());
+    for source in sources {
+        commands.push((
+            source,
+            installer::install_package_argv(HostOs::current(), source)?,
+        ));
+    }
+
     let mut results = Vec::new();
     let mut completed = true;
 
-    for source in sources {
-        let argv = installer::shell_argv(&format!("pi install {}", platform::sh_quote(source)));
+    for (source, argv) in commands {
         let result = align_result(source, runner.run(&argv, installer::EXEC_TIMEOUT));
         if result.status != InstallStatus::Succeeded {
             completed = false;
@@ -400,10 +438,11 @@ mod tests {
         }
     }
 
-    /// 假探测执行器：按调用顺序回放 `pi list` 的结果，并记录收到的脚本。
+    /// 假探测执行器：按调用顺序回放 `pi list` 的结果，并记录收到的脚本与 argv。
     struct FakeProbe {
         outcomes: RefCell<Vec<CommandOutcome>>,
         calls: RefCell<Vec<String>>,
+        programs: RefCell<Vec<Vec<String>>>,
     }
 
     impl FakeProbe {
@@ -411,6 +450,7 @@ mod tests {
             Self {
                 outcomes: RefCell::new(outcomes),
                 calls: RefCell::new(Vec::new()),
+                programs: RefCell::new(Vec::new()),
             }
         }
 
@@ -422,11 +462,30 @@ mod tests {
         fn calls(&self) -> Vec<String> {
             self.calls.borrow().clone()
         }
+
+        fn programs(&self) -> Vec<Vec<String>> {
+            self.programs.borrow().clone()
+        }
     }
 
     impl CommandRunner for FakeProbe {
         fn run(&self, script: &str, _timeout: Duration, _env: &[(&str, String)]) -> CommandOutcome {
             self.calls.borrow_mut().push(script.to_string());
+            let mut outcomes = self.outcomes.borrow_mut();
+            if outcomes.is_empty() {
+                CommandOutcome::Timeout
+            } else {
+                outcomes.remove(0)
+            }
+        }
+
+        fn run_program(
+            &self,
+            argv: &[String],
+            _timeout: Duration,
+            _env: &[(&str, String)],
+        ) -> CommandOutcome {
+            self.programs.borrow_mut().push(argv.to_vec());
             let mut outcomes = self.outcomes.borrow_mut();
             if outcomes.is_empty() {
                 CommandOutcome::Timeout
@@ -694,6 +753,71 @@ mod tests {
         let timeout =
             status(dir.path(), &FakeProbe::new(vec![CommandOutcome::Timeout])).unwrap_err();
         assert!(timeout.contains("probe_timeout"), "{timeout}");
+    }
+
+    #[test]
+    fn windows_pi_list_runs_directly() {
+        let dir = TempDir::new("windows-pi-list");
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).expect("建目录");
+        // pi 只在 `<agent_dir>/bin` 下：PATH 里没有。
+        fs::write(bin.join("pi.cmd"), "").expect("写文件");
+        let search = ProgramPath::new(vec![], vec![".cmd".to_string(), ".exe".to_string()]);
+
+        let runner = FakeProbe::new(vec![ok(&user_list(&[("npm:pi-lens", "C:\\npm\\pi-lens")]))]);
+        let stdout = pi_list_windows(dir.path(), &runner, &search).unwrap();
+
+        assert!(stdout.contains("npm:pi-lens"));
+        assert!(runner.calls().is_empty(), "Windows 上不拼脚本");
+        let programs = runner.programs();
+        assert_eq!(programs.len(), 1);
+        assert_eq!(programs[0][0], "cmd");
+        assert_eq!(programs[0][1], "/C");
+        assert_eq!(
+            programs[0][2],
+            format!("\"{}\" \"list\"", bin.join("pi.cmd").display())
+        );
+    }
+
+    #[test]
+    fn windows_pi_list_without_pi_is_tool_not_found() {
+        let dir = TempDir::new("windows-pi-list-missing");
+        let search = ProgramPath::new(vec![], vec![".cmd".to_string()]);
+
+        let error = pi_list_windows(dir.path(), &FakeProbe::new(Vec::new()), &search).unwrap_err();
+
+        assert!(error.contains("tool_not_found"), "{error}");
+    }
+
+    #[test]
+    fn align_commands_are_quoted_per_platform() {
+        assert_eq!(
+            installer::install_package_argv(HostOs::Windows, "npm:pi-lens").unwrap(),
+            vec![
+                "cmd".to_string(),
+                "/C".to_string(),
+                "\"pi\" \"install\" \"npm:pi-lens\"".to_string()
+            ]
+        );
+        assert_eq!(
+            installer::install_package_argv(HostOs::Posix, "npm:o'brien").unwrap(),
+            vec![
+                std::env::var_os("SHELL")
+                    .unwrap_or_else(|| "sh".into())
+                    .to_string_lossy()
+                    .into_owned(),
+                "-lc".to_string(),
+                "pi install 'npm:o'\\''brien'".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn align_rejects_package_names_cmd_would_expand() {
+        for source in ["npm:a%b", "npm:a\"b", "npm:a&b", "npm:a|b", "npm:a^b"] {
+            let error = installer::install_package_argv(HostOs::Windows, source).unwrap_err();
+            assert!(error.contains("拒绝执行"), "{source}: {error}");
+        }
     }
 
     #[test]
