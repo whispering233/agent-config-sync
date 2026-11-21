@@ -23,9 +23,11 @@
 - 冲突文件扫描（只读）：命名识别、配对与差异摘要。
 - Linux 分发：deb 与 AppImage 打包、关于页、release 去符号。
 - CI：提交验证、tag 建 Release、Linux 打包上传资产。
+- WebDAV 传输：凭据单独存放、连通性探测、增量上传、下载到暂存、冲突判定与覆盖确认。
+- 设置页：传输方式切换与 WebDAV 凭据管理（含坚果云预设）。
 
 ### Note
 
-- 仅面向 Linux；Windows/macOS 未打包。WebDAV 传输与分享包尚未实现。
+- 仅面向 Linux；Windows/macOS 未打包。分享包尚未实现。
 - 安装包未签名；图标为占位图。
 - AppImage 打包需要从 GitHub 下载 type2 runtime，网络受限时会失败（deb 不受影响）。
