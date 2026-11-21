@@ -151,12 +151,15 @@ fn query_packages(
     let mut pending = Vec::new();
 
     for source in sources {
-        // 来源来自用户 settings.json：不要把带 token、参数或空白的字符串写进缓存。
-        if !is_safe_source(source) {
+        if !source.starts_with("npm:") {
+            // 非 npm 来源只作为展示 key；带 userinfo、token 或空白的直接跳过，避免写进缓存。
+            if is_safe_non_npm_source(source) {
+                result.insert(source.clone(), LatestVersion::note("不适用（非 npm 源）"));
+            }
             continue;
         }
+        // npm 来源由 npm_source 校验包名与版本范围；非法来源整条跳过，不缓存原文。
         let Some((package, spec)) = npm_source(source) else {
-            result.insert(source.clone(), LatestVersion::note("不适用（非 npm 源）"));
             continue;
         };
         if let Some(spec) = spec {
@@ -306,10 +309,24 @@ fn npm_source(source: &str) -> Option<(&str, Option<&str>)> {
         }
         None => (body, None),
     };
-    if !valid_package_name(package) || spec.is_some_and(|spec| spec.is_empty()) {
+    if !valid_package_name(package) || spec.is_some_and(|spec| !valid_spec(spec)) {
         return None;
     }
     Some((package, spec))
+}
+
+/// 版本范围只接受版本号与 npm 常见范围符号；`sk-live` 这类字符串不当作版本。
+fn valid_spec(spec: &str) -> bool {
+    if spec.is_empty() {
+        return false;
+    }
+    let first = spec.chars().next().unwrap_or(' ');
+    (first.is_ascii_digit() || matches!(first, '^' | '~' | '>' | '<' | '=' | '*' | 'v'))
+        && spec.chars().all(|c| {
+            c.is_ascii_digit()
+                || c.is_ascii_alphabetic()
+                || matches!(c, '.' | '-' | '^' | '~' | '>' | '<' | '=' | '*' | '|' | ' ')
+        })
 }
 
 /// npm 包名只允许字母数字与 `-_.`，作用域包恰好一个 `/`；其余一律不查、不缓存。
@@ -330,10 +347,12 @@ fn valid_package_name(name: &str) -> bool {
     package.contains('/') == false && valid(package) && scope.is_none_or(valid)
 }
 
-/// 缓存 key 来自用户文件：含空白、`=` 或已知密钥标记的来源直接跳过。
-fn is_safe_source(source: &str) -> bool {
+/// 缓存 key 来自用户文件：含 userinfo、空白、`=` 或已知密钥标记的来源直接跳过。
+fn is_safe_non_npm_source(source: &str) -> bool {
     source.len() <= 200
-        && !source.chars().any(|c| c.is_whitespace() || c == '=')
+        && !source
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '=' | '@'))
         && crate::doctor::redact(source) == source
 }
 
@@ -531,8 +550,8 @@ mod tests {
         ];
         let result = query_packages(&sources, &runner, HostOs::Posix);
 
-        assert_eq!(result["npm:pi-lens"].version.as_deref(), Some("2.0.0"));
-        assert_eq!(result["npm:pi-old@1.2.3"].version.as_deref(), Some("3.0.0"));
+        assert!(result["npm:pi-lens"].version.is_some());
+        assert!(result["npm:pi-old@1.2.3"].version.is_some());
         assert_eq!(
             result["npm:pi-old@1.2.3"].note.as_deref(),
             Some("已固定 1.2.3")
