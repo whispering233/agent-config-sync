@@ -55,6 +55,8 @@ pub struct RestoreReport {
     pub restored: usize,
     /// 删除应用新增路径的条数。
     pub removed: usize,
+    /// 还原时退化处理的说明：目前只有「链接建不成、按目标物化」一种。
+    pub warnings: Vec<String>,
     pub failed_at: Option<String>,
 }
 
@@ -142,6 +144,24 @@ pub fn restore(
     backup_id: &str,
     confirm: bool,
 ) -> Result<RestoreReport, RestoreFailure> {
+    restore_with(
+        agent_dir,
+        app_data_dir,
+        backup_id,
+        confirm,
+        &apply::PlatformLinkCreator,
+    )
+}
+
+/// 与 [`restore`] 相同，只是把建链接这一步交给注入的实现：测试要覆盖
+/// 「平台不允许建链接」这条常规路径（Windows 默认权限），靠改权限碰运气不合适。
+fn restore_with(
+    agent_dir: &Path,
+    app_data_dir: &Path,
+    backup_id: &str,
+    confirm: bool,
+    link_creator: &dyn apply::LinkCreator,
+) -> Result<RestoreReport, RestoreFailure> {
     if !confirm {
         return Err(RestoreFailure::new(
             "not_confirmed",
@@ -197,9 +217,10 @@ pub fn restore(
 
     let mut restored = 0;
     let mut removed = 0;
+    let mut warnings: Vec<String> = Vec::new();
     for entry in &manifest.entries {
         let outcome = if entry.existed {
-            restore_entry(agent_dir, &backup_dir, entry)
+            restore_entry(agent_dir, &backup_dir, entry, &mut warnings, link_creator)
         } else {
             remove_added(agent_dir, entry)
         };
@@ -226,6 +247,7 @@ pub fn restore(
         safety_backup_id,
         restored,
         removed,
+        warnings,
         failed_at: None,
     })
 }
@@ -237,7 +259,13 @@ fn in_scope(agent_dir: &Path, relative: &str) -> bool {
 }
 
 /// 按记录反做一条：链接重建、文件写回内容与权限、目录补齐。
-fn restore_entry(agent_dir: &Path, backup_dir: &Path, entry: &RestoreEntry) -> io::Result<()> {
+fn restore_entry(
+    agent_dir: &Path,
+    backup_dir: &Path,
+    entry: &RestoreEntry,
+    warnings: &mut Vec<String>,
+    link_creator: &dyn apply::LinkCreator,
+) -> io::Result<()> {
     let target = resolve(agent_dir, &entry.path)?;
     match entry.kind {
         RestoreKind::Symlink => {
@@ -247,12 +275,28 @@ fn restore_entry(agent_dir: &Path, backup_dir: &Path, entry: &RestoreEntry) -> i
                 .ok_or_else(|| io::Error::other(format!("{} 的记录里没有链接目标", entry.path)))?;
             remove_any(&target)?;
             // Windows 建链接要按目标类型分开调；目标此刻通常已存在，按它定类型。
-            let is_dir = target
+            let resolved = target
                 .parent()
                 .map(|parent| parent.join(link_target))
-                .and_then(|path| fs::metadata(path).ok())
-                .is_some_and(|metadata| metadata.is_dir());
-            platform::create_link(link_target, &target, is_dir)
+                .unwrap_or_else(|| PathBuf::from(link_target));
+            let is_dir = fs::metadata(&resolved).is_ok_and(|metadata| metadata.is_dir());
+            match link_creator.create_link(link_target, &target, is_dir) {
+                Ok(()) => Ok(()),
+                // 默认权限的 Windows 建不了链接：目标还在，按它的内容物化，内容不丢。
+                // 与 apply 建不成链接时的回退一致，只是把链接换成真实文件并告警。
+                Err(link_error) => {
+                    apply::materialize_subtree(&resolved, &target).map_err(|fallback| {
+                        io::Error::other(format!(
+                            "重建链接失败（{link_error}），按链接目标物化也失败（{fallback}）"
+                        ))
+                    })?;
+                    warnings.push(format!(
+                        "{} 无法重建为链接（{link_error}），已按链接目标物化",
+                        entry.path
+                    ));
+                    Ok(())
+                }
+            }
         }
         RestoreKind::Dir => ensure_dir(&target),
         RestoreKind::File => {
@@ -545,6 +589,42 @@ mod tests {
     fn read_restore(backup_dir: &Path) -> RestoreManifest {
         let text = fs::read_to_string(backup_dir.join(RESTORE_FILE_NAME)).expect("读 restore.json");
         serde_json::from_str(&text).expect("restore.json 应是合法 JSON")
+    }
+
+    /// 建链接一律失败的替身：模拟 Windows 默认权限下的 `ERROR_PRIVILEGE_NOT_HELD`。
+    struct NoLinkCreator;
+
+    impl crate::apply::LinkCreator for NoLinkCreator {
+        fn create_link(&self, _target: &str, _path: &Path, _is_dir: bool) -> io::Result<()> {
+            Err(io::Error::other("客户端没有所需的特权。 (os error 1314)"))
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_that_cannot_be_rebuilt_is_materialized_from_its_target() {
+        let temp = TempDir::new("link-fallback");
+        let agent = temp.path().join("agent");
+        let data = app_data(&temp);
+        // 被删掉的链接记录：目标还在，内容不能丢。
+        write_file(&temp.path().join("outside/keep.txt"), "外部内容\n");
+        let mut entry = file_entry("skills/stale", true, 0o600);
+        entry.kind = RestoreKind::Symlink;
+        entry.mode = None;
+        entry.link_target = Some(temp.path().join("outside").display().to_string());
+        craft_backup(&data, "2026-01-01T00-00-00Z", &manifest(vec![entry]));
+
+        let report = restore_with(&agent, &data, "2026-01-01T00-00-00Z", true, &NoLinkCreator)
+            .expect("建不成链接时应按目标物化");
+
+        assert_eq!(report.restored, 1);
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(report.warnings[0].contains("已按链接目标物化"));
+        assert_eq!(
+            fs::read_to_string(agent.join("skills/stale/keep.txt")).expect("读物化内容"),
+            "外部内容\n",
+            "按链接目标写出真实文件"
+        );
     }
 
     #[test]

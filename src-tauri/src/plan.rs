@@ -11,8 +11,8 @@ use crate::doctor::{self, CommandOutcome, CommandRunner, ShellRunner, Version, P
 use crate::platform::{HostOs, ProgramPath};
 use crate::scope::{self, EntryKind};
 use crate::snapshot::{
-    self, Manifest, ManifestFile, ManifestSymlink, Requirements, SourceInfo, FORMAT_VERSION,
-    MANIFEST_FILE_NAME, SNAPSHOT_DIR_NAME,
+    self, Manifest, ManifestFile, Requirements, SourceInfo, FORMAT_VERSION, MANIFEST_FILE_NAME,
+    SNAPSHOT_DIR_NAME,
 };
 use crate::webdav_transfer;
 use serde::Serialize;
@@ -40,6 +40,14 @@ pub enum PlanCategory {
     Deleted,
 }
 
+/// 计划项在磁盘上的形态。删除链接只删链接本身，不碰目标。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanKind {
+    File,
+    Link,
+}
+
 /// 计划项。路径相对宿主目录。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,7 +55,8 @@ pub struct PlanItem {
     /// 相对宿主目录的路径，`/` 分隔。
     pub path: String,
     pub category: PlanCategory,
-    /// 快照侧字节数；`deleted` 时是 live 侧字节数。
+    pub kind: PlanKind,
+    /// 快照侧字节数；`deleted` 时是 live 侧字节数，链接记 0。
     pub size: u64,
     pub snapshot_sha256: Option<String>,
     pub live_sha256: Option<String>,
@@ -183,7 +192,7 @@ pub fn plan_snapshot(
         });
     }
 
-    let live = live_files(agent_dir, &manifest.symlinks)?;
+    let live = live_scan(agent_dir, &manifest)?;
     let (plan, totals) = build_plan(&manifest.files, &live);
 
     Ok(PlanReport {
@@ -305,11 +314,15 @@ struct LiveFile {
     sha256: Option<String>,
 }
 
+/// live 侧扫描结果。
+struct LiveScan {
+    files: BTreeMap<String, LiveFile>,
+    /// 快照没声明的链接：只能删链接本身，所以只记路径，目标内容永不读取。
+    undeclared_links: Vec<String>,
+}
+
 /// 按受管范围扫 live 并算哈希。范围外文件永不读取。
-fn live_files(
-    agent_dir: &Path,
-    manifest_symlinks: &[ManifestSymlink],
-) -> Result<BTreeMap<String, LiveFile>, PlanFailure> {
+fn live_scan(agent_dir: &Path, manifest: &Manifest) -> Result<LiveScan, PlanFailure> {
     let scanned = scope::scan(agent_dir).map_err(|error| {
         PlanFailure::new(
             "agent_dir_unreadable",
@@ -317,18 +330,27 @@ fn live_files(
         )
     })?;
 
-    // 快照没声明的链接不在受管内容里；不进去读，否则就碰到了链接目标。
-    let managed_links: Vec<String> = manifest_symlinks
+    // manifest 提到过的路径都算受管：链接本身在 `symlinks`，链接下的内容在 `files`。
+    let declared_links: Vec<String> = manifest
+        .symlinks
         .iter()
         .map(|link| live_relative(&link.path).to_string())
         .collect();
-    let unmanaged_links: Vec<String> = scanned
+    let mut declared: Vec<String> = manifest
+        .files
+        .iter()
+        .map(|file| live_relative(&file.path).to_string())
+        .chain(declared_links.iter().cloned())
+        .collect();
+    declared.sort();
+
+    let links: Vec<String> = scanned
         .entries
         .iter()
         .filter(|entry| entry.link_target.is_some())
         .map(|entry| slash(&entry.relative_path))
-        .filter(|path| !managed_links.contains(path))
         .collect();
+    let undeclared_links = undeclared_links(&links, &declared);
 
     let mut files = BTreeMap::new();
     for entry in scanned
@@ -337,7 +359,7 @@ fn live_files(
         .filter(|entry| entry.kind == EntryKind::File)
     {
         let path = slash(&entry.relative_path);
-        if unmanaged_links.iter().any(|link| is_under(&path, link)) {
+        if undeclared_links.iter().any(|link| is_under(&path, link)) {
             continue;
         }
         let sha256 = fs::read(agent_dir.join(&entry.relative_path))
@@ -351,7 +373,27 @@ fn live_files(
             },
         );
     }
-    Ok(files)
+    Ok(LiveScan {
+        files,
+        undeclared_links,
+    })
+}
+
+/// 没被 manifest 提到的链接是陈旧残留：不进去读，列为可删除项（只删链接本身）。
+/// 下有 manifest 内容的链接、以及嵌在另一个待删链接里的链接都不算：前者那部分内容
+/// 本来就该按受管内容比较，后者删外层就一起没了。
+fn undeclared_links(links: &[String], declared: &[String]) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for path in links {
+        if declared.contains(path)
+            || declared.iter().any(|item| is_under(item, path))
+            || found.iter().any(|link| is_under(path, link))
+        {
+            continue;
+        }
+        found.push(path.clone());
+    }
+    found
 }
 
 /// 路径是否在某个链接目录之下（不含链接本身）。
@@ -361,10 +403,7 @@ fn is_under(path: &str, link: &str) -> bool {
 }
 
 /// 比较 manifest 与 live：快照有 live 无 → 新增；都有但哈希不同 → 修改；live 有快照无 → 删除。
-fn build_plan(
-    manifest_files: &[ManifestFile],
-    live: &BTreeMap<String, LiveFile>,
-) -> (Plan, PlanTotals) {
+fn build_plan(manifest_files: &[ManifestFile], live: &LiveScan) -> (Plan, PlanTotals) {
     let mut plan = Plan::default();
     let mut unchanged = 0;
     let mut in_manifest: Vec<String> = Vec::new();
@@ -377,10 +416,11 @@ fn build_plan(
         }
         in_manifest.push(relative.to_string());
 
-        match live.get(relative) {
+        match live.files.get(relative) {
             None => plan.added.push(PlanItem {
                 path: relative.to_string(),
                 category: PlanCategory::Added,
+                kind: PlanKind::File,
                 size: file.size,
                 snapshot_sha256: Some(file.sha256.clone()),
                 live_sha256: None,
@@ -391,6 +431,7 @@ fn build_plan(
             Some(live_file) => plan.modified.push(PlanItem {
                 path: relative.to_string(),
                 category: PlanCategory::Modified,
+                kind: PlanKind::File,
                 size: file.size,
                 snapshot_sha256: Some(file.sha256.clone()),
                 live_sha256: live_file.sha256.clone(),
@@ -398,16 +439,28 @@ fn build_plan(
         }
     }
 
-    for (path, live_file) in live {
+    for (path, live_file) in &live.files {
         if !in_manifest.contains(path) {
             plan.deleted.push(PlanItem {
                 path: path.clone(),
                 category: PlanCategory::Deleted,
+                kind: PlanKind::File,
                 size: live_file.size,
                 snapshot_sha256: None,
                 live_sha256: live_file.sha256.clone(),
             });
         }
+    }
+
+    for path in &live.undeclared_links {
+        plan.deleted.push(PlanItem {
+            path: path.clone(),
+            category: PlanCategory::Deleted,
+            kind: PlanKind::Link,
+            size: 0,
+            snapshot_sha256: None,
+            live_sha256: None,
+        });
     }
 
     for group in [&mut plan.added, &mut plan.modified, &mut plan.deleted] {
@@ -416,7 +469,7 @@ fn build_plan(
 
     let totals = PlanTotals {
         snapshot_files: manifest_files.len(),
-        live_files: live.len(),
+        live_files: live.files.len(),
         added: plan.added.len(),
         modified: plan.modified.len(),
         deleted: plan.deleted.len(),
@@ -769,30 +822,75 @@ mod tests {
         (agent, sync_root)
     }
 
+    #[test]
+    fn only_links_outside_the_manifest_become_delete_candidates() {
+        let declared = vec![
+            "settings.json".to_string(),
+            "skills/managed".to_string(),
+            "skills/holder/deep/SKILL.md".to_string(),
+        ];
+        let links = vec![
+            "skills/managed".to_string(),
+            "skills/holder".to_string(),
+            "stale".to_string(),
+            "stale/nested".to_string(),
+            "old".to_string(),
+        ];
+        assert_eq!(
+            undeclared_links(&links, &declared),
+            vec!["stale".to_string(), "old".to_string()],
+            "已声明链接、含已声明内容的链接、嵌在待删链接里的链接都不列"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
-    fn unmanaged_symlink_contents_are_skipped() {
+    fn undeclared_symlink_is_a_deletable_item_and_its_contents_are_never_compared() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new("unmanaged-link");
+        let temp = TempDir::new("undeclared-link");
         let agent = temp.path().join("agent");
+        let sync_root = temp.path().join("cloud");
         let outside = temp.path().join("outside");
+        write_file(&agent.join("settings.json"), "{\"theme\": \"dark\"}");
         write_file(&outside.join("keep.txt"), "keep");
-        fs::create_dir_all(agent.join("skills")).expect("建 skills");
-        symlink(&outside, agent.join("skills/extra")).expect("建目录链接");
+        fs::create_dir_all(&sync_root).expect("建同步目录");
+        snapshot::export(&agent, &sync_root, false).expect("导出夹具快照");
+        // 导出之后才出现的链接：快照里没有它，只能删链接本身。
+        symlink(&outside, agent.join("extra")).expect("建目录链接");
 
-        let live = live_files(&agent, &[]).expect("扫描");
-        assert!(live.is_empty(), "未声明的链接内容不应进入计划: {live:?}");
+        let report =
+            plan_snapshot(&agent, &sync_root, &FakeRunner::ok(), HostOs::Posix).expect("生成计划");
 
-        let managed = [ManifestSymlink {
-            path: "snapshot/skills/extra".to_string(),
-            target: outside.display().to_string(),
-        }];
-        let live = live_files(&agent, &managed).expect("扫描");
-        assert_eq!(
-            live.keys().map(String::as_str).collect::<Vec<_>>(),
-            vec!["skills/extra/keep.txt"]
-        );
+        assert_eq!(paths(&report.plan.deleted), vec!["extra"]);
+        assert_eq!(report.plan.deleted[0].kind, PlanKind::Link);
+        assert_eq!(report.plan.deleted[0].size, 0);
+        assert_eq!(report.totals.live_files, 1, "链接目标内容不进受管清单");
+        assert!(report.plan.added.is_empty(), "目标内容不能被当成新增");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn declared_symlink_contents_are_compared_and_the_link_is_not_a_candidate() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new("declared-link");
+        let agent = temp.path().join("agent");
+        let sync_root = temp.path().join("cloud");
+        let outside = temp.path().join("outside");
+        write_file(&agent.join("settings.json"), "{\"theme\": \"dark\"}");
+        fs::create_dir_all(&outside).expect("建外部目录");
+        write_file(&outside.join("keep.txt"), "keep");
+        fs::create_dir_all(&sync_root).expect("建同步目录");
+        symlink(&outside, agent.join("extra")).expect("建目录链接");
+        snapshot::export(&agent, &sync_root, false).expect("导出夹具快照");
+
+        let report =
+            plan_snapshot(&agent, &sync_root, &FakeRunner::ok(), HostOs::Posix).expect("生成计划");
+
+        assert!(report.plan.deleted.is_empty(), "已声明链接不是删除候选");
+        assert!(report.plan.added.is_empty(), "链接下的内容按受管内容比较");
+        assert_eq!(report.totals.live_files, 2);
     }
 
     fn dir_entries(root: &Path) -> Vec<String> {

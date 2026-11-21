@@ -60,6 +60,8 @@ type PlanCategory = 'added' | 'modified' | 'deleted';
 type PlanItem = {
   path: string;
   category: PlanCategory;
+  /** `link` 只会出现在删除候选里：只删链接本身，不碰目标。 */
+  kind: 'file' | 'link';
   size: number;
   snapshotSha256: string | null;
   liveSha256: string | null;
@@ -152,6 +154,7 @@ type RestoreReport = {
   safetyBackupId: string;
   restored: number;
   removed: number;
+  warnings: string[];
   failedAt: string | null;
 };
 
@@ -923,6 +926,11 @@ export function SnapshotPage() {
                       />
                       <span className="break-all font-mono text-xs text-foreground">
                         {item.path}
+                        {item.kind === 'link' && (
+                          <span className="ml-xs font-sans text-muted-foreground">
+                            · 链接，只删链接本身
+                          </span>
+                        )}
                       </span>
                     </label>
                   </li>
@@ -1096,6 +1104,7 @@ export function SnapshotPage() {
               <ResultRow label="还原" value={`${restoring.report.restored} 个条目`} />
               <ResultRow label="删除" value={`${restoring.report.removed} 个新增条目`} />
             </dl>
+            <WarningList warnings={restoring.report.warnings} />
             <p className="text-sm text-success">
               已从备份还原：请重启 Pi，或在会话里执行 /reload 让配置生效。
             </p>
@@ -1319,7 +1328,9 @@ function PlanGroup({
         {shown.map((item) => (
           <li key={item.path} className="rounded-md bg-surface-muted px-md py-sm">
             <p className="break-all font-mono text-xs text-foreground">{item.path}</p>
-            <p className="mt-xs text-xs text-muted-foreground">{item.size} B</p>
+            <p className="mt-xs text-xs text-muted-foreground">
+              {item.kind === 'link' ? '链接（只删链接本身）' : `${item.size} B`}
+            </p>
           </li>
         ))}
       </ul>

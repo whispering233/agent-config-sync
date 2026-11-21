@@ -689,8 +689,21 @@ fn record(
         }
     };
 
+    // 链接必须先判：Windows 的目录型链接同时带目录属性，当成目录就会误报「无法作为文件应用」。
+    let link_target = if platform::is_link_like(&live) {
+        let target = fs::read_link(&live).map_err(|error| {
+            ApplyFailure::new(
+                "backup_failed",
+                format!("读取 {relative} 的链接目标失败：{error}"),
+            )
+        })?;
+        Some(target.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+
     // 计划项都是文件；目标位置此刻是目录说明计划期间磁盘变了，停下让人看，不覆盖。
-    if metadata.is_dir() {
+    if link_target.is_none() && metadata.is_dir() {
         if !allow_dir {
             return Err(ApplyFailure::new(
                 "backup_failed",
@@ -706,18 +719,6 @@ fn record(
             link_target: None,
         });
     }
-
-    let link_target = if platform::is_link_like(&live) {
-        let target = fs::read_link(&live).map_err(|error| {
-            ApplyFailure::new(
-                "backup_failed",
-                format!("读取 {relative} 的链接目标失败：{error}"),
-            )
-        })?;
-        Some(target.to_string_lossy().into_owned())
-    } else {
-        None
-    };
     // 链接没有有意义的权限位；Windows 上 `mode_of` 一律给 `None`。
     let mode = match link_target {
         Some(_) => None,
@@ -789,7 +790,8 @@ fn materialize_snapshot_subtree(
 }
 
 /// 递归物化：目录就地建出来（空目录也照样落地），普通文件逐个按快照内容写。
-fn materialize_subtree(source: &Path, target: &Path) -> io::Result<usize> {
+/// 回滚重建链接失败时也走这里，源换成链接目标。
+pub(crate) fn materialize_subtree(source: &Path, target: &Path) -> io::Result<usize> {
     if fs::metadata(source)?.is_dir() {
         ensure_dir(target)?;
         let mut written = 0;
@@ -1338,6 +1340,62 @@ mod tests {
 
         assert_eq!(tree(&agent), before, "拒绝时不得写任何文件");
         assert!(backup_ids(&data).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undeclared_link_is_backed_up_and_deleted_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new("undeclared-link");
+        let agent = temp.path().join("agent");
+        let sync_root = temp.path().join("cloud");
+        let data = app_data(&temp);
+        write_file(&agent.join("settings.json"), "{\"theme\": \"dark\"}");
+        write_file(&temp.path().join("outside/keep.txt"), "留在这里\n");
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+        crate::snapshot::export(&agent, &sync_root, false).expect("导出快照");
+        // 导出之后才出现的链接：快照里没有它，只能删链接本身。
+        symlink(temp.path().join("outside"), agent.join("extra")).expect("创建目录链接");
+
+        let expected = fingerprint(&agent, &sync_root);
+        let report = apply(
+            &agent,
+            &sync_root,
+            &expected,
+            &["extra".to_string()],
+            &data,
+            &FakeRunner::ok(),
+            &PlatformLinkCreator,
+        )
+        .expect("应用应成功");
+
+        assert_eq!(report.deleted, 1);
+        assert!(
+            fs::symlink_metadata(agent.join("extra")).is_err(),
+            "链接本身被删掉"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("outside/keep.txt")).expect("读目标"),
+            "留在这里\n",
+            "链接目标不受影响"
+        );
+
+        let restore =
+            crate::rollback::restore(&agent, &data, &report.backup_id, true).expect("回滚应成功");
+        assert!(restore.warnings.is_empty(), "{:?}", restore.warnings);
+        assert!(
+            fs::symlink_metadata(agent.join("extra"))
+                .expect("链接回来了")
+                .file_type()
+                .is_symlink(),
+            "回滚按记录重建链接"
+        );
+        assert_eq!(
+            fs::read_link(agent.join("extra")).expect("读链接"),
+            temp.path().join("outside"),
+            "链接目标不变"
+        );
     }
 
     #[cfg(unix)]
