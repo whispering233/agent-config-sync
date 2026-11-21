@@ -10,7 +10,7 @@
 use crate::config;
 use crate::doctor::{CommandRunner, ShellRunner};
 use crate::plan;
-use crate::platform;
+use crate::platform::{self, HostOs};
 use crate::scope;
 use crate::snapshot::{ManifestSymlink, MANIFEST_FILE_NAME, SNAPSHOT_DIR_NAME};
 use crate::webdav_transfer;
@@ -148,12 +148,14 @@ pub fn apply(
     link_creator: &dyn LinkCreator,
 ) -> Result<ApplyReport, ApplyFailure> {
     // 计划可能已经过时：用户看的是旧计划，落地前必须按当前磁盘重算一次。
-    let report = plan::plan_snapshot(agent_dir, sync_root, runner).map_err(|failure| {
-        ApplyFailure::new(
-            "manifest_invalid",
-            format!("快照校验未通过（{}）：{}", failure.code, failure.message),
-        )
-    })?;
+    let report = plan::plan_snapshot(agent_dir, sync_root, runner, HostOs::current()).map_err(
+        |failure| {
+            ApplyFailure::new(
+                "manifest_invalid",
+                format!("快照校验未通过（{}）：{}", failure.code, failure.message),
+            )
+        },
+    )?;
     if report.manifest_info.fingerprint != expected_fingerprint {
         return Err(ApplyFailure::new(
             "plan_stale",
@@ -1114,7 +1116,7 @@ mod tests {
     }
 
     fn fingerprint(agent: &Path, sync_root: &Path) -> String {
-        plan::plan_snapshot(agent, sync_root, &FakeRunner::ok())
+        plan::plan_snapshot(agent, sync_root, &FakeRunner::ok(), HostOs::Posix)
             .expect("生成夹具计划")
             .manifest_info
             .fingerprint

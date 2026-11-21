@@ -705,6 +705,7 @@ fn now_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::HostOs;
     use crate::snapshot::{
         fingerprint, ManifestFile, Requirements, SourceInfo, FORMAT_VERSION, PROFILE_ID,
     };
@@ -1285,8 +1286,13 @@ mod tests {
         let outcome = download(&client, &app_data).expect("下载应成功");
 
         // 暂存目录顶替同步根：只读校验与计划一行都不用改。
-        let report = crate::plan::plan_snapshot(&agent_dir, &outcome.staging_root, &FakeRunner)
-            .expect("计划应成功");
+        let report = crate::plan::plan_snapshot(
+            &agent_dir,
+            &outcome.staging_root,
+            &FakeRunner,
+            HostOs::Posix,
+        )
+        .expect("计划应成功");
         assert_eq!(
             report.manifest_info.fingerprint,
             outcome.manifest.fingerprint

@@ -407,6 +407,7 @@ mod tests {
     use crate::apply::BACKUP_RETENTION;
     #[cfg(unix)]
     use crate::doctor::{CommandOutcome, CommandRunner};
+    use crate::platform::HostOs;
     #[cfg(unix)]
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -931,17 +932,18 @@ mod tests {
         write_file(&agent.join("auth.json"), "{\"token\": \"sk-test\"}");
         fs::create_dir_all(&sync_root).expect("建同步目录");
         crate::snapshot::export(&agent, &sync_root, false).expect("导出夹具快照");
-        let fingerprint = crate::plan::plan_snapshot(&agent, &sync_root, &FakeRunner)
-            .expect("生成夹具计划")
-            .manifest_info
-            .fingerprint;
+        let fingerprint =
+            crate::plan::plan_snapshot(&agent, &sync_root, &FakeRunner, HostOs::Posix)
+                .expect("生成夹具计划")
+                .manifest_info
+                .fingerprint;
 
         // 改动本机：改内容与权限、删一个受管文件、留一个待删文件。
         write_file(&agent.join("settings.json"), "{\"theme\": \"light\"}");
         set_mode(&agent.join("settings.json"), 0o640);
         fs::remove_file(agent.join("skills/antd/SKILL.md")).expect("删 live 技能");
         write_file(&agent.join("prompts/leftover.md"), "留下");
-        let expected = crate::plan::plan_snapshot(&agent, &sync_root, &FakeRunner)
+        let expected = crate::plan::plan_snapshot(&agent, &sync_root, &FakeRunner, HostOs::Posix)
             .expect("重算计划")
             .manifest_info
             .fingerprint;

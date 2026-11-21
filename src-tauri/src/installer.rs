@@ -183,7 +183,8 @@ fn probe_from_script(outcome: &CommandOutcome) -> Result<Probe, String> {
 }
 
 /// Windows 的逐命令探测：node、npm、pi 各起一个进程，`.cmd` 中间层经 `cmd /d /s /c`。
-/// 程序按 PATH 与 PATHEXT 解析，pi 再兜底 `<agent_dir>/bin`；解析不到就是没装。
+/// 程序按 PATH 与 PATHEXT 解析，pi 再兜底 `<agent_dir>/bin` 与 npm 全局前缀——
+/// 与医生走同一个 [`doctor::find_pi`]，入口判断不会一处说装了、另一处说没装。
 fn probe_windows(
     agent_dir: Option<&Path>,
     runner: &dyn CommandRunner,
@@ -195,10 +196,14 @@ fn probe_windows(
         probe.node_version = one_line(runner, &program, &["-p", "process.versions.node"])?;
         probe.node_path = program.display().to_string();
     }
-    if let Some(program) = search.find("npm") {
-        probe.npm_version = one_line(runner, &program, &["-v"])?;
-    }
-    if let Some(program) = doctor::find_pi(search, agent_dir, None) {
+    let npm_prefix = match search.find("npm") {
+        Some(program) => {
+            probe.npm_version = one_line(runner, &program, &["-v"])?;
+            doctor::npm_global_prefix(runner, &program)
+        }
+        None => None,
+    };
+    if let Some(program) = doctor::find_pi(search, agent_dir, npm_prefix.as_deref()) {
         probe.pi_version = one_line(runner, &program, &["--version"])?;
         probe.pi_path = program.display().to_string();
     }
@@ -802,7 +807,13 @@ mod tests {
         fs::write(global.join("pi.cmd"), "").expect("写文件");
         let search = windows_search(&[&bin, &global]);
 
-        let runner = FakePrograms::new(vec![ok("22.23.0\n"), ok("10.9.2\n"), ok("1.5.2\n")]);
+        let prefix = "C:\\Users\\u\\AppData\\Roaming\\npm\n";
+        let runner = FakePrograms::new(vec![
+            ok("22.23.0\n"),
+            ok("10.9.2\n"),
+            ok(prefix),
+            ok("1.5.2\n"),
+        ]);
         let probe = probe_windows(None, &runner, &search).unwrap();
 
         let node = bin.join("node.exe").display().to_string();
@@ -813,6 +824,7 @@ mod tests {
             vec![
                 platform::cmd_line(&node, &["-p", "process.versions.node"]),
                 platform::cmd_line(&npm, &["-v"]),
+                platform::cmd_line(&npm, &["prefix", "-g"]),
                 platform::cmd_line(&pi, &["--version"]),
             ]
         );
@@ -830,6 +842,39 @@ mod tests {
                 "npm",
                 &["i", "-g", "@earendil-works/pi-coding-agent@latest"]
             )
+        );
+    }
+
+    #[test]
+    fn windows_probe_falls_back_to_npm_global_prefix() {
+        let dir = TempDir::new("windows-probe-prefix");
+        let bin = dir.path().join("bin");
+        let prefix = dir.path().join("npm-prefix");
+        fs::create_dir_all(&bin).expect("建目录");
+        fs::create_dir_all(&prefix).expect("建目录");
+        fs::write(bin.join("node.exe"), "").expect("写文件");
+        fs::write(bin.join("npm.cmd"), "").expect("写文件");
+        // pi 只在 npm 全局前缀下：PATH 与 `<agent_dir>/bin` 都没有。
+        fs::write(prefix.join("pi.cmd"), "").expect("写文件");
+        let search = windows_search(&[&bin]);
+
+        let runner = FakePrograms::new(vec![
+            ok("22.23.0\n"),
+            ok("10.9.2\n"),
+            ok(&format!("{}\n", prefix.display())),
+            ok("1.5.2\n"),
+        ]);
+        let probe = probe_windows(None, &runner, &search).unwrap();
+
+        assert_eq!(probe.pi_path, prefix.join("pi.cmd").display().to_string());
+        assert_eq!(probe.pi_version, "1.5.2");
+        // 兜底找到的入口不在 node_modules 下：安装类型仍是未知，但预览不再说「没装」。
+        let preview = build_preview(None, "windows", Ok(probe));
+        assert_eq!(preview.install_kind, Some(InstallKind::Unknown));
+        assert!(preview.blocking.is_empty(), "{:?}", preview.blocking);
+        assert_eq!(
+            preview.command.map(|command| command.action),
+            Some(InstallAction::Upgrade)
         );
     }
 

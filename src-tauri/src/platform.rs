@@ -129,16 +129,17 @@ impl HostOs {
     }
 }
 
-/// cmd 会展开或换义的字符：`%` / `!` 是变量引用，其余是命令分隔、管道、重定向与转义符。
-const CMD_UNSAFE_CHARS: [char; 8] = ['"', '%', '!', '&', '|', '<', '>', '^'];
+/// cmd 会展开或换义的字符：`%` / `!` 是变量引用，其余是命令分隔、管道、重定向与转义符；
+/// `\r` / `\n` 会把一条命令行拆成两条。
+const CMD_UNSAFE_CHARS: [char; 10] = ['"', '%', '!', '&', '|', '<', '>', '^', '\r', '\n'];
 
 /// 单引号包裹并转义，避免参数里的字符逃出引号。
 pub(crate) fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// 按平台给一个参数加引号。POSIX 用单引号；Windows 用双引号，并拒绝 cmd 会展开或换义的
-/// 字符——参数来自用户配置（provider id、包名），不能原样拼进命令行。
+/// 按平台给一个来自配置的参数加引号。POSIX 用单引号；Windows 用双引号，并拒绝 cmd 会展开
+/// 或换义的字符——参数来自用户配置（provider id、包名），不能原样拼进命令行。
 pub(crate) fn quote_arg(os: HostOs, value: &str) -> Result<String, String> {
     match os {
         HostOs::Posix => Ok(sh_quote(value)),
@@ -150,6 +151,15 @@ pub(crate) fn quote_arg(os: HostOs, value: &str) -> Result<String, String> {
             }
             Ok(format!("\"{value}\""))
         }
+    }
+}
+
+/// 程序路径只加引号，不过拒绝名单：路径由本机文件系统解析得出，不是配置里的自由文本，
+/// `C:\Users\a&b\…` 这类目录名在双引号内不会构成命令分隔；套同一份名单会让整个功能拒绝执行。
+pub(crate) fn quote_program(os: HostOs, program: &str) -> String {
+    match os {
+        HostOs::Posix => program.to_string(),
+        HostOs::Windows => format!("\"{program}\""),
     }
 }
 
@@ -174,7 +184,7 @@ pub(crate) fn program_argv(
         }
         HostOs::Windows => {
             let mut parts = Vec::with_capacity(args.len() + 1);
-            parts.push(quote_arg(os, program)?);
+            parts.push(quote_program(os, program));
             for arg in args {
                 parts.push(quote_arg(os, arg)?);
             }
@@ -464,12 +474,19 @@ mod tests {
             quote_arg(HostOs::Windows, "npm:pi-lens"),
             Ok("\"npm:pi-lens\"".to_string())
         );
+        // 程序路径只加引号，不过拒绝名单。
+        assert_eq!(
+            quote_program(HostOs::Windows, "C:\\Users\\a&b\\pi.cmd"),
+            "\"C:\\Users\\a&b\\pi.cmd\""
+        );
+        assert_eq!(quote_program(HostOs::Posix, "/usr/bin/pi"), "/usr/bin/pi");
     }
 
     #[test]
     fn windows_quoting_rejects_cmd_metacharacters() {
         for value in [
-            "npm:a\"b", "npm:a%b", "npm:a!b", "npm:a&b", "npm:a|b", "npm:a<b", "npm:a>b", "npm:a^b",
+            "npm:a\"b", "npm:a%b", "npm:a!b", "npm:a&b", "npm:a|b", "npm:a<b", "npm:a>b",
+            "npm:a^b", "npm:a\rb", "npm:a\nb",
         ] {
             let error = quote_arg(HostOs::Windows, value).unwrap_err();
             assert!(error.contains("拒绝执行"), "{value}: {error}");
@@ -492,6 +509,14 @@ mod tests {
             line,
             &cmd_line("C:\\nodejs\\pi.cmd", &["--version"]),
             "外层引号 + 内部逐个加引号的元素"
+        );
+
+        // 程序路径只做引号包裹：cmd 元字符出现在路径里不该让整条命令被拒绝。
+        let argv = program_argv(HostOs::Windows, "C:\\Users\\a&b\\pi.cmd", &["list"]).unwrap();
+        assert_eq!(
+            argv[4],
+            cmd_line("C:\\Users\\a&b\\pi.cmd", &["list"]),
+            "路径里的 & 在引号内不构成命令分隔"
         );
 
         // POSIX 不经 shell：逐命令直接给程序与参数。

@@ -427,12 +427,18 @@ fn windows_npm(runner: &dyn CommandRunner, search: &ProgramPath) -> (SectionData
         return (version.section(&[]), None);
     }
 
-    let prefix = ProgramProbe::run(runner, &program, &["prefix", "-g"]);
-    let prefix = first_line(prefix.stdout());
+    let prefix = npm_global_prefix(runner, &program).unwrap_or_default();
     let value = first_line(version.stdout());
     let section = version.section(&[("version", &value), ("prefix", &prefix)]);
     let fallback = (!prefix.is_empty()).then_some(prefix);
     (section, fallback)
+}
+
+/// npm 全局前缀：`npm prefix -g` 的第一行。找不到 `pi` 时靠它兜底，
+/// 安装页与包对齐页也走这里，避免“检测说装了、安装页说没装”。
+pub(crate) fn npm_global_prefix(runner: &dyn CommandRunner, npm: &Path) -> Option<String> {
+    let prefix = first_line(ProgramProbe::run(runner, npm, &["prefix", "-g"]).stdout());
+    (!prefix.is_empty()).then_some(prefix)
 }
 
 fn windows_pi(
@@ -459,6 +465,7 @@ fn windows_pi(
 }
 
 /// `pi` 入口：先看 PATH，再兜底 `<agent_dir>/bin` 与 npm 全局前缀；都没有就算未找到。
+/// 检测、安装与包对齐三处都走这里，入口判断不会不一致。
 pub(crate) fn find_pi(
     search: &ProgramPath,
     agent_dir: Option<&Path>,

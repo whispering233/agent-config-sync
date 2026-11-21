@@ -188,12 +188,16 @@ fn pi_list_scripted(runner: &dyn CommandRunner) -> Result<String, String> {
 }
 
 /// Windows：解析到 `pi.cmd` 就直接跑 `pi list`，没有标记可用。
+/// 入口与医生、安装页走同一个 [`doctor::find_pi`]，npm 全局前缀兜底也一致。
 fn pi_list_windows(
     agent_dir: &Path,
     runner: &dyn CommandRunner,
     search: &ProgramPath,
 ) -> Result<String, String> {
-    let Some(program) = doctor::find_pi(search, Some(agent_dir), None) else {
+    let npm_prefix = search
+        .find("npm")
+        .and_then(|npm| doctor::npm_global_prefix(runner, &npm));
+    let Some(program) = doctor::find_pi(search, Some(agent_dir), npm_prefix.as_deref()) else {
         return Err("tool_not_found：找不到 pi 命令，无法读取实装列表".to_string());
     };
 
@@ -800,6 +804,37 @@ mod tests {
         assert_eq!(
             crate::platform::cmd_line_of(&programs[0]),
             crate::platform::cmd_line(&bin.join("pi.cmd").display().to_string(), &["list"])
+        );
+    }
+
+    #[test]
+    fn windows_pi_list_falls_back_to_npm_global_prefix() {
+        let dir = TempDir::new("windows-pi-list-prefix");
+        let prefix = dir.path().join("npm-prefix");
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&prefix).expect("建目录");
+        fs::create_dir_all(&bin).expect("建目录");
+        // pi 只在 npm 全局前缀下：PATH 与 `<agent_dir>/bin` 都没有。
+        fs::write(prefix.join("pi.cmd"), "").expect("写文件");
+        fs::write(bin.join("npm.cmd"), "").expect("写文件");
+        let search = ProgramPath::new(vec![bin.clone()], vec![".cmd".to_string()]);
+
+        let list = user_list(&[("npm:pi-lens", "C:\\npm\\pi-lens")]);
+        let runner = FakeProbe::new(vec![ok(&format!("{}\n", prefix.display())), ok(&list)]);
+        let stdout = pi_list_windows(dir.path(), &runner, &search).unwrap();
+
+        assert!(stdout.contains("npm:pi-lens"));
+        let programs = runner.programs();
+        assert_eq!(
+            crate::platform::cmd_line_of(&programs[0]),
+            crate::platform::cmd_line(
+                &bin.join("npm.cmd").display().to_string(),
+                &["prefix", "-g"]
+            )
+        );
+        assert_eq!(
+            crate::platform::cmd_line_of(&programs[1]),
+            crate::platform::cmd_line(&prefix.join("pi.cmd").display().to_string(), &["list"])
         );
     }
 

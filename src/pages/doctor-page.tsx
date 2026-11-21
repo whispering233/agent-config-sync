@@ -691,7 +691,8 @@ function PackagesCard() {
           {status.declared.length > 0 && (
             <PackageList
               title="声明"
-              items={status.declared.map((item) => ({
+              items={status.declared.map((item, index) => ({
+                key: `${index}-${item.source}`,
                 text: item.enabled
                   ? item.source
                   : `${item.source}（已停用，不自动安装）`,
@@ -701,7 +702,8 @@ function PackagesCard() {
           {status.installed.length > 0 && (
             <PackageList
               title="实装"
-              items={status.installed.map((item) => ({
+              items={status.installed.map((item, index) => ({
+                key: `${index}-${item.source}`,
                 text:
                   item.version === null
                     ? item.source
@@ -745,7 +747,10 @@ function PackagesCard() {
           {status.extra.length > 0 && (
             <PackageList
               title="多余（不会自动删除，需要时手动 pi remove）"
-              items={status.extra.map((source) => ({ text: source }))}
+              items={status.extra.map((source, index) => ({
+                key: `${index}-${source}`,
+                text: source,
+              }))}
             />
           )}
 
@@ -851,7 +856,8 @@ function PackageList({
   items,
 }: {
   title: string;
-  items: ReadonlyArray<{ text: string; sub?: string }>;
+  /** 同一个包可能出现在两条来源里，展示文本会重复：key 由调用方给，不能拿文本顶替。 */
+  items: ReadonlyArray<{ key: string; text: string; sub?: string }>;
 }) {
   return (
     <div className="mt-md">
@@ -859,7 +865,7 @@ function PackageList({
       <ul className="mt-xs flex flex-col gap-xs">
         {items.map((item) => (
           <li
-            key={item.text}
+            key={item.key}
             className="break-all rounded-md bg-surface-muted px-md py-xs font-mono text-xs text-foreground"
           >
             {item.text}
