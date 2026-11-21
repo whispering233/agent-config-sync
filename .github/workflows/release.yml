@@ -1,0 +1,36 @@
+name: Release
+
+# 打 tag 即发布；正文取 CHANGELOG 里对应版本段，避免手写重复的发布说明
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # 发布正文与包版本对不上会让用户装到错版本，所以先挡住再建 Release
+      - name: Verify version matches tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(grep -m1 -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' package.json | sed -E 's/.*"([^"]+)"$/\1/')
+          tauri=$(grep -m1 -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' src-tauri/tauri.conf.json | sed -E 's/.*"([^"]+)"$/\1/')
+          cargo=$(grep -m1 -E '^version[[:space:]]*=[[:space:]]*"' src-tauri/Cargo.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+
+          printf 'tag=%s\npackage.json=%s\ntauri.conf.json=%s\nCargo.toml=%s\n' "$tag" "$pkg" "$tauri" "$cargo"
+
+          if [ "$tag" = "$pkg" ] && [ "$tag" = "$tauri" ] && [ "$tag" = "$cargo" ]; then
+            echo "版本一致：$tag"
+          else
+            echo "::error::版本号与 tag 不一致"
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        uses: hermannm/release-from-changelog@v0.2.6

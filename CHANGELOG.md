@@ -5,6 +5,8 @@
 
 ## [Unreleased]
 
+## [v0.0.1] - 2026-11-21
+
 ### Added
 
 - 桌面应用骨架：Tauri v2 + React + TypeScript + Tailwind，三页导航与设计 token。
@@ -20,9 +22,10 @@
 - 包对齐：声明与实装比对，确认后安装缺失项。
 - 冲突文件扫描（只读）：命名识别、配对与差异摘要。
 - Linux 分发：deb 与 AppImage 打包、关于页、release 去符号。
+- CI：提交验证、tag 建 Release、Linux 打包上传资产。
 
 ### Note
 
-- 仅面向 Linux；Windows/macOS 未打包，分享包与自研 WebDAV 传输在 backlog。
+- 仅面向 Linux；Windows/macOS 未打包。WebDAV 传输与分享包尚未实现。
 - 安装包未签名；图标为占位图。
 - AppImage 打包需要从 GitHub 下载 type2 runtime，网络受限时会失败（deb 不受影响）。
