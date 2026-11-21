@@ -67,7 +67,8 @@ npm run build
 - 文件遍历、manifest、哈希、密钥扫描、应用/回滚、包/安装必须有单元测试与临时目录夹具。
 - UI 验证交给子代理，条目数给定上限，只报不修。
 - 每个任务卡必须能独立验证、独立回滚。
-- 打包：`npm run tauri -- build --bundles deb,appimage`（AppImage 需要能访问 GitHub release 下载 runtime）。
+- 打包：`npm run tauri -- build --bundles deb,appimage`（AppImage 需要能访问 GitHub release 下载 runtime）；Windows 上 `npm run tauri -- build --bundles nsis`，CI 的 `windows-latest` job 会先跑 `cargo test` 再出包。
+- 平台差异收在 `src-tauri/src/platform.rs`：权限位、链接判定与创建、`cmd /d /s /c` 命令行、进程树终止。调用点不直接写 `cfg(windows)`，命令形态由注入的宿主平台分支。
 
 ## 提交
 

@@ -54,7 +54,8 @@ pub enum InstallKind {
     Unknown,
 }
 
-/// 一条将执行的命令。`argv` 是完整命令行：POSIX 走登录 shell（`-lc`），Windows 直接调 npm。
+/// 一条将执行的命令。`argv` 是完整命令行：POSIX 走登录 shell（`-lc`），
+/// Windows 走 `cmd /d /s /c`（`npm` 是 `.cmd` 中间层，不经 cmd 起不来）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstallCommand {

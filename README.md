@@ -17,7 +17,9 @@ Pi CLI 配置的换机交付工具：把配置导出成**可校验的快照**，
 | 密钥 | 列出 requiredSecrets、检查环境变量、写入本机字面值 |
 | 包对齐 | 比对 `settings.json` 声明与 `pi list` 实装，安装缺失项 |
 
-## 安装（Linux）
+## 安装
+
+Linux：
 
 ```bash
 # deb（推荐）
@@ -29,6 +31,10 @@ chmod +x "src-tauri/target/release/bundle/appimage/Agent Config Sync_0.0.1_amd64
 ```
 
 文件名含空格，命令需要引号。deb 依赖 `libwebkit2gtk-4.1-0` 与 `libgtk-3-0`。
+
+Windows：运行 `src-tauri/target/release/bundle/nsis/Agent Config Sync_<版本>_x64-setup.exe`，按当前用户安装、不需要管理员。安装包未签名，首次运行会弹 SmartScreen：点「更多信息 → 仍要运行」。
+
+Windows 上命令执行走 `cmd /d /s /c`，环境检测与包对齐按逐命令探测；宿主安装仍只走 npm。
 
 ## 第一次使用
 
@@ -62,7 +68,8 @@ npm run tauri -- dev           # 桌面窗口
 npm run dev                    # 仅前端（浏览器预览，命令降级）
 cd src-tauri && cargo test     # Rust 测试
 npm run build                  # 前端构建
-npm run tauri -- build --bundles deb,appimage
+npm run tauri -- build --bundles deb,appimage   # Linux
+npm run tauri -- build --bundles nsis          # Windows（只能在 Windows 上构建）
 ```
 
 构建与分发的完整说明见 [docs/design/build.md](docs/design/build.md)。

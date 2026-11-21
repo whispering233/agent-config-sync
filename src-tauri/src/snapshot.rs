@@ -56,7 +56,7 @@ pub struct SourceInfo {
     pub app: String,
     pub os: String,
     pub arch: String,
-    /// 宿主版本由环境医生探测；本卡不重复实现，未知时为 null。
+    /// 宿主版本由环境检测探测；这里只记录结论，未知时为 null。
     pub pi: Option<String>,
     pub node: Option<String>,
 }

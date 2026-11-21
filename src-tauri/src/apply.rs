@@ -4,7 +4,7 @@
 //! 顺序固定：重算计划 → 核对指纹与删除清单 → 备份 → 重建链接 → 写入/删除 → 清理旧备份。
 //! 符号链接优先按 manifest 的 `symlinks` 重建；目标不存在（含断链）或平台不允许建链接时
 //! 退回物化写入，后者要整棵子树写出：计划是按链接视角算的，只写新增/修改项会丢内容。
-//! 失败停在原地：写入中途失败即停，已完成的部分留在原地，备份目录保留（回滚是 T8），
+//! 失败停在原地：写入中途失败即停，已完成的部分留在原地，备份目录保留（回滚见 `rollback`），
 //! 不自动回滚、不重试、不静默修复。核心 [`apply`] 不依赖 Tauri，可直接临时目录单测。
 
 use crate::config;
@@ -28,7 +28,7 @@ pub const BACKUPS_DIR_NAME: &str = "backups";
 pub const BACKUP_FILES_DIR_NAME: &str = "files";
 /// 备份说明文件名。
 pub const RESTORE_FILE_NAME: &str = "restore.json";
-/// `restore.json` 的格式版本。T8 按这个版本读取。
+/// `restore.json` 的格式版本。回滚按这个版本读取。
 pub const RESTORE_VERSION: u32 = 1;
 /// 保留最近几份备份。
 pub const BACKUP_RETENTION: usize = 10;
@@ -88,7 +88,7 @@ impl ApplyFailure {
 pub enum RestoreKind {
     File,
     Symlink,
-    /// 本卡不产生目录条目：计划项都是文件，目标位置反而是目录时直接失败。
+    /// 计划项都是文件，目标位置反而是目录时直接失败，所以备份里不会有目录条目。
     Dir,
 }
 
@@ -105,7 +105,7 @@ pub struct RestoreEntry {
     pub link_target: Option<String>,
 }
 
-/// 备份说明。T8 只读这个文件就能还原。
+/// 备份说明。回滚只读这个文件就能还原。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreManifest {
@@ -592,7 +592,7 @@ fn write_backup_entries(
 ) -> Result<(), ApplyFailure> {
     let files_dir = backup.dir.join(BACKUP_FILES_DIR_NAME);
     // 写入时 `ensure_dir` 会把祖先链接换成真实目录，链接本身只能在写入前记下来；
-    // 这些条目放在文件条目之前，T8 先恢复链接再往里放文件。
+    // 这些条目放在文件条目之前，回滚才能先恢复链接再往里放文件。
     let mut entries = symlink_ancestors_of(agent_dir, touched)
         .iter()
         .map(|relative| record(agent_dir, relative, &files_dir, false))
@@ -1651,7 +1651,7 @@ mod tests {
         );
         assert_eq!(tree(&external), external_before, "目标目录内容逐字节不变");
 
-        // 重建前先记下原有链接：T8 可按 restore.json 还原。
+        // 重建前先记下原有链接：回滚按 restore.json 还原。
         let restore = read_restore(&report.backup_dir);
         let skills = entry(&restore, "skills");
         assert_eq!(skills.kind, RestoreKind::Symlink);
@@ -1702,7 +1702,7 @@ mod tests {
         );
         assert!(!external.exists(), "不替用户重建目标目录");
 
-        // 断链本身也在备份里：条目排在文件之前，T8 先恢复链接。
+        // 断链本身也在备份里：条目排在文件之前，回滚先恢复链接。
         let restore = read_restore(&report.backup_dir);
         let skills = entry(&restore, "skills");
         assert_eq!(skills.kind, RestoreKind::Symlink);

@@ -14,7 +14,7 @@
 | :--- | :--- | :--- | :--- |
 | `os` | 系统信息 | — | 展示 |
 | `agent_dir` | `PI_CODING_AGENT_DIR` 或默认 `~/.pi/agent` | 存在/可写 | 创建或修正路径 |
-| `node.path` | POSIX：登录 shell `command -v node` + 常见目录兜底；Windows：`where node` | 找到/未找到 | 安装 Node 说明 |
+| `node.path` | POSIX：登录 shell `command -v node` + 常见目录兜底；Windows：按 `PATH` 与 `PATHEXT` 解析（等价于 `where`） | 找到/未找到 | 安装 Node 说明 |
 | `node.version` | `node -p process.versions.node` | `>=22.19.0` | 升级 Node |
 | `npm` | `where`/`command -v npm` + `npm -v` + `npm prefix -g` | 找到/未找到 | 随 Node 一起装 |
 | `pi.path` | `where`/`command -v pi` + `<agent_dir>/bin/pi` + npm 全局前缀下的入口（POSIX `bin/pi`，Windows `pi.cmd`） | 找到/未找到 | 安装宿主 |
