@@ -4,7 +4,10 @@ use crate::config::{
     self, AppConfig, ConfigError, ConfigValidation, AGENT_DIR_ENV_VAR, CONFIG_FILE_NAME,
 };
 use crate::credentials::{self, CredentialError, WebdavCredentials};
+use crate::doctor::{self, ShellRunner};
+use crate::platform::HostOs;
 use crate::secrets::SecretFinding;
+use crate::snapshot;
 use crate::webdav::{self, DavError, ReqwestTransport, WebdavClient};
 use crate::webdav_transfer::{self, TransferError, UploadOutcome};
 use std::path::PathBuf;
@@ -334,10 +337,18 @@ pub async fn upload_snapshot(
             })?;
         let transport = ReqwestTransport::new(&credentials.username, &credentials.password)
             .map_err(|error| upload_failure("remote_unreachable", dav_error(error)))?;
+        // 与本地导出同一份探测：manifest 的 source 记下这次上传来自哪个宿主版本。
+        let (pi, node) = doctor::probe_versions(
+            Some(&agent_dir),
+            &ShellRunner::from_env(),
+            HostOs::current(),
+        );
+        let versions = snapshot::SourceVersions { pi, node };
         let outcome = webdav_transfer::upload(
             &WebdavClient::new(transport, &credentials.url),
             &dir,
             &agent_dir,
+            &versions,
             allow_plaintext.unwrap_or(false),
             overwrite,
         )

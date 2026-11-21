@@ -8,6 +8,8 @@
 //! 可直接用临时目录单测。command 定义在本文件是因为并行开发约束下不能改 `commands.rs`。
 
 use crate::config::{self, AGENT_DIR_ENV_VAR};
+use crate::doctor::{self, ShellRunner};
+use crate::platform::HostOs;
 use crate::scope;
 use crate::secrets::{self, RequiredSecret, SecretFinding, SecretLevel};
 use serde::{Deserialize, Serialize};
@@ -145,11 +147,35 @@ impl ExportFailure {
     }
 }
 
-/// 导出快照。`allow_plaintext` 为 true 表示用户已看过明文密钥条目并仍然选择导出。
+/// 导出时记进 manifest 的宿主版本。探测不到就留空，导出照常进行。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceVersions {
+    pub pi: Option<String>,
+    pub node: Option<String>,
+}
+
+/// 导出快照（不记来源版本）。生产路径都用 [`export_with`] 带上探测结果，
+/// 这里留给单测：临时目录夹具不关心宿主版本。
+#[cfg(test)]
 pub fn export(
     agent_dir: &Path,
     sync_root: &Path,
     allow_plaintext: bool,
+) -> Result<ExportReport, ExportFailure> {
+    export_with(
+        agent_dir,
+        sync_root,
+        allow_plaintext,
+        SourceVersions::default(),
+    )
+}
+
+/// 与 [`export`] 相同，额外把探测到的 node/pi 版本写进 `manifest.source`。
+pub fn export_with(
+    agent_dir: &Path,
+    sync_root: &Path,
+    allow_plaintext: bool,
+    versions: SourceVersions,
 ) -> Result<ExportReport, ExportFailure> {
     precheck(agent_dir, sync_root)?;
 
@@ -218,8 +244,8 @@ pub fn export(
             app: env!("CARGO_PKG_VERSION").to_string(),
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
-            pi: None,
-            node: None,
+            pi: versions.pi,
+            node: versions.node,
         },
         requirements: Requirements {
             node: REQUIREMENT_NODE.to_string(),
@@ -584,8 +610,18 @@ fn civil_from_days(days: i64) -> (i64, u64, u64) {
 
 /// command 层入口：从应用配置读取同步根目录与宿主目录，再跑导出。
 #[tauri::command]
-pub fn export_snapshot(
+pub async fn export_snapshot(
     app: tauri::AppHandle,
+    allow_plaintext: Option<bool>,
+) -> Result<ExportReport, ExportFailure> {
+    // 版本探测要起子进程，最多各等 5 秒；放阻塞线程池，别占住 UI 线程。
+    tauri::async_runtime::spawn_blocking(move || export_snapshot_blocking(&app, allow_plaintext))
+        .await
+        .map_err(|error| ExportFailure::new("export_failed", format!("导出失败：{error}")))?
+}
+
+fn export_snapshot_blocking(
+    app: &tauri::AppHandle,
     allow_plaintext: Option<bool>,
 ) -> Result<ExportReport, ExportFailure> {
     let config_dir = app.path().app_config_dir().map_err(|error| {
@@ -613,7 +649,18 @@ pub fn export_snapshot(
         ExportFailure::new("agent_dir_missing", "无法确定宿主目录，请先在设置页填写")
     })?;
 
-    export(&agent_dir, &sync_root, allow_plaintext.unwrap_or(false))
+    // 记下来源版本，另一台机器据此判断快照来自哪个宿主；探测不到就留空。
+    let (pi, node) = doctor::probe_versions(
+        Some(&agent_dir),
+        &ShellRunner::from_env(),
+        HostOs::current(),
+    );
+    export_with(
+        &agent_dir,
+        &sync_root,
+        allow_plaintext.unwrap_or(false),
+        SourceVersions { pi, node },
+    )
 }
 
 #[cfg(test)]
@@ -699,6 +746,31 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn export_records_probed_versions_and_leaves_them_null_when_unknown() {
+        let temp = TempDir::new("versions");
+        let agent = temp.path().join("agent");
+        let sync_root = temp.path().join("cloud");
+        fixture_agent(&agent);
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+
+        let versions = SourceVersions {
+            pi: Some("1.6.0".to_string()),
+            node: Some("24.14.0".to_string()),
+        };
+        export_with(&agent, &sync_root, false, versions).expect("导出应成功");
+
+        let manifest = read_manifest(&sync_root);
+        assert_eq!(manifest.source.pi.as_deref(), Some("1.6.0"));
+        assert_eq!(manifest.source.node.as_deref(), Some("24.14.0"));
+
+        // 探测不到时留空：导出照常成功，manifest 里是 null。
+        export(&agent, &sync_root, false).expect("导出应成功");
+        let manifest = read_manifest(&sync_root);
+        assert_eq!(manifest.source.pi, None);
+        assert_eq!(manifest.source.node, None);
     }
 
     #[test]

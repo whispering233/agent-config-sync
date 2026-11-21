@@ -361,6 +361,33 @@ impl ProgramProbe {
     }
 }
 
+/// 导出 manifest 用：本机 pi 与 node 的版本（顺序即 `(pi, node)`），探测失败留空，
+/// 导出不因此中断。与 [`check`] 共用同一组探测，避免「环境检测说有版本、manifest 里是 null」。
+pub fn probe_versions(
+    agent_dir: Option<&Path>,
+    runner: &dyn CommandRunner,
+    host: HostOs,
+) -> (Option<String>, Option<String>) {
+    let probes = fast_probes(runner, agent_dir, &ProgramPath::from_env(), host);
+    (section_version(&probes.pi), section_version(&probes.node))
+}
+
+/// 从探测段里取 `version` 字段：能解析就规范成 `x.y.z`，解析不了就留原文。
+fn section_version(section: &SectionData) -> Option<String> {
+    let SectionData::Body { fields, .. } = section else {
+        return None;
+    };
+    let raw = fields.get("version")?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(
+        parse_version(raw)
+            .map(format_version)
+            .unwrap_or_else(|| raw.to_string()),
+    )
+}
+
 /// 快速组的三个探测结果。POSIX 从一条登录 shell 脚本的哨兵段里取；Windows 每个探测点
 /// 单独起进程（`.cmd` 中间层经 `cmd /d /s /c`），不再拼批处理。
 struct FastProbes {
@@ -1535,6 +1562,25 @@ mod tests {
             .iter()
             .find(|check| check.id == id)
             .unwrap_or_else(|| panic!("缺少检查项 {id}"))
+    }
+
+    #[test]
+    fn probe_versions_normalizes_and_leaves_unknown_empty() {
+        let node = "path:/usr/bin/node\nversion:v24.14.0";
+        let pi = "path:/usr/bin/pi\nversion:pi 1.6.0 (build 2026-11-20)";
+        let runner = FakeRunner::single(fast_ok(node, "", pi));
+        assert_eq!(
+            probe_versions(None, &runner, HostOs::Posix),
+            (Some("1.6.0".to_string()), Some("24.14.0".to_string()))
+        );
+
+        // 两个命令都没装：留空，不报错——导出照常进行。
+        let missing = FakeRunner::single(ok(&format!(
+            "{}{}",
+            fake_section("node", MISSING_MARKER),
+            fake_section("pi", MISSING_MARKER)
+        )));
+        assert_eq!(probe_versions(None, &missing, HostOs::Posix), (None, None));
     }
 
     #[test]

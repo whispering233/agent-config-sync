@@ -289,6 +289,7 @@ pub fn upload<T: DavTransport>(
     client: &WebdavClient<T>,
     app_data: &Path,
     agent_dir: &Path,
+    versions: &snapshot::SourceVersions,
     allow_plaintext: bool,
     overwrite: bool,
 ) -> Result<UploadOutcome, TransferError> {
@@ -296,6 +297,7 @@ pub fn upload<T: DavTransport>(
     let input = UploadInput {
         app_data,
         agent_dir,
+        versions,
         workspace: &workspace,
     };
     let outcome = upload_into(client, &input, allow_plaintext, overwrite);
@@ -308,6 +310,7 @@ pub fn upload<T: DavTransport>(
 struct UploadInput<'a> {
     app_data: &'a Path,
     agent_dir: &'a Path,
+    versions: &'a snapshot::SourceVersions,
     workspace: &'a Path,
 }
 
@@ -324,8 +327,13 @@ fn upload_into<T: DavTransport>(
     overwrite: bool,
 ) -> Result<UploadOutcome, TransferError> {
     // 1. 导出：脱敏、明文扫描、manifest、指纹全部复用快照流水线，不另写一套。
-    snapshot::export(input.agent_dir, input.workspace, allow_plaintext)
-        .map_err(TransferError::Export)?;
+    snapshot::export_with(
+        input.agent_dir,
+        input.workspace,
+        allow_plaintext,
+        input.versions.clone(),
+    )
+    .map_err(TransferError::Export)?;
     let manifest = read_workspace_manifest(input.workspace)?;
 
     // 2. 读远端 manifest：不存在表示首次上传，可解析则拿它判冲突、做条件写。
@@ -1333,6 +1341,24 @@ mod tests {
         write_file(&root.join("prompts/review.md"), "# 评审\n");
     }
 
+    /// 单测不关心来源版本：默认空，调用点保持短。
+    fn upload_for_tests<T: DavTransport>(
+        client: &WebdavClient<T>,
+        app_data: &Path,
+        agent_dir: &Path,
+        allow_plaintext: bool,
+        overwrite: bool,
+    ) -> Result<UploadOutcome, TransferError> {
+        upload(
+            client,
+            app_data,
+            agent_dir,
+            &snapshot::SourceVersions::default(),
+            allow_plaintext,
+            overwrite,
+        )
+    }
+
     fn write_state(app_data: &Path, manifest: &Manifest, seen_at: &str) {
         fs::create_dir_all(app_data).unwrap();
         let state = RemoteState {
@@ -1393,7 +1419,15 @@ mod tests {
         fixture_agent(&agent);
         let (client, transport) = fake_client(first_upload_responses());
 
-        let outcome = upload(&client, &app_data, &agent, false, false).expect("首次上传应成功");
+        let outcome = upload(
+            &client,
+            &app_data,
+            &agent,
+            &snapshot::SourceVersions::default(),
+            false,
+            false,
+        )
+        .expect("首次上传应成功");
 
         let fingerprint = match &outcome {
             UploadOutcome::Uploaded {
@@ -1465,8 +1499,15 @@ mod tests {
         });
         let (client, transport) = fake_client(vec![corrupt]);
 
-        let outcome =
-            upload(&client, &app_data, &agent, false, false).expect("应返回冲突而不是报错");
+        let outcome = upload(
+            &client,
+            &app_data,
+            &agent,
+            &snapshot::SourceVersions::default(),
+            false,
+            false,
+        )
+        .expect("应返回冲突而不是报错");
 
         match outcome {
             UploadOutcome::Conflict {
@@ -1500,7 +1541,15 @@ mod tests {
         responses.extend((0..24).map(|_| response(201)));
         let (client, transport) = fake_client(responses);
 
-        let outcome = upload(&client, &app_data, &agent, false, true).expect("确认覆盖后应成功");
+        let outcome = upload(
+            &client,
+            &app_data,
+            &agent,
+            &snapshot::SourceVersions::default(),
+            false,
+            true,
+        )
+        .expect("确认覆盖后应成功");
 
         match outcome {
             // 清单坏了就没法增量：全部重传。
@@ -1546,36 +1595,60 @@ mod tests {
 
         // 云端可能留着上一轮的快照，而本机目录是新的：按设计会报保守冲突。
         // 测试要可重跑，所以确认覆盖一次，而不是把“上次运行的残留”当成失败。
-        let fingerprint =
-            match upload(&client, &app_data, &agent, false, false).expect("上传应成功") {
-                UploadOutcome::Uploaded {
-                    fingerprint,
-                    uploaded,
-                    skipped,
-                    ..
-                } => {
-                    assert!(uploaded + skipped > 0);
-                    fingerprint
-                }
-                UploadOutcome::Conflict { .. } => {
-                    match upload(&client, &app_data, &agent, false, true).expect("确认覆盖后应成功")
-                    {
-                        UploadOutcome::Uploaded {
-                            fingerprint,
-                            uploaded,
-                            skipped,
-                            ..
-                        } => {
-                            assert!(uploaded + skipped > 0);
-                            fingerprint
-                        }
-                        other => panic!("期望 Uploaded，得到 {other:?}"),
+        let fingerprint = match upload(
+            &client,
+            &app_data,
+            &agent,
+            &snapshot::SourceVersions::default(),
+            false,
+            false,
+        )
+        .expect("上传应成功")
+        {
+            UploadOutcome::Uploaded {
+                fingerprint,
+                uploaded,
+                skipped,
+                ..
+            } => {
+                assert!(uploaded + skipped > 0);
+                fingerprint
+            }
+            UploadOutcome::Conflict { .. } => {
+                match upload(
+                    &client,
+                    &app_data,
+                    &agent,
+                    &snapshot::SourceVersions::default(),
+                    false,
+                    true,
+                )
+                .expect("确认覆盖后应成功")
+                {
+                    UploadOutcome::Uploaded {
+                        fingerprint,
+                        uploaded,
+                        skipped,
+                        ..
+                    } => {
+                        assert!(uploaded + skipped > 0);
+                        fingerprint
                     }
+                    other => panic!("期望 Uploaded，得到 {other:?}"),
                 }
-            };
+            }
+        };
 
         // 同一份内容再传一次：不应该冲突，也不该重传任何文件。
-        let again = upload(&client, &app_data, &agent, false, false).expect("二次上传应成功");
+        let again = upload(
+            &client,
+            &app_data,
+            &agent,
+            &snapshot::SourceVersions::default(),
+            false,
+            false,
+        )
+        .expect("二次上传应成功");
         match again {
             UploadOutcome::Uploaded {
                 uploaded, skipped, ..
@@ -1646,7 +1719,15 @@ mod tests {
 
         // 先完整上传一次，拿到远端真实存在的 manifest（状态里存的就是它）。
         let (first_client, _) = fake_client(first_upload_responses());
-        upload(&first_client, &app_data, &agent, false, false).expect("首次上传应成功");
+        upload(
+            &first_client,
+            &app_data,
+            &agent,
+            &snapshot::SourceVersions::default(),
+            false,
+            false,
+        )
+        .expect("首次上传应成功");
         let remote = load_state(&app_data).unwrap().unwrap().manifest;
 
         write_file(&agent.join("settings.json"), "{\"theme\":\"light\"}");
@@ -1654,7 +1735,15 @@ mod tests {
         responses.extend((0..24).map(|_| response(201)));
         let (client, transport) = fake_client(responses);
 
-        let outcome = upload(&client, &app_data, &agent, false, false).expect("增量上传应成功");
+        let outcome = upload(
+            &client,
+            &app_data,
+            &agent,
+            &snapshot::SourceVersions::default(),
+            false,
+            false,
+        )
+        .expect("增量上传应成功");
 
         match &outcome {
             UploadOutcome::Uploaded {
@@ -1702,7 +1791,15 @@ mod tests {
         )]);
         let (client, transport) = fake_client(vec![with_etag(&manifest_bytes(&remote), "\"v1\"")]);
 
-        let outcome = upload(&client, &app_data, &agent, false, false).expect("冲突不是错误");
+        let outcome = upload(
+            &client,
+            &app_data,
+            &agent,
+            &snapshot::SourceVersions::default(),
+            false,
+            false,
+        )
+        .expect("冲突不是错误");
 
         // 没有基准就算不出差异：三个清单给空，由前端文案解释。
         assert_eq!(
@@ -1741,7 +1838,15 @@ mod tests {
         write_state(&app_data, &recorded, "2026-11-01T08:00:00Z");
         let (client, transport) = fake_client(vec![with_etag(&manifest_bytes(&remote), "\"v2\"")]);
 
-        let outcome = upload(&client, &app_data, &agent, false, false).expect("冲突不是错误");
+        let outcome = upload(
+            &client,
+            &app_data,
+            &agent,
+            &snapshot::SourceVersions::default(),
+            false,
+            false,
+        )
+        .expect("冲突不是错误");
 
         assert_eq!(
             outcome,
@@ -1773,7 +1878,15 @@ mod tests {
         responses.extend((0..24).map(|_| response(201)));
         let (client, transport) = fake_client(responses);
 
-        let outcome = upload(&client, &app_data, &agent, false, true).expect("覆盖上传应成功");
+        let outcome = upload(
+            &client,
+            &app_data,
+            &agent,
+            &snapshot::SourceVersions::default(),
+            false,
+            true,
+        )
+        .expect("覆盖上传应成功");
 
         let fingerprint = match &outcome {
             UploadOutcome::Uploaded {
@@ -1803,7 +1916,15 @@ mod tests {
         let agent = temp.path().join("agent");
         fixture_agent(&agent);
         let (first_client, _) = fake_client(first_upload_responses());
-        upload(&first_client, &app_data, &agent, false, false).expect("首次上传应成功");
+        upload(
+            &first_client,
+            &app_data,
+            &agent,
+            &snapshot::SourceVersions::default(),
+            false,
+            false,
+        )
+        .expect("首次上传应成功");
         let before = load_state(&app_data).unwrap().unwrap();
 
         // 无损内容变：文件全部跳过，直接提交 manifest，服务端回 412。
@@ -1813,7 +1934,15 @@ mod tests {
         responses.push(response(412));
         let (client, transport) = fake_client(responses);
 
-        let error = upload(&client, &app_data, &agent, false, false).expect_err("412 应失败");
+        let error = upload(
+            &client,
+            &app_data,
+            &agent,
+            &snapshot::SourceVersions::default(),
+            false,
+            false,
+        )
+        .expect_err("412 应失败");
 
         assert_eq!(error, TransferError::RemoteChanged);
         assert_eq!(
@@ -1855,7 +1984,15 @@ mod tests {
 
         // 宿主目录不存在：导出预检就失败，一个请求都不该发出去。
         let (client, transport) = fake_client(Vec::new());
-        let error = upload(&client, &app_data, &agent, false, false).expect_err("导出失败应停下");
+        let error = upload(
+            &client,
+            &app_data,
+            &agent,
+            &snapshot::SourceVersions::default(),
+            false,
+            false,
+        )
+        .expect_err("导出失败应停下");
         match error {
             TransferError::Export(failure) => assert_eq!(failure.code, "agent_dir_missing"),
             other => panic!("期望 Export，得到 {other:?}"),
@@ -1878,8 +2015,15 @@ mod tests {
         );
 
         let (client, transport) = fake_client(Vec::new());
-        let error =
-            upload(&client, &app_data, &agent, false, false).expect_err("明文密钥未确认时不能上传");
+        let error = upload(
+            &client,
+            &app_data,
+            &agent,
+            &snapshot::SourceVersions::default(),
+            false,
+            false,
+        )
+        .expect_err("明文密钥未确认时不能上传");
         match error {
             TransferError::Export(failure) => {
                 assert_eq!(failure.code, "secrets_unconfirmed");
@@ -1891,8 +2035,15 @@ mod tests {
 
         // 用户确认后同一个入口能继续：复用导出的 allow_plaintext 语义。
         let (confirming_client, _) = fake_client(first_upload_responses());
-        let outcome =
-            upload(&confirming_client, &app_data, &agent, true, false).expect("确认后应上传成功");
+        let outcome = upload(
+            &confirming_client,
+            &app_data,
+            &agent,
+            &snapshot::SourceVersions::default(),
+            true,
+            false,
+        )
+        .expect("确认后应上传成功");
         assert!(matches!(outcome, UploadOutcome::Uploaded { .. }));
     }
 }

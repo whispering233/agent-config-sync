@@ -108,6 +108,7 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
 }
 ```
 
+- `source.pi` / `source.node`：导出时按环境检测同一组探测取版本（能解析就规范成 `x.y.z`），探测不到记 `null`；只作来源记录，不参与指纹与冲突判定。
 - `fingerprint`：对 `formatVersion` 与所有 `{path, sha256}` 排序后取哈希，显示前 12 位。用途：两台机器肉眼核对"是不是同一份快照"。
 - manifest **最后写**：文件先落盘，manifest 落盘即代表快照完整。
 - 未知 `formatVersion` 一律拒绝读取，不尝试兼容。
