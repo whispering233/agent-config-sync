@@ -6,27 +6,11 @@
 
 | 卡 | 内容 | 依赖 | 可并行 |
 | :--- | :--- | :--- | :--- |
-| T2 | Release：tag 建发布 | — | 否 |
-| T3 | Linux 打包与资产上传 | T2 | 否 |
 | T4 | 传输方式与 WebDAV 凭据 | — | 与 T5 |
 | T5 | WebDAV 客户端 | — | 与 T4 |
 | T6 | 连通性探测 | T4、T5 | 否 |
 | T7 | 上传与冲突判定 | T4、T5 | 与 T8 |
 | T8 | 下载与暂存 | T4、T5 | 与 T7 |
-
-## T2 Release：tag 建发布
-
-- 目标：push `v*` tag 后生成带正文的 GitHub Release。
-- 范围：`.github/workflows/release.yml`；第一步校验三处版本号（`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`）与 tag 一致；正文取 `CHANGELOG.md` 对应 `## [vX.Y.Z]` 段；`permissions: contents: write`。同时把 `CHANGELOG.md` 的 `[Unreleased]` 内容整理成 `## [v0.0.1] - <日期>` 段。
-- 验收：版本不一致时失败且不建 Release；在仓库推一个临时 tag 后 Release 正文与 CHANGELOG 段一致。
-- 依赖：无。回滚：删除工作流；Release 手工删除。
-
-## T3 Linux 打包与资产上传
-
-- 目标：同一个 tag 产出 deb 与 AppImage 并挂到该 Release。
-- 范围：`.github/workflows/desktop.yml`；`ubuntu-22.04`；安装 webkit 依赖；`tauri-action` 出 `deb,appimage` 并上传；`workflow_dispatch` 输入 `release_tag` 用于补包。
-- 验收：tag 触发的运行里 Release 有 deb + AppImage 两个资产；手动触发能把资产补到已有 Release；资产上传不改 Release 正文。
-- 依赖：T2。回滚：删除工作流。
 
 ## T4 传输方式与 WebDAV 凭据
 
