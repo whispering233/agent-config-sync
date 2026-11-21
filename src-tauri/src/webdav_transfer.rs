@@ -1558,6 +1558,46 @@ mod tests {
         );
     }
 
+    /// 条件写诊断：看服务端到底给不给 ETag、认不认 If-Match。
+    /// 只在一个临时文件上试，不碰 manifest，跑完删掉。
+    #[test]
+    #[ignore = "需要真实 WebDAV 服务器与凭据（DAV_URL / DAV_USER / DAV_PASS）"]
+    fn interop_probes_conditional_write() {
+        let url = std::env::var("DAV_URL").expect("需要 DAV_URL");
+        let user = std::env::var("DAV_USER").expect("需要 DAV_USER");
+        let pass = std::env::var("DAV_PASS").expect("需要 DAV_PASS");
+
+        let transport = crate::webdav::ReqwestTransport::new(&user, &pass).expect("构造 transport");
+        let client = WebdavClient::new(transport, &url);
+
+        client.mkcol("").expect("工作根应可创建或已存在");
+        client
+            .put("etag-probe.txt", b"one", &[])
+            .expect("写探针文件");
+
+        let (body, etag) = client
+            .get("etag-probe.txt")
+            .expect("读探针文件")
+            .expect("探针文件应存在");
+        assert_eq!(body, b"one");
+        println!("GET 响应的 ETag: {etag:?}");
+
+        let wrong = vec![("If-Match".to_string(), "\"definitely-wrong\"".to_string())];
+        match client.put("etag-probe.txt", b"two", &wrong) {
+            Err(DavError::PreconditionFailed) => {
+                println!("If-Match 生效：错误 ETag 被拒（412）");
+            }
+            Ok(()) => {
+                println!("⚠ 服务端忽略 If-Match：错误 ETag 仍然写入成功");
+            }
+            Err(other) => {
+                println!("⚠ 条件写入返回了预期之外的结果：{other}");
+            }
+        }
+
+        client.delete("etag-probe.txt").expect("清理探针文件");
+    }
+
     #[test]
     fn upload_puts_only_files_that_differ_from_the_remote_manifest() {
         let temp = TempDir::new("upload-incremental");
