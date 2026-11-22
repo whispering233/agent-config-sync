@@ -86,6 +86,7 @@ T10  │             │      └─▶ T5 ─┬─▶ T6 ─▶ T7
 | 目标 | 远端取包、解包、交给现有计划与应用；下载不改动远端 |
 | 改动 | 下载命令接到 T2 的 WebDAV 实现：列举 → 默认取名字最大的包（或指定包）→ `get` → 体积上限（先看列出的 `content-length`）→ 解包到 `staging/<包名>/`；`remote_no_packages` / `package_not_found` / `remote_insecure` 的文案；记录 `remote-state.json` 的包集合与 `seenAt`；`DownloadView` 加包字段；前端下载区展示包名与创建时间 |
 | 验证 | 端到端：下载 → 计划 → 应用跑通；远端为空报 `remote_no_packages`；选中后被删报 `package_not_found`；坏包不污染 `staging/`；同一份包重复下载结果一致 |
+| 兼带 | 修掉上传侧的缺口：`unchanged` 路径现在一次请求都不发，导致「内容未变、但另一台机器推了新包」时 `unseen` 恒为 0，托盘显示 `success` 而非 `diverged`。本卡让它也列一次远端，更新 `state.packages` 与 `seenAt`（**不动** `lastUploadedFingerprint`） |
 | 依赖 | T3 |
 | 回滚 | 单次提交回退 |
 
