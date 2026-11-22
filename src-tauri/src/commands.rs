@@ -2,15 +2,14 @@
 
 use crate::auto_sync;
 use crate::config::{
-    self, AppConfig, ConfigError, ConfigValidation, AGENT_DIR_ENV_VAR, CONFIG_FILE_NAME,
+    self, AppConfig, ConfigError, ConfigValidation, Transport, AGENT_DIR_ENV_VAR, CONFIG_FILE_NAME,
 };
 use crate::credentials::{self, CredentialError, WebdavCredentials};
-use crate::doctor::{self, ShellRunner};
-use crate::platform::HostOs;
 use crate::runtime;
-use crate::snapshot;
+use crate::snapshot::{self, ExportReport};
+use crate::store::{LocalStore, PackageStore};
 use crate::webdav::{self, DavError, ReqwestTransport, WebdavClient};
-use crate::webdav_transfer::{self, TransferError, UploadOutcome};
+use crate::webdav_transfer;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
@@ -85,12 +84,6 @@ fn webdav_summary(credentials: Option<&WebdavCredentials>) -> WebdavSummary {
 
 fn credential_error(error: CredentialError) -> String {
     error.to_string()
-}
-
-fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_data_dir()
-        .map_err(|error| format!("无法定位应用数据目录：{error}"))
 }
 
 #[tauri::command]
@@ -172,87 +165,116 @@ pub async fn test_webdav_connection(
     .map_err(|error| format!("测试连接失败：{error}"))?
 }
 
-/// 一次下载的结果。`stagingRoot` 顶替同步根，交给 `verify_and_plan` 与 `apply_snapshot`。
+/// 读取应用配置。
+fn app_config(app: &AppHandle) -> Result<AppConfig, String> {
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("无法定位应用配置目录：{error}"))?;
+
+    config::load_config(&config_dir).map_err(|error| error.to_string())
+}
+
+/// 本地文件夹模式的存储根。WebDAV 模式在这里就被挡下，两个方向都不会退到旧链路。
+fn local_store(app: &AppHandle) -> Result<LocalStore, String> {
+    let config = app_config(app)?;
+    if config.transport != Transport::Local {
+        return Err(webdav_transfer::REMOTE_NOT_READY_MESSAGE.to_string());
+    }
+    let root = config
+        .sync_root
+        .ok_or_else(|| "还没有设置同步文件夹：请先在设置页选择，再回来导出或恢复".to_string())?;
+
+    Ok(LocalStore::new(root))
+}
+
+fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map_err(|error| format!("无法定位应用数据目录：{error}"))
+}
+
+/// 存储根里的一个包。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageEntryView {
+    name: String,
+    size: u64,
+    /// RFC 3339 UTC，由包名里的时间戳换算。
+    created_at: String,
+}
+
+/// 一次列举的结果。`newest` 是默认选中项：恢复时先挑名字最大的一份。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageListView {
+    packages: Vec<PackageEntryView>,
+    newest: Option<String>,
+    /// 无法识别的文件（`.tmp-*`、云盘冲突副本等）：只展示，不可操作。
+    unrecognized: Vec<String>,
+}
+
+/// 列举存储根里的快照包，按名字倒序（最新在前）。
+#[tauri::command]
+pub fn list_snapshot_packages(app: AppHandle) -> Result<PackageListView, String> {
+    let listing = local_store(&app)?.list().map_err(|error| error.message)?;
+    let mut packages: Vec<PackageEntryView> = listing
+        .packages
+        .into_iter()
+        .map(|entry| PackageEntryView {
+            name: entry.name,
+            size: entry.size,
+            created_at: snapshot::format_timestamp(entry.created_at),
+        })
+        .collect();
+    packages.sort_by(|left, right| right.name.cmp(&left.name));
+    let newest = packages.first().map(|entry| entry.name.clone());
+
+    Ok(PackageListView {
+        packages,
+        newest,
+        unrecognized: listing.unrecognized,
+    })
+}
+
+/// 取包到本机暂存的结果。`stagingRoot` 顶替同步根，交给 `verify_and_plan` 与 `apply_snapshot`。
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadView {
-    staging_root: PathBuf,
-    fingerprint: String,
-    file_count: usize,
+    package_name: String,
     created_at: String,
-    /// 本次下载之前记录的同步时间；本机没有记录时为 null。
-    previous_seen_at: Option<String>,
+    file_count: usize,
+    staging_root: PathBuf,
 }
 
-/// 凭据缺失就是「还没配置」：这句话要能直接指路，不能只报文件不存在。
-fn download_credential_error(error: CredentialError) -> String {
-    match error {
-        CredentialError::Read { .. } | CredentialError::Corrupt { .. } => error.to_string(),
-        other => format!("还没有可用的 WebDAV 凭据：{other}；请先在设置页填写地址、用户名与密码"),
-    }
-}
-
-/// 网络类错误沿用设置页那套中文说法，其余直接用下载模块的说明。
-fn transfer_error(error: TransferError) -> String {
-    match error {
-        TransferError::Network(dav) => dav_error(dav),
-        other => other.to_string(),
-    }
-}
-
-/// 按远端 manifest 把快照取到本机暂存目录。不写 live，不碰同步文件夹。
+/// 取一份包到本机暂存目录；`package` 缺省时取名字最大的一份。
+///
+/// 解包之后完全复用 `10-snapshot-sync.md` 第 6 节的校验 → 计划 → 备份 → 应用，本命令不写 live。
 #[tauri::command]
-pub async fn download_remote_snapshot(app: AppHandle) -> Result<DownloadView, String> {
-    // 单文件传输超时 120s 是阻塞等待，留在 UI 线程会冻住窗口。
+pub async fn download_remote_snapshot(
+    app: AppHandle,
+    package: Option<String>,
+) -> Result<DownloadView, String> {
+    // 解包是阻塞 IO，留在 UI 线程会冻住窗口。
     tauri::async_runtime::spawn_blocking(move || {
         // 与自动上行、应用/回滚共用同一把锁，避免两套写盘同时跑。
         let _guard = crate::runtime::lock_operation();
-        let dir = app_data_dir(&app)?;
-        let credentials = credentials::load(&dir)
-            .map_err(download_credential_error)?
-            .ok_or_else(|| "还没有配置 WebDAV：请先在设置页填写地址、用户名与密码".to_string())?;
-        let transport = ReqwestTransport::new(&credentials.username, &credentials.password)
-            .map_err(dav_error)?;
-        let outcome =
-            webdav_transfer::download(&WebdavClient::new(transport, &credentials.url), &dir)
-                .map_err(transfer_error)?;
+        let store = local_store(&app)?;
+        let staged =
+            webdav_transfer::stage_package(&store, &app_data_dir(&app)?, package.as_deref())?;
 
         Ok(DownloadView {
-            staging_root: outcome.staging_root,
-            fingerprint: outcome.manifest.fingerprint,
-            file_count: outcome.manifest.files.len(),
-            created_at: outcome.manifest.created_at,
-            previous_seen_at: outcome.previous_seen_at,
+            package_name: staged.package_name,
+            created_at: staged.created_at,
+            file_count: staged.file_count,
+            staging_root: staged.staging_root,
         })
     })
     .await
-    .map_err(|error| format!("下载失败：{error}"))?
+    .map_err(|error| format!("取快照包失败：{error}"))?
 }
 
-/// 一次上传的结局。前端按 `kind` 区分「已上传」与「需要用户先选一边」。
-#[derive(Debug, serde::Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
-pub enum UploadView {
-    #[serde(rename_all = "camelCase")]
-    Uploaded {
-        fingerprint: String,
-        uploaded: usize,
-        skipped: usize,
-        /// 本次上传后记录的远端状态时间；前端直接拿它刷「上次同步时间」。
-        seen_at: String,
-    },
-    #[serde(rename_all = "camelCase")]
-    Conflict {
-        remote_fingerprint: String,
-        added: Vec<String>,
-        modified: Vec<String>,
-        removed: Vec<String>,
-        /// 远端清单损坏：只能覆盖，无法先下载。
-        remote_corrupt: bool,
-    },
-}
-
-/// 上传失败。码沿用 `40-webdav.md` §8。
+/// 上传失败。码沿用 `10-snapshot-sync.md` §9 的失败码表。
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UploadFailure {
@@ -260,122 +282,33 @@ pub struct UploadFailure {
     message: String,
 }
 
-fn upload_failure(code: &'static str, message: String) -> UploadFailure {
-    UploadFailure { code, message }
-}
-
-/// 失败码：先定码，再取文案（导出失败有自己的码，其余按传输层分类）。
-fn upload_failure_code(error: &TransferError) -> &'static str {
-    match error {
-        TransferError::Export(failure) => failure.code,
-        TransferError::NotFound => "remote_not_found",
-        TransferError::Corrupt(_) => "remote_manifest_corrupt",
-        TransferError::RemoteChanged => "remote_changed",
-        TransferError::Insecure(_) => "remote_insecure",
-        TransferError::Network(DavError::AuthFailed) => "remote_auth_failed",
-        TransferError::Network(DavError::Quota) => "remote_quota",
-        TransferError::Network(_) => "remote_unreachable",
-        _ => "upload_failed",
-    }
-}
-
-fn upload_failure_from(error: TransferError) -> UploadFailure {
-    let code = upload_failure_code(&error);
-    match error {
-        TransferError::Export(failure) => UploadFailure {
-            code,
-            message: failure.message,
-        },
-        other => upload_failure(code, transfer_error(other)),
-    }
-}
-
-/// 把当前 live 导出并推到 WebDAV。冲突时远端一个字节都不写，等用户选「覆盖」或「从云端更新」。
+/// 本地文件夹模式的「上传」= 导出成包放进存储根（由云盘客户端负责搬运）；
+/// WebDAV 模式沿用同一个失败形状，只是先停在这里。
 #[tauri::command]
-pub async fn upload_snapshot(app: AppHandle, overwrite: bool) -> Result<UploadView, UploadFailure> {
-    // 导出、逐文件 PUT 与 120s 单文件超时都是阻塞等待，留在 UI 线程会冻住窗口。
+pub async fn upload_snapshot(app: AppHandle) -> Result<ExportReport, UploadFailure> {
+    // 导出要遍历、扫描并打包，留在 UI 线程会冻住窗口。
     tauri::async_runtime::spawn_blocking(move || {
-        let _guard = crate::runtime::lock_operation();
-        let config_dir = app.path().app_config_dir().map_err(|error| {
-            upload_failure(
-                "app_config_unavailable",
-                format!("无法定位应用配置目录：{error}"),
-            )
+        let config = app_config(&app).map_err(|message| UploadFailure {
+            code: "app_config_unavailable",
+            message,
         })?;
-        let config = config::load_config(&config_dir)
-            .map_err(|error| upload_failure("app_config_unavailable", error.to_string()))?;
-        // 只读取这一个文档化的变量；错误信息里不回显其内容。
-        let env_agent_dir = std::env::var_os(AGENT_DIR_ENV_VAR).map(PathBuf::from);
-        let home_dir = app.path().home_dir().ok();
-        let agent_dir =
-            config::resolve_agent_dir(&config, env_agent_dir.as_deref(), home_dir.as_deref())
-                .path
-                .ok_or_else(|| {
-                    upload_failure(
-                        "agent_dir_missing",
-                        "无法确定宿主目录，请先在设置页填写".to_string(),
-                    )
-                })?;
+        if config.transport != Transport::Local {
+            return Err(UploadFailure {
+                code: "remote_not_ready",
+                message: webdav_transfer::REMOTE_NOT_READY_MESSAGE.to_string(),
+            });
+        }
 
-        let dir =
-            app_data_dir(&app).map_err(|error| upload_failure("app_data_unavailable", error))?;
-        let credentials = credentials::load(&dir)
-            .map_err(|error| {
-                upload_failure("remote_not_configured", download_credential_error(error))
-            })?
-            .ok_or_else(|| {
-                upload_failure(
-                    "remote_not_configured",
-                    "还没有配置 WebDAV：请先在设置页填写地址、用户名与密码".to_string(),
-                )
-            })?;
-        let transport = ReqwestTransport::new(&credentials.username, &credentials.password)
-            .map_err(|error| upload_failure("remote_unreachable", dav_error(error)))?;
-        // 与本地导出同一份探测：manifest 的 source 记下这次上传来自哪个宿主版本。
-        let (pi, node) = doctor::probe_versions(
-            Some(&agent_dir),
-            &ShellRunner::from_env(),
-            HostOs::current(),
-        );
-        let versions = snapshot::SourceVersions { pi, node };
-        let outcome = webdav_transfer::upload(
-            &WebdavClient::new(transport, &credentials.url),
-            &dir,
-            &agent_dir,
-            &versions,
-            overwrite,
-        )
-        .map_err(upload_failure_from)?;
-
-        Ok(match outcome {
-            UploadOutcome::Uploaded {
-                fingerprint,
-                uploaded,
-                skipped,
-                seen_at,
-            } => UploadView::Uploaded {
-                fingerprint,
-                uploaded,
-                skipped,
-                seen_at,
-            },
-            UploadOutcome::Conflict {
-                remote_fingerprint,
-                added,
-                modified,
-                removed,
-                remote_corrupt,
-            } => UploadView::Conflict {
-                remote_fingerprint,
-                added,
-                modified,
-                removed,
-                remote_corrupt,
-            },
+        snapshot::export_to_local_store(&app).map_err(|failure| UploadFailure {
+            code: failure.code,
+            message: failure.message,
         })
     })
     .await
-    .map_err(|error| upload_failure("upload_failed", format!("上传失败：{error}")))?
+    .map_err(|error| UploadFailure {
+        code: "upload_failed",
+        message: format!("上传失败：{error}"),
+    })?
 }
 
 #[tauri::command]
@@ -456,42 +389,47 @@ pub fn trigger_auto_sync() -> auto_sync::AutoSyncStatus {
 mod tests {
     use super::*;
 
-    /// 前端按 `kind` 与 camelCase 字段消费；形状一变就会静默拿不到数据。
+    /// 前端按 camelCase 字段消费；形状一变就会静默拿不到数据。
     #[test]
-    fn upload_view_serializes_with_kind_and_camel_case() {
-        let uploaded = UploadView::Uploaded {
-            fingerprint: "abc123".to_string(),
-            uploaded: 2,
-            skipped: 3,
-            seen_at: "2026-11-20T05:30:00Z".to_string(),
+    fn download_view_serializes_with_camel_case() {
+        let view = DownloadView {
+            package_name: "20261122-105230-deadbeef.zip".to_string(),
+            created_at: "2026-11-22T10:52:30Z".to_string(),
+            file_count: 7,
+            staging_root: PathBuf::from("/data/staging/20261122-105230-deadbeef.zip"),
         };
         assert_eq!(
-            serde_json::to_value(&uploaded).unwrap(),
+            serde_json::to_value(&view).unwrap(),
             serde_json::json!({
-                "kind": "uploaded",
-                "fingerprint": "abc123",
-                "uploaded": 2,
-                "skipped": 3,
-                "seenAt": "2026-11-20T05:30:00Z",
+                "packageName": "20261122-105230-deadbeef.zip",
+                "createdAt": "2026-11-22T10:52:30Z",
+                "fileCount": 7,
+                "stagingRoot": "/data/staging/20261122-105230-deadbeef.zip",
             })
         );
+    }
 
-        let conflict = UploadView::Conflict {
-            remote_fingerprint: "def456".to_string(),
-            added: vec!["snapshot/a.md".to_string()],
-            modified: Vec::new(),
-            removed: Vec::new(),
-            remote_corrupt: false,
+    #[test]
+    fn package_list_serializes_with_camel_case() {
+        let list = PackageListView {
+            packages: vec![PackageEntryView {
+                name: "20261122-105230-deadbeef.zip".to_string(),
+                size: 4096,
+                created_at: "2026-11-22T10:52:30Z".to_string(),
+            }],
+            newest: Some("20261122-105230-deadbeef.zip".to_string()),
+            unrecognized: vec!["notes.txt".to_string()],
         };
         assert_eq!(
-            serde_json::to_value(&conflict).unwrap(),
+            serde_json::to_value(&list).unwrap(),
             serde_json::json!({
-                "kind": "conflict",
-                "remoteFingerprint": "def456",
-                "added": ["snapshot/a.md"],
-                "modified": [],
-                "removed": [],
-                "remoteCorrupt": false,
+                "packages": [{
+                    "name": "20261122-105230-deadbeef.zip",
+                    "size": 4096,
+                    "createdAt": "2026-11-22T10:52:30Z",
+                }],
+                "newest": "20261122-105230-deadbeef.zip",
+                "unrecognized": ["notes.txt"],
             })
         );
     }
@@ -499,12 +437,15 @@ mod tests {
     /// 失败码与文案要能过 IPC。
     #[test]
     fn upload_failure_carries_code_and_message() {
-        let failure = upload_failure("remote_changed", "远端被改写".to_string());
+        let failure = UploadFailure {
+            code: "remote_not_ready",
+            message: webdav_transfer::REMOTE_NOT_READY_MESSAGE.to_string(),
+        };
         assert_eq!(
             serde_json::to_value(&failure).unwrap(),
             serde_json::json!({
-                "code": "remote_changed",
-                "message": "远端被改写",
+                "code": "remote_not_ready",
+                "message": webdav_transfer::REMOTE_NOT_READY_MESSAGE,
             })
         );
     }

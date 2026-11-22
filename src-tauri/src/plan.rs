@@ -818,7 +818,7 @@ mod tests {
         write_file(&agent.join("auth.json"), "{}");
         write_file(&agent.join("sessions/session.json"), "{}");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        snapshot::export(&agent, &sync_root).expect("导出夹具快照");
+        snapshot::export_fixture(&agent, &sync_root).expect("导出夹具快照");
         (agent, sync_root)
     }
 
@@ -855,7 +855,7 @@ mod tests {
         write_file(&agent.join("settings.json"), "{\"theme\": \"dark\"}");
         write_file(&outside.join("keep.txt"), "keep");
         fs::create_dir_all(&sync_root).expect("建同步目录");
-        snapshot::export(&agent, &sync_root).expect("导出夹具快照");
+        snapshot::export_fixture(&agent, &sync_root).expect("导出夹具快照");
         // 导出之后才出现的链接：快照里没有它，只能删链接本身。
         fs::create_dir_all(agent.join("skills")).expect("建 skills");
         symlink(&outside, agent.join("skills/extra")).expect("建目录链接");
@@ -885,7 +885,7 @@ mod tests {
         fs::create_dir_all(agent.join("skills")).expect("建 skills");
         fs::create_dir_all(&sync_root).expect("建同步目录");
         symlink(&outside, agent.join("skills/extra")).expect("建目录链接");
-        snapshot::export(&agent, &sync_root).expect("导出夹具快照");
+        snapshot::export_fixture(&agent, &sync_root).expect("导出夹具快照");
 
         let report =
             plan_snapshot(&agent, &sync_root, &FakeRunner::ok(), HostOs::Posix).expect("生成计划");

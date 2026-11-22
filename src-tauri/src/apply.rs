@@ -1123,7 +1123,7 @@ mod tests {
         write_file(&agent.join("auth.json"), "{\"token\": \"sk-test\"}");
         write_file(&agent.join("sessions/old.json"), "{}");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &sync_root).expect("导出夹具快照");
+        crate::snapshot::export_fixture(&agent, &sync_root).expect("导出夹具快照");
         (agent, sync_root)
     }
 
@@ -1303,7 +1303,7 @@ mod tests {
         assert_eq!(failure.code, "manifest_invalid", "{}", failure.message);
 
         // 云盘只传了一半：manifest 还在，但文件内容不符。
-        crate::snapshot::export(&agent, &sync_root).expect("重新导出快照");
+        crate::snapshot::export_fixture(&agent, &sync_root).expect("重新导出快照");
         write_file(
             &sync_root.join("snapshot/settings.json"),
             "{\"theme\": \"half\"}",
@@ -1370,7 +1370,7 @@ mod tests {
         write_file(&agent.join("settings.json"), "{\"theme\": \"dark\"}");
         write_file(&temp.path().join("outside/keep.txt"), "留在这里\n");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &sync_root).expect("导出快照");
+        crate::snapshot::export_fixture(&agent, &sync_root).expect("导出快照");
         // 导出之后才出现的链接：快照里没有它，只能删链接本身。
         fs::create_dir_all(agent.join("skills")).expect("创建 skills");
         symlink(temp.path().join("outside"), agent.join("skills/extra")).expect("创建目录链接");
@@ -1434,7 +1434,7 @@ mod tests {
         )
         .expect("创建符号链接");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &sync_root).expect("导出快照");
+        crate::snapshot::export_fixture(&agent, &sync_root).expect("导出快照");
 
         // 链接目标内容变了：计划里 SKILL.md 变成"修改"；settings.json 也改一下，
         // 让备份同时覆盖"修改文件 + 修改链接"两种情况。
@@ -1670,7 +1670,7 @@ mod tests {
         fs::create_dir_all(&agent).expect("创建宿主目录");
         symlink("../outside/skills-live", agent.join("skills")).expect("创建目录链接");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &sync_root).expect("导出夹具快照");
+        crate::snapshot::export_fixture(&agent, &sync_root).expect("导出夹具快照");
         (agent, sync_root, external)
     }
 
@@ -1842,7 +1842,7 @@ mod tests {
         fs::create_dir_all(&agent).expect("创建宿主目录");
         symlink("../outside/skills-live", agent.join("skills")).expect("创建目录链接");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &sync_root).expect("导出夹具快照");
+        crate::snapshot::export_fixture(&agent, &sync_root).expect("导出夹具快照");
         (agent, sync_root, external)
     }
 
@@ -2013,7 +2013,7 @@ mod tests {
         )
         .expect("创建目录链接");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &sync_root).expect("导出夹具快照");
+        crate::snapshot::export_fixture(&agent, &sync_root).expect("导出夹具快照");
 
         // 链接没了，父目录又不可写：建链接失败之后连物化都落不下去。
         fs::remove_file(agent.join("agents/link-to-shared")).expect("删除夹具链接");

@@ -4,9 +4,6 @@
 //! 本模块只处理字节：manifest 由调用方序列化好交给 [`pack`]，解出来的仍是字节，
 //! 这里不认识 manifest 结构，也不碰受管范围、计划与网络。
 
-// 这一层的调用方是存储与导出流程，还没接上；在那之前整层只由下面的测试引用。
-#![allow(dead_code)]
-
 use crate::platform;
 use crate::snapshot;
 use std::fmt;
@@ -24,6 +21,8 @@ pub const SNAPSHOT_ENTRY_PREFIX: &str = "snapshot/";
 pub const TEMP_NAME_PREFIX: &str = ".tmp-";
 
 const COPY_BUFFER: usize = 64 * 1024;
+/// manifest 是被单独读的唯一条目，它自己也要有体积上限（不可信输入）。
+const MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 /// 解包落盘的权限：暂存目录可能是下一次应用的对象，而快照含明文密钥。
 /// 不套用包内记录的 mode——那是不可信输入。
 const UNPACK_DIR_MODE: u32 = 0o700;
@@ -176,11 +175,6 @@ fn parse_stamp(stamp: &str) -> Option<u64> {
     Some(days as u64 * 86_400 + hour * 3600 + minute * 60 + second)
 }
 
-/// 上传中的临时名，永不当作包。
-pub fn is_temp_name(name: &str) -> bool {
-    name.starts_with(TEMP_NAME_PREFIX)
-}
-
 /// 打包：`manifest.json` 原样写入，`snapshot_dir` 的内容递归带 `snapshot/` 前缀。
 ///
 /// `manifest_json` 由调用方序列化：这里不重新序列化，避免打包与 manifest 内容分家。
@@ -275,6 +269,48 @@ fn file_options(mode: Option<u32>) -> SimpleFileOptions {
         Some(mode) => options.unix_permissions(mode),
         None => options,
     }
+}
+
+/// 只读包里的 `manifest.json`：列举历史时看指纹、导出前判「内容未变」都只需要它，
+/// 为此解整包会把上百个文件写到盘上再删掉。
+pub fn read_manifest(archive: &Path) -> Result<Vec<u8>, PackageError> {
+    let size = fs::metadata(archive)
+        .map_err(|error| {
+            PackageError::corrupt(format!("无法读取包文件 {}：{error}", archive.display()))
+        })?
+        .len();
+    if size > Limits::default().package_bytes {
+        return Err(PackageError::too_large(format!(
+            "包体积 {size} 字节，超过上限 {}",
+            Limits::default().package_bytes
+        )));
+    }
+    let file = File::open(archive).map_err(|error| {
+        PackageError::corrupt(format!("无法打开包文件 {}：{error}", archive.display()))
+    })?;
+    let mut zip = ZipArchive::new(file)
+        .map_err(|error| PackageError::corrupt(format!("无法解析快照包：{error}")))?;
+    let mut entry = zip
+        .by_name(MANIFEST_ENTRY)
+        .map_err(|_| PackageError::corrupt("包内缺少 manifest.json"))?;
+    // manifest 正常只有几 KB；条目声明的体积决定要不要读，读的时候再卡一次硬上限。
+    if entry.size() > MANIFEST_MAX_BYTES {
+        return Err(PackageError::unsafe_entry(format!(
+            "manifest.json 声明 {} 字节，超过 {MANIFEST_MAX_BYTES} 字节上限",
+            entry.size()
+        )));
+    }
+    let mut bytes = Vec::new();
+    io::Read::take(&mut entry, MANIFEST_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| PackageError::corrupt(format!("manifest.json 读不出来：{error}")))?;
+    if bytes.len() as u64 > MANIFEST_MAX_BYTES {
+        return Err(PackageError::unsafe_entry(format!(
+            "manifest.json 超过 {MANIFEST_MAX_BYTES} 字节上限"
+        )));
+    }
+
+    Ok(bytes)
 }
 
 /// 解包到 `dest`。`dest` 必须是调用方按包名准备的新路径：失败时整棵删掉，不留半套快照。
@@ -577,6 +613,38 @@ mod tests {
     }
 
     #[test]
+    fn read_manifest_returns_only_that_entry() {
+        let temp = TempDir::new("read-manifest");
+        let source = temp.path().join("snapshot");
+        let manifest = br#"{"formatVersion":2,"files":[]}"#;
+        write_file(&source.join("settings.json"), br#"{"theme":"dark"}"#);
+        let archive = temp.path().join("20261122-105230-deadbeef.zip");
+        pack(&archive, manifest, &source).expect("打包");
+
+        assert_eq!(read_manifest(&archive).expect("读 manifest"), manifest);
+    }
+
+    #[test]
+    fn read_manifest_rejects_package_without_manifest() {
+        let temp = TempDir::new("read-manifest-missing");
+        let archive = temp.path().join("package.zip");
+        build_zip(&archive, &[("snapshot/a.json", b"x")]);
+
+        let error = read_manifest(&archive).expect_err("缺 manifest 必须拒绝");
+        assert_eq!(error.code, "package_corrupt", "{}", error.message);
+    }
+
+    #[test]
+    fn read_manifest_rejects_non_zip() {
+        let temp = TempDir::new("read-manifest-garbage");
+        let archive = temp.path().join("package.zip");
+        write_file(&archive, b"not a zip at all");
+
+        let error = read_manifest(&archive).expect_err("非 zip 必须拒绝");
+        assert_eq!(error.code, "package_corrupt", "{}", error.message);
+    }
+
+    #[test]
     fn empty_directories_are_not_packed() {
         let temp = TempDir::new("emptydir");
         let source = temp.path().join("snapshot");
@@ -871,12 +939,5 @@ mod tests {
         ] {
             assert_eq!(parse_name(name), None, "{name} 必须拒绝");
         }
-    }
-
-    #[test]
-    fn temp_name_prefix_is_recognized() {
-        assert!(is_temp_name(".tmp-1-20261122105230"));
-        assert!(!is_temp_name("20261122-105230-deadbeef.zip"));
-        assert!(!is_temp_name("tmp-1"));
     }
 }

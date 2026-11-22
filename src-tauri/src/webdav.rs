@@ -243,11 +243,6 @@ impl<T: DavTransport> WebdavClient<T> {
         }
     }
 
-    /// 工作根（含 `/PiAgentSync`），用于在传输前检查协议是否允许明文凭据。
-    pub fn root_url(&self) -> &str {
-        &self.root
-    }
-
     /// 覆盖超时：生产用常量，单测要毫秒级。
     // 只在测试里存在：生产路径直接用常量，不保留配置入口。
     #[cfg(test)]

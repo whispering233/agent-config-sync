@@ -7,37 +7,13 @@ import { loadAppConfig, type PathStatus, type Transport } from '../lib/app-confi
 import {
   downloadRemoteSnapshot,
   isDesktop,
+  listSnapshotPackages,
   uploadSnapshot,
+  type PackageList,
   type RemoteDownload,
-  type RemoteUpload,
+  type SnapshotExport,
 } from '../lib/desktop';
 import { cn } from '../lib/utils';
-
-/** 与 Rust 侧 `SecretFinding` 一一对应；只含位置，不含密钥值。 */
-type SecretFinding = {
-  path: string;
-  field: string | null;
-  line: number;
-  level: 'high' | 'low';
-  rule: string;
-};
-
-type RequiredPackage = {
-  source: string;
-  enabled: boolean;
-};
-
-/** 与 Rust 侧 `ExportReport` 一一对应。 */
-type ExportReport = {
-  files: number;
-  fingerprint: string;
-  requiredPackages: RequiredPackage[];
-  skipped: number;
-  warnings: SecretFinding[];
-  plaintextSecrets: boolean;
-  snapshotDir: string;
-  manifestPath: string;
-};
 
 /** 与 Rust 侧 `ExportFailure` 一一对应。 */
 type ExportFailure = {
@@ -180,14 +156,19 @@ type DownloadState =
 type UploadState =
   | { kind: 'idle' }
   | { kind: 'uploading' }
-  | { kind: 'uploaded'; view: Extract<RemoteUpload, { kind: 'uploaded' }> }
-  | { kind: 'conflict'; view: Extract<RemoteUpload, { kind: 'conflict' }> }
+  | { kind: 'done'; report: SnapshotExport }
   | { kind: 'failed'; message: string };
 
 type ExportState =
   | { kind: 'idle' }
   | { kind: 'exporting' }
-  | { kind: 'done'; report: ExportReport }
+  | { kind: 'done'; report: SnapshotExport }
+  | { kind: 'failed'; message: string };
+
+type PackagesState =
+  | { kind: 'idle' }
+  | { kind: 'loading' }
+  | { kind: 'done'; list: PackageList }
   | { kind: 'failed'; message: string };
 
 type PlanState =
@@ -224,9 +205,6 @@ const APPLY_WARNING_LIMIT = 5;
 
 /** 备份卡片最多列出的份数；更旧的仍在磁盘上。 */
 const BACKUP_LIST_SHOWN = 5;
-
-/** 冲突清单最多列出的条数；其余只计数。 */
-const CONFLICT_LIST_LIMIT = 10;
 
 const mismatchReasonText: Record<HashMismatch['reason'], string> = {
   missing: '快照里没有这个文件',
@@ -315,6 +293,9 @@ export function SnapshotPage() {
   const [applying, setApplying] = useState<ApplyState>({ kind: 'idle' });
   const [backups, setBackups] = useState<BackupsState>({ kind: 'idle' });
   const [restoring, setRestoring] = useState<RestoreState>({ kind: 'idle' });
+  /** 存储根里的包列表，与选中的那一份（缺省跟随最新）。 */
+  const [packages, setPackages] = useState<PackagesState>({ kind: 'idle' });
+  const [picked, setPicked] = useState<string | null>(null);
 
   useEffect(() => {
     if (!isDesktop) {
@@ -356,15 +337,40 @@ export function SnapshotPage() {
 
   const syncRoot = config.kind === 'ready' ? config.syncRoot : null;
   const isWebdav = config.kind === 'ready' && config.transport === 'webdav';
+
+  useEffect(() => {
+    if (!isDesktop || isWebdav || syncRoot === null) {
+      return;
+    }
+    void loadPackages();
+  }, [isWebdav, syncRoot]);
   const exporting = exported.kind === 'exporting';
   const canExport = isDesktop && syncRoot !== null && !exporting;
   const downloading = downloaded.kind === 'downloading';
   const canDownload = isDesktop && isWebdav && !downloading;
   const uploading = upload.kind === 'uploading';
   const canUpload = isDesktop && isWebdav && !uploading;
+  const canDownloadLocal =
+    isDesktop && !isWebdav && picked !== null && !downloading;
   const checking = planning.kind === 'checking';
-  // 下载之后检查的是暂存快照，此时没有同步文件夹也能走完预览与应用。
-  const canCheck = isDesktop && (syncRoot !== null || planRoot !== null) && !checking;
+  // 检查的是解包后的暂存快照：没有取到包时「同步文件夹」里已经没有目录布局可查。
+  const canCheck = isDesktop && planRoot !== null && !checking;
+
+  async function loadPackages() {
+    setPackages({ kind: 'loading' });
+    try {
+      const list = await listSnapshotPackages();
+      setPackages({ kind: 'done', list });
+      // 默认选中最新的一份；已选的还在列表里就不动。
+      setPicked((current) =>
+        current !== null && list.packages.some((entry) => entry.name === current)
+          ? current
+          : list.newest,
+      );
+    } catch (error) {
+      setPackages({ kind: 'failed', message: errorMessage(error) });
+    }
+  }
 
   async function runCheck(root: string | null) {
     setPlanning({ kind: 'checking' });
@@ -384,13 +390,11 @@ export function SnapshotPage() {
     }
   }
 
-  async function runDownload() {
+  async function runDownload(packageName: string | null) {
     setDownloaded({ kind: 'downloading' });
     try {
-      const view = await downloadRemoteSnapshot();
+      const view = await downloadRemoteSnapshot(packageName);
       setDownloaded({ kind: 'done', view });
-      // 刚对齐过远端，之前那份冲突提示已经过时。
-      setUpload({ kind: 'idle' });
       // 后面的检查与应用都针对这份暂存快照，不再指向同步文件夹。
       setPlanRoot(view.stagingRoot);
       await runCheck(view.stagingRoot);
@@ -399,15 +403,11 @@ export function SnapshotPage() {
     }
   }
 
-  async function runUpload(overwrite: boolean) {
+  async function runUpload() {
     setUpload({ kind: 'uploading' });
     try {
-      const view = await uploadSnapshot(overwrite);
-      setUpload(
-        view.kind === 'conflict'
-          ? { kind: 'conflict', view }
-          : { kind: 'uploaded', view },
-      );
+      const report = await uploadSnapshot();
+      setUpload({ kind: 'done', report });
     } catch (error) {
       const failure = asFailure(error);
       setUpload({
@@ -492,8 +492,10 @@ export function SnapshotPage() {
   async function runExport() {
     setExported({ kind: 'exporting' });
     try {
-      const report = await invoke<ExportReport>('export_snapshot');
+      const report = await invoke<SnapshotExport>('export_snapshot');
       setExported({ kind: 'done', report });
+      // 刚写了一个包：列表要跟着更新，否则用户看不出存储里已经是最新那份。
+      void loadPackages();
     } catch (error) {
       const failure = asFailure(error);
       setExported({
@@ -548,157 +550,117 @@ export function SnapshotPage() {
         <Card className="p-lg">
           <h2 className="text-sm font-semibold text-foreground">WebDAV</h2>
           <p className="mt-xs text-sm text-muted-foreground">
-            上传把当前配置导出成快照推到远端；下载按远端 manifest 取回本机暂存目录。两边共用同一套快照格式与校验。
+            快照包的 WebDAV 传输还没有接上：下面两个按钮会明确报错，不会退到逐文件上传。
           </p>
 
           <div className="mt-md flex flex-wrap items-center gap-md">
-            <Button onClick={() => void runUpload(false)} disabled={!canUpload}>
+            <Button onClick={() => void runUpload()} disabled={!canUpload}>
               {uploading ? '上传中…' : '上传到 WebDAV'}
             </Button>
-            {!isDesktop && (
-              <span className="text-sm text-muted-foreground">上传仅桌面版可用</span>
-            )}
-            {uploading && (
-              <span className="text-sm text-muted-foreground" aria-live="polite">
-                正在导出快照、比对远端清单并上传变化的文件…
-              </span>
-            )}
-          </div>
-
-          {upload.kind === 'uploaded' && (
-            <div className="mt-md flex flex-col gap-sm">
-              <dl className="flex flex-col gap-sm">
-                <ResultRow label="远端指纹" value={upload.view.fingerprint} mono />
-                <ResultRow label="本次上传" value={`${upload.view.uploaded} 个文件`} />
-                <ResultRow
-                  label="已一致跳过"
-                  value={`${upload.view.skipped} 个文件`}
-                />
-                <ResultRow label="上次同步时间" value={upload.view.seenAt} />
-              </dl>
-              <p className="text-sm text-success">
-                上传完成：manifest 最后写入，远端现在指向这份快照。
-              </p>
-              <p className="text-xs text-muted-foreground">
-                旧快照里的多余文件不会自动删除；需要清理时在网盘里手动处理。
-              </p>
-            </div>
-          )}
-
-          {upload.kind === 'conflict' && (
-            <div className="mt-md flex flex-col gap-md rounded-md bg-surface-muted px-md py-sm">
-              <p className="flex items-start gap-sm text-sm text-warning">
-                <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
-                <span>
-                  {upload.view.remoteCorrupt ? (
-                    '远端 manifest 已损坏：还没有往远端写入任何内容，只能覆盖重建。'
-                  ) : (
-                    <>
-                      云端快照与本机记录不一致（远端指纹{' '}
-                      <span className="font-mono">{upload.view.remoteFingerprint}</span>
-                      ）：还没有往远端写入任何内容，先选一边再继续。
-                    </>
-                  )}
-                </span>
-              </p>
-              <ConflictDiff view={upload.view} />
-              <div className="flex flex-wrap gap-sm">
-                <Button onClick={() => void runUpload(true)} disabled={uploading}>
-                  覆盖云端
-                </Button>
-                {!upload.view.remoteCorrupt && (
-                  <Button
-                    variant="secondary"
-                    onClick={() => void runDownload()}
-                    disabled={!canDownload}
-                  >
-                    {downloading ? '下载中…' : '从云端更新'}
-                  </Button>
-                )}
-              </div>
-              <p className="text-xs text-muted-foreground">
-                覆盖云端 = 用当前配置导出新快照替换远端；从云端更新 = 走下面的下载 → 检查 → 应用。
-              </p>
-            </div>
-          )}
-
-          {upload.kind === 'failed' && (
-            <div className="mt-md flex flex-col gap-sm">
-              <p className="flex items-start gap-sm text-sm text-danger">
-                <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
-                <span>上传失败：{upload.message}</span>
-              </p>
-              <p className="text-xs text-muted-foreground">
-                失败停在原地：已上传的文件留在远端，但旧 manifest 仍指向旧快照；本机远端状态没有更新。
-              </p>
-            </div>
-          )}
-
-          <h3 className="mt-lg text-sm font-semibold text-foreground">从 WebDAV 下载</h3>
-          <p className="mt-xs text-sm text-muted-foreground">
-            按远端 manifest 把快照取到本机暂存目录：逐文件核对字节数与 sha256，全部通过才写盘；不写本机配置。
-          </p>
-          <div className="mt-md flex flex-wrap items-center gap-md">
-            <Button onClick={() => void runDownload()} disabled={!canDownload}>
+            <Button
+              variant="secondary"
+              onClick={() => void runDownload(null)}
+              disabled={!canDownload}
+            >
               {downloading ? '下载中…' : '从 WebDAV 下载'}
             </Button>
             {!isDesktop && (
-              <span className="text-sm text-muted-foreground">下载仅桌面版可用</span>
-            )}
-            {downloading && (
-              <span className="text-sm text-muted-foreground" aria-live="polite">
-                正在读取远端 manifest 并下载快照文件…
-              </span>
+              <span className="text-sm text-muted-foreground">仅桌面版可用</span>
             )}
           </div>
 
-          {downloaded.kind === 'failed' && (
-            <div className="mt-md flex flex-col gap-sm">
-              <p className="flex items-start gap-sm text-sm text-danger">
-                <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
-                <span>下载失败：{downloaded.message}</span>
-              </p>
-              <p className="text-xs text-muted-foreground">
-                失败即停：本次暂存目录已删除，本机配置与远端状态都保持原样；修正后可以重新下载。
-              </p>
-            </div>
-          )}
+          {upload.kind === 'done' && <ExportResult report={upload.report} />}
 
-          {downloaded.kind === 'done' && (
-            <div className="mt-md flex flex-col gap-sm">
-              <dl className="flex flex-col gap-sm">
-                <ResultRow label="远端指纹" value={downloaded.view.fingerprint} mono />
-                <ResultRow label="文件数" value={String(downloaded.view.fileCount)} />
-                <ResultRow label="快照创建时间" value={downloaded.view.createdAt} />
-                <ResultRow
-                  label="上次同步时间"
-                  value={
-                    downloaded.view.previousSeenAt ?? '首次下载：本机还没有远端记录'
-                  }
-                />
-                <ResultRow label="暂存目录" value={downloaded.view.stagingRoot} mono />
-              </dl>
-              <p className="text-xs text-muted-foreground">
-                下面的检查与应用都针对这份暂存快照；只保留最新的暂存目录。
-              </p>
-            </div>
+          {upload.kind === 'failed' && (
+            <p className="mt-md flex items-start gap-sm text-sm text-danger">
+              <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
+              <span>上传失败：{upload.message}</span>
+            </p>
           )}
         </Card>
       )}
 
-      <div className="flex flex-wrap items-center gap-md">
-        <Button onClick={() => void runExport()} disabled={!canExport}>
-          {exporting ? '导出中…' : '导出快照'}
-        </Button>
-        {!isDesktop && (
-          <span className="text-sm text-muted-foreground">导出仅桌面版可用</span>
-        )}
-        {exporting && (
-          <span className="text-sm text-muted-foreground" aria-live="polite">
-            正在收集配置、扫描明文密钥并写入临时目录…
-          </span>
-        )}
-      </div>
+      {!isWebdav && (
+        <div className="flex flex-wrap items-center gap-md">
+          <Button onClick={() => void runExport()} disabled={!canExport}>
+            {exporting ? '导出中…' : '导出快照'}
+          </Button>
+          {!isDesktop && (
+            <span className="text-sm text-muted-foreground">导出仅桌面版可用</span>
+          )}
+          {exporting && (
+            <span className="text-sm text-muted-foreground" aria-live="polite">
+              正在收集配置、扫描明文密钥并打包…
+            </span>
+          )}
+        </div>
+      )}
+
+      {!isWebdav && (
+        <Card className="p-lg">
+          <h2 className="text-sm font-semibold text-foreground">从存储恢复</h2>
+          <p className="mt-xs text-sm text-muted-foreground">
+            从同步文件夹里选一份包解到本机暂存目录，再走下面的检查与应用；暂存只保留当前这一份。
+          </p>
+
+          {packages.kind === 'loading' && (
+            <p className="mt-sm text-sm text-muted-foreground">正在读取存储里的包…</p>
+          )}
+          {packages.kind === 'failed' && (
+            <p className="mt-sm text-sm text-danger">读取快照包失败：{packages.message}</p>
+          )}
+          {packages.kind === 'done' && packages.list.packages.length === 0 && (
+            <p className="mt-sm text-sm text-muted-foreground">
+              同步文件夹里还没有快照包：先导出一次，或者等云盘把另一台机器的包同步下来。
+            </p>
+          )}
+          {packages.kind === 'done' && packages.list.packages.length > 0 && (
+            <ul className="mt-md flex flex-col gap-sm">
+              {packages.list.packages.map((entry) => (
+                <li key={entry.name}>
+                  <label className="flex items-start gap-sm rounded-md bg-surface-muted px-md py-sm">
+                    <input
+                      type="radio"
+                      name="snapshot-package"
+                      className="mt-xs h-4 w-4"
+                      checked={picked === entry.name}
+                      onChange={() => setPicked(entry.name)}
+                      disabled={downloading}
+                    />
+                    <span className="flex flex-col gap-xs">
+                      <span className="break-all font-mono text-xs text-foreground">
+                        {entry.name}
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        {entry.createdAt} · {formatBytes(entry.size)}
+                        {entry.name === packages.list.newest && ' · 最新'}
+                      </span>
+                    </span>
+                  </label>
+                </li>
+              ))}
+            </ul>
+          )}
+          {packages.kind === 'done' && packages.list.unrecognized.length > 0 && (
+            <p className="mt-sm text-xs text-muted-foreground">
+              另有 {packages.list.unrecognized.length} 个无法识别的文件（上传残留、云盘冲突副本等）：
+              它们不会被当成包，需要清理时手动处理。
+            </p>
+          )}
+
+          <div className="mt-md flex flex-wrap items-center gap-md">
+            <Button
+              onClick={() => void runDownload(picked)}
+              disabled={!canDownloadLocal}
+            >
+              {downloading ? '取包中…' : '从这份包恢复'}
+            </Button>
+            {!isDesktop && (
+              <span className="text-sm text-muted-foreground">恢复仅桌面版可用</span>
+            )}
+          </div>
+        </Card>
+      )}
 
       <Card className="p-lg">
         <h2 className="text-sm font-semibold text-foreground">检查与预览</h2>
@@ -726,6 +688,26 @@ export function SnapshotPage() {
           <p className="mt-sm text-sm text-muted-foreground">
             浏览器预览里没有本机快照：桌面版会读取 manifest.json、逐文件校验哈希，再列出差异；应用快照也仅桌面版可用，并会先备份再写入。
           </p>
+        )}
+
+        {planRoot === null && isDesktop && (
+          <p className="mt-sm text-sm text-muted-foreground">
+            还没有取到快照：先在「从存储恢复」里选一份包，或从 WebDAV 下载。
+          </p>
+        )}
+
+        {downloaded.kind === 'done' && <DownloadResult view={downloaded.view} />}
+
+        {downloaded.kind === 'failed' && (
+          <div className="mt-md flex flex-col gap-sm">
+            <p className="flex items-start gap-sm text-sm text-danger">
+              <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
+              <span>取快照包失败：{downloaded.message}</span>
+            </p>
+            <p className="text-xs text-muted-foreground">
+              失败即停：本次暂存目录已删除，本机配置不动；修正后可以重新取。
+            </p>
+          </div>
         )}
 
         {planning.kind === 'done' && (
@@ -1081,31 +1063,15 @@ export function SnapshotPage() {
 
       {exported.kind === 'done' && (
         <Card className="p-lg">
-          <h2 className="text-sm font-semibold text-foreground">导出完成</h2>
-          <dl className="mt-md flex flex-col gap-sm">
-            <ResultRow label="文件数" value={String(exported.report.files)} />
-            <ResultRow label="指纹" value={exported.report.fingerprint} mono />
-            <ResultRow
-              label="声明的包"
-              value={String(exported.report.requiredPackages.length)}
-            />
-            <ResultRow label="跳过的条目" value={String(exported.report.skipped)} />
-            <ResultRow label="manifest" value={exported.report.manifestPath} mono />
-          </dl>
+          <h2 className="text-sm font-semibold text-foreground">
+            {exported.report.unchanged ? '内容未变，没有新包' : '导出完成'}
+          </h2>
+          <ExportResult report={exported.report} />
           <p className="mt-md text-sm text-muted-foreground">
-            等待云盘上传完成后再在另一台机器上导入；manifest 最后写入，可作为上传完成的信号。
+            {exported.report.unchanged
+              ? '存储里最新的一份包就是这份内容：没有写新包，历史不会重复堆积。'
+              : '包在存储里出现即代表完整：云盘客户端传完后，另一台机器就能在「从存储恢复」里选到它。'}
           </p>
-          {exported.report.plaintextSecrets && (
-            <p className="mt-sm text-sm text-warning">
-              快照含明文密钥（auth.json 或高危命中），manifest 已记录；云盘/WebDAV
-              服务端及其版本历史可见。OAuth 多机共享可能互相失效，切换机器前先应用最新快照。
-            </p>
-          )}
-          {exported.report.warnings.length > 0 && (
-            <p className="mt-sm text-sm text-muted-foreground">
-              另有 {exported.report.warnings.length} 条密钥提示，文件已原样保留。
-            </p>
-          )}
         </Card>
       )}
 
@@ -1116,7 +1082,7 @@ export function SnapshotPage() {
             <span>导出失败：{exported.message}</span>
           </p>
           <p className="mt-sm text-xs text-muted-foreground">
-            原快照与 manifest 保持不动，修正后可以重新导出。
+            失败即停：存储里已有的包没被改动，修正后可以重新导出。
           </p>
         </Card>
       )}
@@ -1131,60 +1097,48 @@ function sourceText(source: PlanReport['manifestInfo']['source']): string {
   } · node ${source.node ?? '未知'}`;
 }
 
-/** 冲突清单：只列文件名，完整路径放在悬停提示里。 */
-/** 冲突时把“差在哪”讲清楚：清单坏了、没有基准、或逐项列出三类变化。 */
-function ConflictDiff({ view }: { view: Extract<RemoteUpload, { kind: 'conflict' }> }) {
-  if (view.remoteCorrupt) {
-    return (
-      <p className="text-xs text-danger">
-        远端清单无法解析（多半是上次写入中断）。这里只能覆盖：会用当前配置重建整份快照。
-      </p>
-    );
-  }
-  if (view.added.length === 0 && view.modified.length === 0 && view.removed.length === 0) {
-    return (
-      <p className="text-xs text-muted-foreground">
-        本机没有上次同步的记录（换机器或换过地址），算不出文件级差异；覆盖会把云端快照整份换成当前配置。
-      </p>
-    );
-  }
+/** 导出/上传的结果：包名、大小、文件数、指纹。 */
+function ExportResult({ report }: { report: SnapshotExport }) {
   return (
-    <div className="flex flex-col gap-sm">
-      <ConflictList title="云端新增" paths={view.added} />
-      <ConflictList title="云端修改" paths={view.modified} />
-      <ConflictList title="云端删除" paths={view.removed} />
-    </div>
+    <>
+      <dl className="mt-md flex flex-col gap-sm">
+        <ResultRow label="快照包" value={report.packageName} mono />
+        <ResultRow label="包体积" value={formatBytes(report.size)} />
+        <ResultRow label="文件数" value={String(report.files)} />
+        <ResultRow label="指纹" value={report.fingerprint} mono />
+        <ResultRow label="创建时间" value={report.createdAt} />
+      </dl>
+      {report.plaintextSecrets && (
+        <p className="mt-sm text-sm text-warning">
+          快照含明文密钥（auth.json 或高危命中）：包在云盘/WebDAV 服务端及其版本历史里可见。
+          OAuth 多机共享可能互相失效，切换机器前先应用最新快照。
+        </p>
+      )}
+    </>
   );
 }
 
-function ConflictList({ title, paths }: { title: string; paths: string[] }) {
-  if (paths.length === 0) {
-    return null;
-  }
-  const shown = paths.slice(0, CONFLICT_LIST_LIMIT);
+/** 取包结果：包名、创建时间、文件数与暂存目录。 */
+function DownloadResult({ view }: { view: RemoteDownload }) {
   return (
-    <div>
-      <h3 className="text-xs font-semibold text-foreground">
-        {title} {paths.length} 项
-      </h3>
-      <ul className="mt-xs flex flex-col gap-xs">
-        {shown.map((path) => (
-          <li
-            key={path}
-            title={path}
-            className="truncate font-mono text-xs text-foreground"
-          >
-            {path.split('/').pop() ?? path}
-          </li>
-        ))}
-      </ul>
-      {paths.length > shown.length && (
-        <p className="mt-xs text-xs text-muted-foreground">
-          还有 {paths.length - shown.length} 项
-        </p>
-      )}
-    </div>
+    <dl className="mt-md flex flex-col gap-sm">
+      <ResultRow label="快照包" value={view.packageName} mono />
+      <ResultRow label="创建时间" value={view.createdAt} />
+      <ResultRow label="文件数" value={String(view.fileCount)} />
+      <ResultRow label="暂存目录" value={view.stagingRoot} mono />
+    </dl>
   );
+}
+
+/** 包体积按 KB / MB 显示：几十 KB 是常态，字节数读起来没意义。 */
+function formatBytes(size: number): string {
+  if (size >= 1024 * 1024) {
+    return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  if (size >= 1024) {
+    return `${(size / 1024).toFixed(1)} KB`;
+  }
+  return `${size} B`;
 }
 
 /** 一组计划项：只列前 20 条，其余只报数量。 */

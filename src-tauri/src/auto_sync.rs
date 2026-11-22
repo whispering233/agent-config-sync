@@ -1,17 +1,15 @@
-//! 托盘常驻时的 WebDAV 自动上行。
+//! 托盘常驻时的自动上行。
 //!
-//! 只做一件事：按配置的间隔把当前 live 导出并上传。默认不传 `auth.json`，
-//! 不自动下载/应用，不覆盖远端冲突；失败只更新状态，不重试。
-//! 与手动上传/下载/应用共用 [`crate::runtime`] 的操作锁。
+//! 只上行：按配置的间隔把当前 live 导出并上传（默认不传 `auth.json`），不自动下载/应用，
+//! 失败只更新状态，不重试。
+//!
+//! WebDAV 侧的包上传尚未接上（包只能落到本地存储根），所以这里只报一次可读的失败，
+//! 不退回逐文件链路。
 
-use crate::config::{self, AppConfig, Transport, AGENT_DIR_ENV_VAR};
-use crate::credentials;
-use crate::runtime;
+use crate::config::{self, AppConfig, Transport};
 use crate::snapshot;
-use crate::webdav::{ReqwestTransport, WebdavClient};
-use crate::webdav_transfer::{self, TransferError, UploadOutcome};
+use crate::webdav_transfer::REMOTE_NOT_READY_MESSAGE;
 use serde::Serialize;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -124,7 +122,7 @@ pub fn start(app: AppHandle) {
             }
 
             // 手动上传/下载/应用正在跑时直接跳过本次，不排队。
-            let Some(_guard) = runtime::try_lock_operation() else {
+            let Some(_guard) = crate::runtime::try_lock_operation() else {
                 set_status(
                     &app,
                     "skipped",
@@ -133,7 +131,12 @@ pub fn start(app: AppHandle) {
                 );
                 continue;
             };
-            run_once(&app, &config);
+            set_status(
+                &app,
+                "failed",
+                Some(REMOTE_NOT_READY_MESSAGE.to_string()),
+                true,
+            );
         }
     });
 }
@@ -152,103 +155,6 @@ fn config_interval(app: &AppHandle) -> Duration {
 fn load_config(app: &AppHandle) -> Option<AppConfig> {
     let dir = app.path().app_config_dir().ok()?;
     config::load_config(&dir).ok()
-}
-
-fn agent_dir(app: &AppHandle, config: &AppConfig) -> Option<PathBuf> {
-    let env_dir = std::env::var_os(AGENT_DIR_ENV_VAR).map(PathBuf::from);
-    let home = app.path().home_dir().ok();
-    config::resolve_agent_dir(config, env_dir.as_deref(), home.as_deref()).path
-}
-
-fn run_once(app: &AppHandle, config: &AppConfig) {
-    set_status(app, "running", None, false);
-
-    let Some(agent_dir) = agent_dir(app, config) else {
-        set_status(
-            app,
-            "failed",
-            Some("无法确定 Pi 宿主目录".to_string()),
-            true,
-        );
-        return;
-    };
-    let data_dir = match app.path().app_data_dir() {
-        Ok(dir) => dir,
-        Err(error) => {
-            set_status(
-                app,
-                "failed",
-                Some(format!("无法定位应用数据目录：{error}")),
-                true,
-            );
-            return;
-        }
-    };
-    let credentials = match credentials::load(&data_dir) {
-        Ok(Some(credentials)) => credentials,
-        Ok(None) => {
-            set_status(
-                app,
-                "skipped",
-                Some("还没有配置 WebDAV 凭据".to_string()),
-                false,
-            );
-            return;
-        }
-        Err(error) => {
-            set_status(
-                app,
-                "failed",
-                Some(format!("读取 WebDAV 凭据失败：{error}")),
-                true,
-            );
-            return;
-        }
-    };
-
-    let transport = match ReqwestTransport::new(&credentials.username, &credentials.password) {
-        Ok(transport) => transport,
-        Err(error) => {
-            set_status(
-                app,
-                "failed",
-                Some(format!("创建 WebDAV 客户端失败：{error}")),
-                true,
-            );
-            return;
-        }
-    };
-    let client = WebdavClient::new(transport, &credentials.url);
-    let versions = snapshot::SourceVersions::default();
-    let outcome = if config.auto_sync_include_credentials {
-        webdav_transfer::upload(&client, &data_dir, &agent_dir, &versions, false)
-    } else {
-        webdav_transfer::upload_excluding_auth(&client, &data_dir, &agent_dir, &versions, false)
-    };
-
-    match outcome {
-        Ok(UploadOutcome::Uploaded {
-            uploaded, skipped, ..
-        }) => set_status(
-            app,
-            "success",
-            Some(format!("已上传 {uploaded} 个文件，跳过 {skipped} 个")),
-            true,
-        ),
-        Ok(UploadOutcome::Conflict { .. }) => set_status(
-            app,
-            "conflict",
-            Some("云端有更新，已停止自动上行；请手动处理冲突".to_string()),
-            true,
-        ),
-        Err(error) => {
-            let message = match error {
-                TransferError::Insecure(message) => message,
-                other => other.to_string(),
-            };
-            set_status(app, "failed", Some(message), true);
-        }
-    }
 }
 
 fn set_status(app: &AppHandle, state: &'static str, message: Option<String>, stamp: bool) {

@@ -61,54 +61,70 @@ export function testWebdavConnection(input: WebdavInput): Promise<WebdavProbe> {
   });
 }
 
-/** 与 Rust 侧 `DownloadView` 一一对应：一次下载落到了本机暂存目录。 */
+/** 与 Rust 侧 `DownloadView` 一一对应：一份包已经解到本机暂存目录。 */
 export type RemoteDownload = {
+  packageName: string;
+  /** manifest 里的创建时间，RFC 3339 UTC。 */
+  createdAt: string;
+  fileCount: number;
   /** 暂存目录；可以当作 `root` 传给 `verify_and_plan` 与 `apply_snapshot`。 */
   stagingRoot: string;
-  fingerprint: string;
-  fileCount: number;
-  createdAt: string;
-  /** 本次下载之前记录的同步时间；本机没有记录时为 null。 */
-  previousSeenAt: string | null;
 };
 
-/** 按远端 manifest 把快照取到本机暂存目录。不写本机配置，也不碰同步文件夹。 */
-export function downloadRemoteSnapshot(): Promise<RemoteDownload> {
-  return invoke<RemoteDownload>('download_remote_snapshot');
-}
+/** 存储根里的一个包。 */
+export type PackageEntry = {
+  /** `<UTC yyyymmdd-HHmmss>-<指纹前 8 位>.zip`。 */
+  name: string;
+  size: number;
+  createdAt: string;
+};
 
-/** 一次上传的结局。冲突不是错误：远端一个字节都没写，等用户选一边。 */
-export type RemoteUpload =
-  | {
-      kind: 'uploaded';
-      fingerprint: string;
-      /** 真正 PUT 上去的文件数。 */
-      uploaded: number;
-      /** 与远端已一致、跳过的文件数。 */
-      skipped: number;
-      /** 本次上传后记录的同步时间。 */
-      seenAt: string;
-    }
-  | {
-      kind: 'conflict';
-      remoteFingerprint: string;
-      /** 下面三个清单描述远端相对上次记录的变化；本机无记录时都是空数组。 */
-      added: string[];
-      modified: string[];
-      removed: string[];
-      /** 远端清单损坏：只能覆盖，无法先下载。 */
-      remoteCorrupt: boolean;
-    };
+/** 与 Rust 侧 `PackageListView` 一一对应。 */
+export type PackageList = {
+  /** 按名字倒序：最新在前。 */
+  packages: PackageEntry[];
+  /** 默认选中项（名字最大的一份）；存储根为空时为 null。 */
+  newest: string | null;
+  /** 无法识别的文件（`.tmp-*`、云盘冲突副本等）：只展示，不可操作。 */
+  unrecognized: string[];
+};
+
+/** 列举存储根里的快照包。 */
+export function listSnapshotPackages(): Promise<PackageList> {
+  return invoke<PackageList>('list_snapshot_packages');
+}
 
 /**
- * 把当前配置导出并推到 WebDAV。
+ * 取一份包到本机暂存目录，不写本机配置。
  *
- * `overwrite` 只在用户看过冲突清单后点「覆盖云端」时为 true。
+ * 省略 `packageName` 时取存储里名字最大的一份。
  */
-export function uploadSnapshot(overwrite: boolean): Promise<RemoteUpload> {
-  return invoke<RemoteUpload>('upload_snapshot', { overwrite });
+export function downloadRemoteSnapshot(
+  packageName?: string | null,
+): Promise<RemoteDownload> {
+  return invoke<RemoteDownload>('download_remote_snapshot', {
+    package: packageName ?? null,
+  });
 }
 
+/** 与 Rust 侧 `ExportReport` 一一对应：导出得到的包。 */
+export type SnapshotExport = {
+  /** 内容与存储里最新包相同：这次没有写新包。 */
+  unchanged: boolean;
+  packageName: string;
+  /** 包文件字节数。 */
+  size: number;
+  /** 包内快照文件数（不含 manifest）。 */
+  files: number;
+  fingerprint: string;
+  createdAt: string;
+  plaintextSecrets: boolean;
+};
+
+/** 把当前配置导出成快照包，放进存储根（本地文件夹模式下即同步文件夹）。 */
+export function uploadSnapshot(): Promise<SnapshotExport> {
+  return invoke<SnapshotExport>('upload_snapshot');
+}
 
 /** 与 Rust 侧 `AutoSyncStatus` 一一对应。`state` 是有限状态机，不是自由文本。 */
 export type AutoSyncState =

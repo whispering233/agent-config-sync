@@ -196,6 +196,11 @@ impl LocalStore {
         Self { root }
     }
 
+    /// 存储根。按路径读单个包（例如只读 manifest）时要用；包本身仍经由 trait 读写。
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// 根不存在时按 `0700` 建；已存在就不动权限，那是用户的目录。
     fn ensure_root(&self) -> Result<(), StoreError> {
         platform::create_dir_all_mode(&self.root, STORE_DIR_MODE)
@@ -532,7 +537,7 @@ mod tests {
             .unwrap()
             .flatten()
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| package::is_temp_name(name))
+            .filter(|name| name.starts_with(TEMP_NAME_PREFIX))
             .collect();
         assert!(leftovers.is_empty(), "残留：{leftovers:?}");
 
@@ -580,7 +585,7 @@ mod tests {
             .url
             .strip_prefix(&format!("{ROOT_URL}/"))
             .unwrap();
-        assert!(package::is_temp_name(temp), "临时名：{temp}");
+        assert!(temp.starts_with(TEMP_NAME_PREFIX), "临时名：{temp}");
         assert_eq!(requests[2].body.as_deref(), Some(&b"package-bytes"[..]));
 
         assert_eq!(

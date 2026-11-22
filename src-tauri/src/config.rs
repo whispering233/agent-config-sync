@@ -622,7 +622,7 @@ fn is_plain_absolute(path: &Path) -> bool {
             .any(|component| matches!(component, Component::ParentDir))
 }
 
-fn overlap_message(sync_root: &Path, agent_dir: &Path) -> Option<&'static str> {
+pub(crate) fn overlap_message(sync_root: &Path, agent_dir: &Path) -> Option<&'static str> {
     if sync_root == agent_dir {
         Some("同步文件夹不能与宿主目录相同")
     } else if sync_root.starts_with(agent_dir) {
