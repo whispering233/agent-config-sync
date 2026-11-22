@@ -775,6 +775,12 @@ export function SnapshotPage() {
             同步文件夹里的历史包，按名字（UTC 时间）倒序；选一份解到本机暂存目录，再走下面的检查与应用。暂存只保留当前这一份。
           </p>
 
+          {!isDesktop && (
+            <p className="mt-sm text-xs leading-relaxed text-muted-foreground">
+              浏览器预览里没有 Rust 进程，读不到存储里的包列表；包历史与对比只在桌面版可用。
+            </p>
+          )}
+
           {packages.kind === 'loading' && (
             <p className="mt-sm text-sm text-muted-foreground">正在读取存储里的包…</p>
           )}
