@@ -1029,7 +1029,7 @@ function SkillsCard() {
         </p>
       )}
 
-      {state.kind === 'idle' && (
+      {(state.kind === 'idle' || state.kind === 'browser') && (
         <div className="mt-md rounded-md bg-surface-muted px-md py-sm">
           <p className="text-xs leading-relaxed text-muted-foreground">
             刷新会启动{' '}
