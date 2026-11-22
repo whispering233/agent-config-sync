@@ -1740,20 +1740,25 @@ mod tests {
         };
         let client = WebdavClient::new(transport, &url);
 
+        // 唯一名：固定名会覆盖并删掉服务器上一份同名的既有文件。
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("读时钟")
+            .as_nanos();
+        let probe = format!(".tmp-probe-{stamp}-etag");
+
         client.mkcol("").expect("工作根应可创建或已存在");
-        client
-            .put("etag-probe.txt", b"one", &[])
-            .expect("写探针文件");
+        client.put(&probe, b"one", &[]).expect("写探针文件");
 
         let (body, etag) = client
-            .get("etag-probe.txt")
+            .get(&probe)
             .expect("读探针文件")
             .expect("探针文件应存在");
         assert_eq!(body, b"one");
         println!("GET 响应的 ETag: {etag:?}");
 
         let wrong = vec![("If-Match".to_string(), "\"definitely-wrong\"".to_string())];
-        match client.put("etag-probe.txt", b"two", &wrong) {
+        match client.put(&probe, b"two", &wrong) {
             Err(DavError::PreconditionFailed) => {
                 println!("If-Match 生效：错误 ETag 被拒（412）");
             }
@@ -1765,7 +1770,7 @@ mod tests {
             }
         }
 
-        client.delete("etag-probe.txt").expect("清理探针文件");
+        client.delete(&probe).expect("清理探针文件");
     }
 
     /// `PROPFIND` 只问会不会回元素，不问具体值，所以四个属性一次问全。
@@ -1871,8 +1876,8 @@ mod tests {
             "PUT 临时名失败：HTTP {status}"
         );
 
-        // 3. MOVE 到正式名：`MOVE` 不可用时这一步失败，探测继续跑完并如实汇报。
-        let status = send(
+        // 3. MOVE 到正式名：上传定案成立的前提之一。
+        let move_status = send(
             "MOVE",
             &name,
             move_headers(&moved),
@@ -1880,11 +1885,12 @@ mod tests {
             crate::webdav::CONTROL_TIMEOUT,
         )
         .status;
-        let move_available = matches!(status, 201 | 204);
-        println!("3. MOVE → 正式名：{status}（可用：{move_available}）");
-        if !move_available {
-            println!("   ⚠ MOVE 不可用：403/405/501 等服务商限制，上传定案需重新决策");
-        }
+        println!("3. MOVE → 正式名：{move_status}");
+        // 上传定案就靠这一步：正式名下的包只能由 `MOVE` 原子产生。
+        assert!(
+            matches!(move_status, 201 | 204),
+            "上传定案依赖服务商支持 MOVE（RFC 4918 必备方法）：临时名 → 正式名应回 201/204，实际 HTTP {move_status}"
+        );
 
         // 4. 第二个临时文件：用于验证目标已存在时 `Overwrite: F` 是否真的生效。
         let status = send(
@@ -1910,15 +1916,11 @@ mod tests {
         )
         .status;
         println!("5. MOVE → 已存在的名字（Overwrite: F）：{status}");
-        if !move_available {
-            println!("   （第 3 步已判 MOVE 不可用，本步状态码不可解释）");
-        } else if matches!(status, 201 | 204) {
-            println!("   ⚠ 服务端忽略了 Overwrite: F：已存在的目标被覆盖");
-        } else if !matches!(status, 409 | 412) {
-            println!("   ⚠ 预期之外的状态码（期望 409 或 412）");
-        } else {
-            println!("   Overwrite: F 生效：已存在的目标被拒");
-        }
+        // 上传定案依赖这条：同名包永不被覆盖，正是靠 `Overwrite: F` 被拒。
+        assert!(
+            matches!(status, 409 | 412),
+            "上传定案依赖 Overwrite: F 生效：目标已存在时 `MOVE` 应回 409/412 且不覆盖，实际 HTTP {status}"
+        );
 
         // 6. ETag 响应头：只报有无与长度，值本身不打印。
         let response = send(
@@ -1972,11 +1974,13 @@ mod tests {
             "8. 清理复核 PROPFIND：{}；仍有本次探针：{leftover}",
             response.status
         );
+        // 403 或空 body 同样不含探针名：先要回列表，这条复核才有意义。
         assert!(
-            !leftover,
-            "清理后 PROPFIND 仍列出本次探针（HTTP {}）",
+            matches!(response.status, 200 | 207),
+            "清理复核 PROPFIND 应回 207/200，实际 HTTP {}",
             response.status
         );
+        assert!(!leftover, "清理后 PROPFIND 仍列出本次探针");
     }
 
     #[test]

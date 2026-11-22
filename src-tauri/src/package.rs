@@ -24,6 +24,10 @@ pub const SNAPSHOT_ENTRY_PREFIX: &str = "snapshot/";
 pub const TEMP_NAME_PREFIX: &str = ".tmp-";
 
 const COPY_BUFFER: usize = 64 * 1024;
+/// 解包落盘的权限：暂存目录可能是下一次应用的对象，而快照含明文密钥。
+/// 不套用包内记录的 mode——那是不可信输入。
+const UNPACK_DIR_MODE: u32 = 0o700;
+const UNPACK_FILE_MODE: u32 = 0o600;
 /// 包名的固定形态 `<yyyymmdd-HHmmss>-<fp8>.zip`，逐位校验时用到它的长度。
 const NAME_LEN: usize = 28;
 
@@ -273,12 +277,19 @@ fn file_options(mode: Option<u32>) -> SimpleFileOptions {
     }
 }
 
-/// 解包到 `dest`。`dest` 必须是调用方按包名准备的暂存目录：失败时整棵删掉，不留半套快照。
+/// 解包到 `dest`。`dest` 必须是调用方按包名准备的新路径：失败时整棵删掉，不留半套快照。
 pub fn unpack(archive: &Path, dest: &Path) -> Result<UnpackReport, PackageError> {
     unpack_with(archive, dest, Limits::default())
 }
 
 fn unpack_with(archive: &Path, dest: &Path, limits: Limits) -> Result<UnpackReport, PackageError> {
+    // 已存在的路径可能是一份可用的暂存：这里拒绝而不是复用，失败路径才不会删掉别人的目录。
+    if dest.symlink_metadata().is_ok() {
+        return Err(PackageError::corrupt(format!(
+            "暂存目录已存在，拒绝对其解包：{}",
+            dest.display()
+        )));
+    }
     let size = fs::metadata(archive)
         .map_err(|error| {
             PackageError::corrupt(format!("无法读取包文件 {}：{error}", archive.display()))
@@ -315,6 +326,10 @@ fn write_entries<R: Read + io::Seek>(
     dest: &Path,
     limits: Limits,
 ) -> Result<UnpackReport, PackageError> {
+    // 上层目录（暂存根）可能还不存在：递归建，每一级都按 0700 建，不经过 umask。
+    platform::create_dir_all_mode(dest, UNPACK_DIR_MODE).map_err(|error| {
+        PackageError::write_failed(format!("无法创建暂存目录 {}：{error}", dest.display()))
+    })?;
     let mut report = UnpackReport { files: 0, bytes: 0 };
     let mut has_manifest = false;
     let mut buffer = vec![0u8; COPY_BUFFER];
@@ -338,7 +353,7 @@ fn write_entries<R: Read + io::Seek>(
         let target = resolve_within(dest, &relative)
             .ok_or_else(|| PackageError::unsafe_entry(format!("条目落点越界：{name}")))?;
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
+            platform::create_dir_all_mode(parent, UNPACK_DIR_MODE).map_err(|error| {
                 PackageError::write_failed(format!("无法创建目录 {}：{error}", parent.display()))
             })?;
         }
@@ -363,6 +378,10 @@ fn write_entries<R: Read + io::Seek>(
                 PackageError::write_failed(format!("无法写入 {}：{error}", target.display()))
             })?;
         }
+        // `File::create` 按 umask 建（通常 0644），写完补一次显式权限（Windows 上不设）。
+        platform::set_mode(&target, UNPACK_FILE_MODE).map_err(|error| {
+            PackageError::write_failed(format!("无法设置 {} 的权限：{error}", target.display()))
+        })?;
         report.files += 1;
         if name == MANIFEST_ENTRY {
             has_manifest = true;
@@ -641,6 +660,52 @@ mod tests {
     #[test]
     fn rejects_package_without_manifest() {
         reject_entries(&[("snapshot/a.json", b"x")], "package_corrupt");
+    }
+
+    #[test]
+    fn unpacked_directories_and_files_are_owner_only() {
+        let temp = TempDir::new("modes");
+        let archive = temp.path().join("package.zip");
+        build_zip(
+            &archive,
+            &[
+                ("manifest.json", b"{}"),
+                ("snapshot/skills/antd/SKILL.md", b"# antd\n"),
+            ],
+        );
+        let dest = temp.path().join("staging").join("out");
+        unpack(&archive, &dest).expect("解包");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for dir in [dest.clone(), dest.join("snapshot/skills")] {
+                let mode = fs::metadata(&dir).expect("stat").permissions().mode();
+                assert_eq!(mode & 0o777, 0o700, "{} 应只有本用户可进入", dir.display());
+            }
+            let mode = fs::metadata(dest.join("snapshot/skills/antd/SKILL.md"))
+                .expect("stat")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "解包文件应只有本用户可读写");
+        }
+    }
+
+    #[test]
+    fn refuses_to_unpack_onto_an_existing_directory() {
+        let temp = TempDir::new("occupied");
+        let archive = temp.path().join("package.zip");
+        build_zip(&archive, &[("manifest.json", b"{}")]);
+        let dest = temp.path().join("out");
+        fs::create_dir_all(dest.join("keep")).expect("建已存在的暂存目录");
+        write_file(&dest.join("keep/previous.json"), b"{}");
+
+        let error = unpack(&archive, &dest).expect_err("已存在的目录必须拒绝");
+        assert_eq!(error.code, "package_corrupt", "{}", error.message);
+        assert!(
+            dest.join("keep/previous.json").exists(),
+            "拒绝时不得删除已存在目录的内容"
+        );
     }
 
     #[test]

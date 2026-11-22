@@ -99,6 +99,8 @@
 | 包文件体积 | ≤ 64 MB（上传前本地判；下载前看 `content-length`） | `package_too_large` |
 | 条目类型 | 只接受普通文件与目录；出现符号链接或特殊类型条目即拒 | `package_corrupt` |
 | manifest | 解包后 `manifest.json` 必须存在 | `package_corrupt` |
+| 目标目录 | 必须是尚不存在的路径；已存在即拒（不覆盖、不删除） | `package_corrupt` |
+| 权限 | 解包后目录 `0700`、文件 `0600`；不套用包内记录 mode | — |
 
 数量级参照：真实受管范围约几十到几百个文件、约 100 KB，上限留了两个数量级余量。
 
@@ -267,7 +269,8 @@ idle → fetching → unpacking → verifying → planning → previewing → ba
 
 | code | 含义 |
 | :--- | :--- |
-| `manifest_missing` / `manifest_corrupt` / `manifest_unsupported` | 解包后 manifest 缺失、无法解析或格式版本不支持 |
+| `manifest_missing` | 计划侧目录里没有 `manifest.json`（例如手选了旧布局目录）；解包阶段缺 manifest 是 `package_corrupt` |
+| `manifest_corrupt` / `manifest_unsupported` | manifest 无法解析或格式版本不支持 |
 | `package_corrupt` | zip 无法解析、顶层条目不符白名单、缺 manifest、或出现符号链接/特殊类型条目 |
 | `package_unsafe_entry` | 条目路径越界、条目数或解压体积超限 |
 | `package_too_large` | 包超过 64 MB |
