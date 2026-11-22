@@ -1627,7 +1627,7 @@ mod tests {
             .expect_err("缺 agent 根应失败");
         assert_eq!(failure.code, "manifest_corrupt");
 
-        // 字段整个缺失：为了让旧 `remote-state.json` 能解析，结构上允许缺省，
+        // 字段整个缺失：结构上允许缺省，好让旧 manifest 能被单独读取；
         // 但 v3 快照缺它就缺 agent 根，同样按损坏拒绝，不当成 agent-only。
         manifest
             .as_object_mut()

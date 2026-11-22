@@ -48,7 +48,7 @@
         └── agents-skills/     # ~/.agents/skills，第二个受管根
 ```
 
-- 包内布局与旧版同步根**逐字节同构**（`manifest.json` + `snapshot/…`），所以解包到暂存目录后可以直接交给计划与应用，落地链路不认识"包"这个概念。
+- 解包后的暂存目录与旧版同步根**逐字节同构**（`manifest.json` + `snapshot/…`），所以可以直接交给计划与应用，落地链路不认识"包"这个概念。
 - `manifest.json` 必须位于包根，且在同一个 zip 内：**包自包含**，导出/导入/分享都只有一个文件。
 - 包内**只有普通文件与目录条目**。符号链接不写成 zip 的 symlink 条目：链接目标内容已经物化进 `snapshot/`，链接身份只记在 manifest 的 `symlinks` 里。由此不需要 Info-ZIP 的 `S_IFLNK` 约定，也不可能通过归档内容在本机创建符号链接。
 
@@ -298,7 +298,7 @@ idle → fetching → unpacking → verifying → planning → previewing → ba
 
 | code | 含义 |
 | :--- | :--- |
-| `manifest_missing` | 计划侧目录里没有 `manifest.json`（例如手选了旧布局目录）；解包阶段缺 manifest 是 `package_corrupt` |
+| `manifest_missing` | 计划侧目录里没有 `manifest.json`（例如手选了一个不是快照包的目录）；解包阶段缺 manifest 是 `package_corrupt` |
 | `manifest_corrupt` / `manifest_unsupported` | manifest 无法解析，或格式版本 / 受管根 id 不支持 |
 | `manifest_invalid` | 应用前重算计划时快照校验未通过（半套快照、哈希不符、manifest 里的根与链接记录读不出来）：整次拒绝 |
 | `package_corrupt` | zip 无法解析、顶层条目不符白名单、缺 manifest，或出现符号链接/特殊类型条目 |

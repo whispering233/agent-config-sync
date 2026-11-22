@@ -129,7 +129,7 @@ export type CompareRow = {
   deleted: number | null;
   unchanged: number | null;
   /** 将被删掉的具体条目：所属根 + 根内相对路径。 */
-  deletedItems: { root: 'agent' | 'agents-skills'; path: string }[];
+  deletedItems: { root: RootId; path: string }[];
   error: { code: string; message: string } | null;
 };
 

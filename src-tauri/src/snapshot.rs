@@ -59,8 +59,8 @@ pub struct Manifest {
     pub profile_id: String,
     /// 本快照受管的根 id。`agent` 始终在，`agents-skills` 只在源机存在 `~/.agents/skills` 时出现。
     ///
-    /// 缺字段按空处理：`remote-state.json` 里曾存过整份 manifest，旧版本记录没有这个字段，
-    /// 解析失败会让 WebDAV 上传/下载与定时上行全部停掉。快照本身依旧只按 `formatVersion` 拒绝旧格式。
+    /// 缺字段按空处理：旧 manifest 可能没有这个字段。先让它能反序列化，再由格式版本与
+    /// `agent` 根校验给出具体错误，而不是把「字段没有」一律报成 JSON 损坏。
     #[serde(default)]
     pub managed_roots: Vec<RootId>,
     pub created_at: String,
@@ -2036,9 +2036,8 @@ mod tests {
 
     #[test]
     fn manifest_without_managed_roots_still_deserializes() {
-        // v2 快照没有 `managedRoots`。这个字段必须能缺省：`remote-state.json` 里存的是整份
-        // manifest，升级后解析失败会让 WebDAV 上传/下载与定时上行全部停掉。
-        // 快照本身依旧靠 `formatVersion` 拒绝旧格式。
+        // v2 快照没有 `managedRoots`。缺省是为了让旧 manifest 能单独读取元数据；
+        // 是否可用仍由 `formatVersion` 与 `agent` 根校验决定。
         let text = r#"{
             "formatVersion": 2,
             "profileId": "default",

@@ -16,6 +16,7 @@ import {
   type LeftoverCleanup,
   type PackageList,
   type RemoteDownload,
+  type RootId,
   type SnapshotExport,
   type UploadResult,
 } from '../lib/desktop';
@@ -29,9 +30,6 @@ type ExportFailure = {
 
 /** 计划项的差异类别，与 Rust 侧 `PlanCategory` 一致。 */
 type PlanCategory = 'added' | 'modified' | 'deleted';
-
-/** 受管根，与 Rust 侧 `RootId` 一致：agent 根与用户级 `~/.agents/skills`。 */
-type RootId = 'agent' | 'agents-skills';
 
 /** 受管根的可读名称；与 `RootId` 逐一对应。 */
 const rootLabels: Record<RootId, string> = {

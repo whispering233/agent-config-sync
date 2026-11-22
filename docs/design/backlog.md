@@ -50,7 +50,7 @@
 
 ### 删除旧格式快照
 
-- 现状：升级前的快照是 `manifest.json` + `snapshot/` 目录布局，升级后它们落进「无法识别的文件」，只展示不处理。
+- 现状：升级前的快照是一个目录，内含 `manifest.json` + `snapshot/`；当前快照是 zip，旧目录布局落进「无法识别的文件」，只展示不处理。
 - 判断：这些残留对“最新”判定、保留清理与落地都是惰性的，不处理也没有功能影响。
 - 要点：要删的是**目录**，而 `StoreListing.unrecognized` 不带 `is_collection`（`DavEntry` 有，被 store 层丢了），`store.delete` 只删文件；WebDAV 上目录 `DELETE` 还要求尾斜杠 + `Depth: infinity`（坚果云对根目录下的集合直接 403）。
 - 前置：先把「不可识别项」带上类型（文件/目录）与体积，再谈目录删除。
