@@ -1042,7 +1042,9 @@ mod tests {
         write_file(&agent.join("skills/antd/SKILL.md"), "# 技能\n");
         write_file(&agent.join("auth.json"), "{\"token\": \"sk-test\"}");
         fs::create_dir_all(&sync_root).expect("建同步目录");
-        crate::snapshot::export(&agent, &sync_root).expect("导出夹具快照");
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).expect("建 home");
+        crate::snapshot::export(&agent, &home, &sync_root).expect("导出夹具快照");
         let fingerprint =
             crate::plan::plan_snapshot(&agent, &sync_root, &FakeRunner, HostOs::Posix)
                 .expect("生成夹具计划")

@@ -9,17 +9,17 @@
 use crate::config;
 use crate::doctor::{self, CommandOutcome, CommandRunner, ShellRunner, Version, PROBE_TIMEOUT};
 use crate::platform::{HostOs, ProgramPath};
-use crate::scope::{self, EntryKind};
+use crate::scope::{self, EntryKind, ManagedRoot, ManagedRoots, RootId};
 use crate::snapshot::{
-    self, Manifest, ManifestFile, Requirements, SourceInfo, FORMAT_VERSION, MANIFEST_FILE_NAME,
-    SNAPSHOT_DIR_NAME,
+    self, split_manifest_path, Manifest, ManifestFile, Requirements, SourceInfo, FORMAT_VERSION,
+    MANIFEST_FILE_NAME,
 };
 use crate::webdav_transfer;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
 /// 哈希不符明细的列出上限；超出部分只计数。
@@ -48,11 +48,13 @@ pub enum PlanKind {
     Link,
 }
 
-/// 计划项。路径相对宿主目录。
+/// 计划项。`path` 相对所属受管根：两个根可能包含相同的相对路径，靠 `root` 区分。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanItem {
-    /// 相对宿主目录的路径，`/` 分隔。
+    /// 所属受管根。
+    pub root: RootId,
+    /// 相对所属受管根的路径，`/` 分隔。
     pub path: String,
     pub category: PlanCategory,
     pub kind: PlanKind,
@@ -171,10 +173,12 @@ impl PlanFailure {
     }
 }
 
-/// core：校验快照并生成计划。`agent_dir` 是 live 宿主目录，`sync_root` 是云盘同步文件夹；
+/// core：校验快照并生成计划。`agent_dir` 是 live 宿主目录，`home_dir` 用来解析
+/// `~/.agents/skills`（快照声明了它但本机解析不到 home 时报 `home_dir_missing`）；
 /// `host` 只影响宿主版本探测的命令形态（生产传 [`HostOs::current`]）。
 pub fn plan_snapshot(
     agent_dir: &Path,
+    home_dir: Option<&Path>,
     sync_root: &Path,
     runner: &dyn CommandRunner,
     host: HostOs,
@@ -192,8 +196,9 @@ pub fn plan_snapshot(
         });
     }
 
-    let live = live_scan(agent_dir, &manifest)?;
-    let (plan, totals) = build_plan(&manifest.files, &live);
+    let roots = resolve_roots(agent_dir, home_dir, &manifest)?;
+    let live = live_scan(&roots, &manifest)?;
+    let (plan, totals) = build_plan(&manifest, &live);
 
     Ok(PlanReport {
         manifest_info: ManifestInfo {
@@ -258,9 +263,45 @@ fn read_manifest(sync_root: &Path) -> Result<Manifest, PlanFailure> {
         }
     }
 
-    serde_json::from_value(value).map_err(|error| {
+    // 受管根 id 不认识就是格式不支持：先于反序列化检查，才能与「结构损坏」分开。
+    match value.get("managedRoots") {
+        // 缺字段：结构上能解析（`serde(default)`），但 agent 根必须在，后面按损坏报。
+        None => {}
+        Some(serde_json::Value::Array(items)) => {
+            for item in items {
+                let Some(id) = item.as_str() else {
+                    return Err(PlanFailure::new(
+                        "manifest_corrupt",
+                        "manifest 的 managedRoots 不是字符串数组",
+                    ));
+                };
+                if RootId::parse(id).is_none() {
+                    return Err(PlanFailure::new(
+                        "manifest_unsupported",
+                        format!("manifest 声明了本应用不认识的受管根 {id}"),
+                    ));
+                }
+            }
+        }
+        Some(_) => {
+            return Err(PlanFailure::new(
+                "manifest_corrupt",
+                "manifest 的 managedRoots 不是字符串数组",
+            ))
+        }
+    }
+
+    let manifest: Manifest = serde_json::from_value(value).map_err(|error| {
         PlanFailure::new("manifest_corrupt", format!("manifest 字段不完整：{error}"))
-    })
+    })?;
+    // agent 根是所有快照的前提，缺了就当损坏而不是「不声明」。
+    if !manifest.managed_roots.contains(&RootId::Agent) {
+        return Err(PlanFailure::new(
+            "manifest_corrupt",
+            "manifest 的 managedRoots 缺少 agent 根",
+        ));
+    }
+    Ok(manifest)
 }
 
 /// 逐文件重算大小与哈希。返回（最多 [`MAX_LISTED_MISMATCHES`] 条明细, 不符总数）。
@@ -314,69 +355,123 @@ struct LiveFile {
     sha256: Option<String>,
 }
 
-/// live 侧扫描结果。
+/// live 侧扫描结果。键是（所属根, 根内相对路径）：两个根可能有相同相对路径，不能串。
 struct LiveScan {
-    files: BTreeMap<String, LiveFile>,
+    files: BTreeMap<(RootId, String), LiveFile>,
     /// 快照没声明的链接：只能删链接本身，所以只记路径，目标内容永不读取。
-    undeclared_links: Vec<String>,
+    undeclared_links: Vec<(RootId, String)>,
+}
+
+/// 按 manifest 声明的根解析本机路径。未声明的根不出现：目标机完全不读、不写、不删。
+fn resolve_roots(
+    agent_dir: &Path,
+    home_dir: Option<&Path>,
+    manifest: &Manifest,
+) -> Result<ManagedRoots, PlanFailure> {
+    let mut roots = vec![ManagedRoot::agent(agent_dir)];
+    if manifest.managed_roots.contains(&RootId::AgentsSkills) {
+        let home_dir = home_dir.ok_or_else(|| {
+            PlanFailure::new(
+                "home_dir_missing",
+                "快照声明了 ~/.agents/skills，但无法确定本机 home 目录，已停止生成计划",
+            )
+        })?;
+        roots.push(ManagedRoot::agents_skills(home_dir));
+    }
+    Ok(ManagedRoots::new(roots))
+}
+
+/// 外部根在本机的状态：`Ok(false)` = 还没建（按空目录处理）。
+/// 目标机多出的技能要能列为删除候选，缺失则快照里的内容全算新增。
+fn external_root_usable(path: &Path) -> Result<bool, PlanFailure> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(PlanFailure::new(
+            "external_root_invalid",
+            format!("{} 存在但不是目录，无法落地快照", path.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(PlanFailure::new(
+            "external_root_unreadable",
+            format!("无法访问 {}：{error}", path.display()),
+        )),
+    }
 }
 
 /// 按受管范围扫 live 并算哈希。范围外文件永不读取。
-fn live_scan(agent_dir: &Path, manifest: &Manifest) -> Result<LiveScan, PlanFailure> {
-    let scanned = scope::scan(agent_dir).map_err(|error| {
-        PlanFailure::new(
-            "agent_dir_unreadable",
-            format!("无法遍历宿主目录 {}：{error}", agent_dir.display()),
-        )
-    })?;
+fn live_scan(roots: &ManagedRoots, manifest: &Manifest) -> Result<LiveScan, PlanFailure> {
+    let mut scan = LiveScan {
+        files: BTreeMap::new(),
+        undeclared_links: Vec::new(),
+    };
 
-    // manifest 提到过的路径都算受管：链接本身在 `symlinks`，链接下的内容在 `files`。
-    let declared_links: Vec<String> = manifest
-        .symlinks
-        .iter()
-        .map(|link| live_relative(&link.path).to_string())
-        .collect();
-    let mut declared: Vec<String> = manifest
-        .files
-        .iter()
-        .map(|file| live_relative(&file.path).to_string())
-        .chain(declared_links.iter().cloned())
-        .collect();
-    declared.sort();
-
-    let links: Vec<String> = scanned
-        .entries
-        .iter()
-        .filter(|entry| entry.link_target.is_some())
-        .map(|entry| slash(&entry.relative_path))
-        .collect();
-    let undeclared_links = undeclared_links(&links, &declared);
-
-    let mut files = BTreeMap::new();
-    for entry in scanned
-        .entries
-        .iter()
-        .filter(|entry| entry.kind == EntryKind::File)
-    {
-        let path = slash(&entry.relative_path);
-        if undeclared_links.iter().any(|link| is_under(&path, link)) {
+    for root in roots.iter() {
+        if root.id == RootId::AgentsSkills && !external_root_usable(&root.path)? {
             continue;
         }
-        let sha256 = fs::read(agent_dir.join(&entry.relative_path))
-            .ok()
-            .map(|bytes| snapshot::sha256_hex(&bytes));
-        files.insert(
-            path,
-            LiveFile {
-                size: entry.size,
-                sha256,
-            },
-        );
+
+        let scanned = scope::scan_root(root).map_err(|error| {
+            let (code, what) = match root.id {
+                RootId::Agent => ("agent_dir_unreadable", "宿主目录"),
+                RootId::AgentsSkills => ("external_root_unreadable", "~/.agents/skills"),
+            };
+            PlanFailure::new(
+                code,
+                format!("无法遍历{what} {}：{error}", root.path.display()),
+            )
+        })?;
+
+        // manifest 提到过的路径都算受管：链接本身在 `symlinks`，链接下的内容在 `files`。
+        let declared_links: Vec<String> = manifest
+            .symlinks
+            .iter()
+            .filter_map(|link| split_manifest_path(&link.path))
+            .filter(|(id, _)| *id == root.id)
+            .map(|(_, relative)| slash(&relative))
+            .collect();
+        let mut declared: Vec<String> = manifest
+            .files
+            .iter()
+            .filter_map(|file| split_manifest_path(&file.path))
+            .filter(|(id, _)| *id == root.id)
+            .map(|(_, relative)| slash(&relative))
+            .chain(declared_links.iter().cloned())
+            .collect();
+        declared.sort();
+
+        let links: Vec<String> = scanned
+            .entries
+            .iter()
+            .filter(|entry| entry.link_target.is_some())
+            .map(|entry| slash(&entry.relative_path))
+            .collect();
+        let undeclared = undeclared_links(&links, &declared);
+
+        for entry in scanned
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::File)
+        {
+            let path = slash(&entry.relative_path);
+            if undeclared.iter().any(|link| is_under(&path, link)) {
+                continue;
+            }
+            let sha256 = fs::read(root.path.join(&entry.relative_path))
+                .ok()
+                .map(|bytes| snapshot::sha256_hex(&bytes));
+            scan.files.insert(
+                (root.id, path),
+                LiveFile {
+                    size: entry.size,
+                    sha256,
+                },
+            );
+        }
+        scan.undeclared_links
+            .extend(undeclared.into_iter().map(|path| (root.id, path)));
     }
-    Ok(LiveScan {
-        files,
-        undeclared_links,
-    })
+
+    Ok(scan)
 }
 
 /// 没被 manifest 提到的链接是陈旧残留：不进去读，列为可删除项（只删链接本身）。
@@ -403,22 +498,26 @@ fn is_under(path: &str, link: &str) -> bool {
 }
 
 /// 比较 manifest 与 live：快照有 live 无 → 新增；都有但哈希不同 → 修改；live 有快照无 → 删除。
-fn build_plan(manifest_files: &[ManifestFile], live: &LiveScan) -> (Plan, PlanTotals) {
+fn build_plan(manifest: &Manifest, live: &LiveScan) -> (Plan, PlanTotals) {
     let mut plan = Plan::default();
     let mut unchanged = 0;
-    let mut in_manifest: Vec<String> = Vec::new();
+    let mut in_manifest: BTreeSet<(RootId, String)> = BTreeSet::new();
 
-    for file in manifest_files {
-        let relative = live_relative(&file.path);
-        // manifest 里出现范围外路径（例如被改过的 manifest）：永不进入计划。
-        if !is_managed_relative(Path::new(relative)) {
+    for file in &manifest.files {
+        let Some((root, relative)) = split_manifest_path(&file.path) else {
+            continue;
+        };
+        // manifest 里出现未声明的根或范围外路径（例如被改过的 manifest）：永不进入计划。
+        if !manifest.managed_roots.contains(&root) || !scope::is_managed_relative(root, &relative) {
             continue;
         }
-        in_manifest.push(relative.to_string());
+        let key = (root, slash(&relative));
+        in_manifest.insert(key.clone());
 
-        match live.files.get(relative) {
+        match live.files.get(&key) {
             None => plan.added.push(PlanItem {
-                path: relative.to_string(),
+                root,
+                path: key.1,
                 category: PlanCategory::Added,
                 kind: PlanKind::File,
                 size: file.size,
@@ -429,7 +528,8 @@ fn build_plan(manifest_files: &[ManifestFile], live: &LiveScan) -> (Plan, PlanTo
                 unchanged += 1
             }
             Some(live_file) => plan.modified.push(PlanItem {
-                path: relative.to_string(),
+                root,
+                path: key.1,
                 category: PlanCategory::Modified,
                 kind: PlanKind::File,
                 size: file.size,
@@ -439,10 +539,11 @@ fn build_plan(manifest_files: &[ManifestFile], live: &LiveScan) -> (Plan, PlanTo
         }
     }
 
-    for (path, live_file) in &live.files {
-        if !in_manifest.contains(path) {
+    for (key, live_file) in &live.files {
+        if !in_manifest.contains(key) {
             plan.deleted.push(PlanItem {
-                path: path.clone(),
+                root: key.0,
+                path: key.1.clone(),
                 category: PlanCategory::Deleted,
                 kind: PlanKind::File,
                 size: live_file.size,
@@ -452,8 +553,9 @@ fn build_plan(manifest_files: &[ManifestFile], live: &LiveScan) -> (Plan, PlanTo
         }
     }
 
-    for path in &live.undeclared_links {
+    for (root, path) in &live.undeclared_links {
         plan.deleted.push(PlanItem {
+            root: *root,
             path: path.clone(),
             category: PlanCategory::Deleted,
             kind: PlanKind::Link,
@@ -464,11 +566,15 @@ fn build_plan(manifest_files: &[ManifestFile], live: &LiveScan) -> (Plan, PlanTo
     }
 
     for group in [&mut plan.added, &mut plan.modified, &mut plan.deleted] {
-        group.sort_by(|left, right| left.path.cmp(&right.path));
+        group.sort_by(|left, right| {
+            left.root
+                .cmp(&right.root)
+                .then_with(|| left.path.cmp(&right.path))
+        });
     }
 
     let totals = PlanTotals {
-        snapshot_files: manifest_files.len(),
+        snapshot_files: manifest.files.len(),
         live_files: live.files.len(),
         added: plan.added.len(),
         modified: plan.modified.len(),
@@ -476,39 +582,6 @@ fn build_plan(manifest_files: &[ManifestFile], live: &LiveScan) -> (Plan, PlanTo
         unchanged,
     };
     (plan, totals)
-}
-
-/// manifest 路径形如 `snapshot/settings.json`；计划里用相对宿主目录的路径。
-fn live_relative(path: &str) -> &str {
-    path.strip_prefix(SNAPSHOT_DIR_NAME)
-        .and_then(|rest| rest.strip_prefix('/'))
-        .unwrap_or(path)
-}
-
-/// 路径必须落在受管范围内：越界组件或排除项永不进入计划。
-///
-/// 快照由导出写入，正常情况下全在范围内；这里再挡一次被改过的 manifest，
-/// 复用 `scope` 的常量而不是复制规则表。
-fn is_managed_relative(relative: &Path) -> bool {
-    let names: Vec<&str> = relative
-        .components()
-        .map(|component| match component {
-            Component::Normal(name) => name.to_str(),
-            _ => None,
-        })
-        .collect::<Option<Vec<&str>>>()
-        .unwrap_or_default();
-
-    if names.is_empty() || scope::is_excluded_relative(relative) {
-        return false;
-    }
-    if names.len() > 1 {
-        return scope::INCLUDED_ROOT_DIRS.contains(&names[0]);
-    }
-    scope::INCLUDED_ROOT_FILES.contains(&names[0])
-        || Path::new(names[0])
-            .extension()
-            .is_some_and(|extension| extension == "json")
 }
 
 fn slash(path: &Path) -> String {
@@ -647,6 +720,7 @@ fn probe(app: &AppHandle, root: Option<String>) -> Result<PlanReport, PlanFailur
 
     plan_snapshot(
         &agent_dir,
+        home_dir.as_deref(),
         &sync_root,
         &ShellRunner::from_env(),
         HostOs::current(),
@@ -748,7 +822,7 @@ mod tests {
         sync_root: &Path,
         runner: &dyn CommandRunner,
     ) -> Result<PlanReport, PlanFailure> {
-        plan_snapshot(agent_dir, sync_root, runner, HostOs::Posix)
+        plan_snapshot(agent_dir, None, sync_root, runner, HostOs::Posix)
     }
 
     /// Windows 逐命令探测的替身：按顺序回放结果，并记下每个 argv。
@@ -807,6 +881,13 @@ mod tests {
         fs::write(path, content).expect("写入夹具文件");
     }
 
+    /// 单根夹具的 home：存在但没有 `~/.agents/skills`，导出只声明 agent 根。
+    fn home_without_skills(temp: &TempDir) -> PathBuf {
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).expect("创建 home");
+        home
+    }
+
     /// 导出过的快照 + 同一份 live：先保证"无差异"是基线。
     fn fixture(temp: &TempDir) -> (PathBuf, PathBuf) {
         let agent = temp.path().join("agent");
@@ -818,7 +899,7 @@ mod tests {
         write_file(&agent.join("auth.json"), "{}");
         write_file(&agent.join("sessions/session.json"), "{}");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        snapshot::export(&agent, &sync_root).expect("导出夹具快照");
+        snapshot::export(&agent, &home_without_skills(temp), &sync_root).expect("导出夹具快照");
         (agent, sync_root)
     }
 
@@ -855,13 +936,13 @@ mod tests {
         write_file(&agent.join("settings.json"), "{\"theme\": \"dark\"}");
         write_file(&outside.join("keep.txt"), "keep");
         fs::create_dir_all(&sync_root).expect("建同步目录");
-        snapshot::export(&agent, &sync_root).expect("导出夹具快照");
+        snapshot::export(&agent, &home_without_skills(&temp), &sync_root).expect("导出夹具快照");
         // 导出之后才出现的链接：快照里没有它，只能删链接本身。
         fs::create_dir_all(agent.join("skills")).expect("建 skills");
         symlink(&outside, agent.join("skills/extra")).expect("建目录链接");
 
-        let report =
-            plan_snapshot(&agent, &sync_root, &FakeRunner::ok(), HostOs::Posix).expect("生成计划");
+        let report = plan_snapshot(&agent, None, &sync_root, &FakeRunner::ok(), HostOs::Posix)
+            .expect("生成计划");
 
         assert_eq!(paths(&report.plan.deleted), vec!["skills/extra"]);
         assert_eq!(report.plan.deleted[0].kind, PlanKind::Link);
@@ -885,10 +966,10 @@ mod tests {
         fs::create_dir_all(agent.join("skills")).expect("建 skills");
         fs::create_dir_all(&sync_root).expect("建同步目录");
         symlink(&outside, agent.join("skills/extra")).expect("建目录链接");
-        snapshot::export(&agent, &sync_root).expect("导出夹具快照");
+        snapshot::export(&agent, &home_without_skills(&temp), &sync_root).expect("导出夹具快照");
 
-        let report =
-            plan_snapshot(&agent, &sync_root, &FakeRunner::ok(), HostOs::Posix).expect("生成计划");
+        let report = plan_snapshot(&agent, None, &sync_root, &FakeRunner::ok(), HostOs::Posix)
+            .expect("生成计划");
 
         assert!(report.plan.deleted.is_empty(), "已声明链接不是删除候选");
         assert!(report.plan.added.is_empty(), "链接下的内容按受管内容比较");
@@ -1299,5 +1380,293 @@ mod tests {
             (None, None)
         );
         assert!(runner.calls.borrow().is_empty());
+    }
+
+    fn rooted(items: &[PlanItem]) -> Vec<(RootId, String)> {
+        items
+            .iter()
+            .map(|item| (item.root, item.path.clone()))
+            .collect()
+    }
+
+    /// 两个根的夹具：导出后两端 live 与快照一致，作为“无差异”基线。
+    fn fixture_multi_root(temp: &TempDir) -> (PathBuf, PathBuf, PathBuf) {
+        let agent = temp.path().join("agent");
+        let home = temp.path().join("home");
+        let sync_root = temp.path().join("cloud");
+        write_file(&agent.join("settings.json"), "{\"theme\": \"dark\"}");
+        // 两个根放同一条相对路径：计划不能串。
+        write_file(&agent.join("skills/shared/SKILL.md"), "# agent 技能\n");
+        write_file(
+            &home.join(".agents/skills/skills/shared/SKILL.md"),
+            "# 外部技能\n",
+        );
+        write_file(
+            &home.join(".agents/skills/extra/SKILL.md"),
+            "# 只在外部的技能\n",
+        );
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+        snapshot::export_with(
+            &agent,
+            Some(&home),
+            &sync_root,
+            snapshot::SourceVersions::default(),
+        )
+        .expect("导出夹具快照");
+        (agent, home, sync_root)
+    }
+
+    #[test]
+    fn v2_manifest_is_rejected_as_unsupported() {
+        let temp = TempDir::new("v2");
+        let agent = temp.path().join("agent");
+        let sync_root = temp.path().join("cloud");
+        write_file(&agent.join("settings.json"), "{}");
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+        fs::write(
+            sync_root.join(MANIFEST_FILE_NAME),
+            "{\"formatVersion\": 2, \"profileId\": \"default\"}",
+        )
+        .expect("写 v2 manifest");
+
+        let failure = plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok())
+            .expect_err("v2 快照必须被拒绍");
+        assert_eq!(failure.code, "manifest_unsupported");
+        assert!(failure.message.contains('2'), "{}", failure.message);
+    }
+
+    #[test]
+    fn unknown_or_missing_agent_root_is_rejected() {
+        let temp = TempDir::new("managed-roots");
+        let agent = temp.path().join("agent");
+        let sync_root = temp.path().join("cloud");
+        write_file(&agent.join("settings.json"), "{}");
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+
+        // 不认识的根 id：格式不支持，不尝试兼容。
+        let mut manifest = serde_json::json!({
+            "formatVersion": FORMAT_VERSION,
+            "profileId": "default",
+            "managedRoots": ["agent", "profiles"],
+            "createdAt": "2026-11-20T05:30:00Z",
+            "fingerprint": "000000000000",
+            "source": { "app": "0.1.0", "os": "linux", "arch": "x64", "pi": null, "node": null },
+            "requirements": { "node": ">=22.19.0", "pi": ">=1.5.0" },
+            "files": [],
+            "symlinks": [],
+            "requiredPackages": []
+        });
+        fs::write(sync_root.join(MANIFEST_FILE_NAME), manifest.to_string()).expect("写 manifest");
+        let failure = plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok())
+            .expect_err("未知根 id 应失败");
+        assert_eq!(failure.code, "manifest_unsupported");
+        assert!(failure.message.contains("profiles"), "{}", failure.message);
+
+        // 缺 agent 根：当损坏处理，不当作“只声明了外部根”。
+        manifest["managedRoots"] = serde_json::json!(["agents-skills"]);
+        fs::write(sync_root.join(MANIFEST_FILE_NAME), manifest.to_string()).expect("写 manifest");
+        let failure = plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok())
+            .expect_err("缺 agent 根应失败");
+        assert_eq!(failure.code, "manifest_corrupt");
+
+        // 字段整个缺失：为了让旧 `remote-state.json` 能解析，结构上允许缺省，
+        // 但 v3 快照缺它就缺 agent 根，同样按损坏拒绝，不当成 agent-only。
+        manifest
+            .as_object_mut()
+            .expect("manifest 是对象")
+            .remove("managedRoots");
+        fs::write(sync_root.join(MANIFEST_FILE_NAME), manifest.to_string()).expect("写 manifest");
+        let failure = plan_snapshot_posix(&agent, &sync_root, &FakeRunner::ok())
+            .expect_err("缺 managedRoots 应失败");
+        assert_eq!(failure.code, "manifest_corrupt");
+    }
+
+    #[test]
+    fn both_roots_are_planned_and_same_relative_paths_do_not_mix() {
+        let temp = TempDir::new("multi-root");
+        let (agent, home, sync_root) = fixture_multi_root(&temp);
+
+        // 无差异基线。
+        let report = plan_snapshot(
+            &agent,
+            Some(&home),
+            &sync_root,
+            &FakeRunner::ok(),
+            HostOs::Posix,
+        )
+        .expect("应生成计划");
+        assert!(report.plan.added.is_empty(), "{:?}", report.plan.added);
+        assert!(
+            report.plan.modified.is_empty(),
+            "{:?}",
+            report.plan.modified
+        );
+        assert!(report.plan.deleted.is_empty(), "{:?}", report.plan.deleted);
+        assert_eq!(report.totals.unchanged, 4);
+        assert_eq!(report.totals.snapshot_files, 4);
+        assert_eq!(report.totals.live_files, 4);
+
+        // 只改外部根的同名相对路径：agent 根的同名文件不能被误判为修改。
+        write_file(
+            &home.join(".agents/skills/skills/shared/SKILL.md"),
+            "# 外部技能（改）\n",
+        );
+        let report = plan_snapshot(
+            &agent,
+            Some(&home),
+            &sync_root,
+            &FakeRunner::ok(),
+            HostOs::Posix,
+        )
+        .expect("应生成计划");
+        assert_eq!(
+            rooted(&report.plan.modified),
+            vec![(RootId::AgentsSkills, "skills/shared/SKILL.md".to_string())]
+        );
+
+        // 外部根的新增与删除也按根归属：live 少一项是新增，live 多一项是删除候选。
+        write_file(
+            &home.join(".agents/skills/new/SKILL.md"),
+            "# 新技能
+",
+        );
+        fs::remove_file(home.join(".agents/skills/extra/SKILL.md")).expect("删除外部技能");
+        let report = plan_snapshot(
+            &agent,
+            Some(&home),
+            &sync_root,
+            &FakeRunner::ok(),
+            HostOs::Posix,
+        )
+        .expect("应生成计划");
+        assert_eq!(
+            rooted(&report.plan.added),
+            vec![(RootId::AgentsSkills, "extra/SKILL.md".to_string())]
+        );
+        assert_eq!(
+            rooted(&report.plan.deleted),
+            vec![(RootId::AgentsSkills, "new/SKILL.md".to_string())]
+        );
+        // 计划项的根按 id 序列化，前端据此区分两个根。
+        let json = serde_json::to_value(&report.plan.deleted[0]).expect("序列化计划项");
+        assert_eq!(json["root"], "agents-skills");
+        assert_eq!(json["path"], "new/SKILL.md");
+    }
+
+    #[test]
+    fn missing_target_external_root_lists_everything_as_added() {
+        let temp = TempDir::new("multi-root-target");
+        let (agent, _home, sync_root) = fixture_multi_root(&temp);
+        // 目标机还没有 ~/.agents/skills：快照里的外部内容全部是新增。
+        let other_home = temp.path().join("other-home");
+        fs::create_dir_all(&other_home).expect("创建目标 home");
+
+        let report = plan_snapshot(
+            &agent,
+            Some(&other_home),
+            &sync_root,
+            &FakeRunner::ok(),
+            HostOs::Posix,
+        )
+        .expect("应生成计划");
+        assert_eq!(
+            rooted(&report.plan.added),
+            vec![
+                (RootId::AgentsSkills, "extra/SKILL.md".to_string()),
+                (RootId::AgentsSkills, "skills/shared/SKILL.md".to_string()),
+            ]
+        );
+        assert!(report.plan.deleted.is_empty(), "{:?}", report.plan.deleted);
+    }
+
+    #[test]
+    fn extra_skills_on_the_target_root_become_delete_candidates() {
+        let temp = TempDir::new("multi-root-extra");
+        let (agent, _home, sync_root) = fixture_multi_root(&temp);
+        let other_home = temp.path().join("other-home");
+        write_file(
+            &other_home.join(".agents/skills/only-here/SKILL.md"),
+            "# 只在目标机的技能\n",
+        );
+
+        let report = plan_snapshot(
+            &agent,
+            Some(&other_home),
+            &sync_root,
+            &FakeRunner::ok(),
+            HostOs::Posix,
+        )
+        .expect("应生成计划");
+        assert_eq!(
+            rooted(&report.plan.deleted),
+            vec![(RootId::AgentsSkills, "only-here/SKILL.md".to_string())]
+        );
+    }
+
+    #[test]
+    fn empty_source_root_lists_target_only_skills_as_deleted() {
+        let temp = TempDir::new("multi-root-empty-source");
+        let agent = temp.path().join("agent");
+        let home = temp.path().join("home");
+        let sync_root = temp.path().join("cloud");
+        write_file(&agent.join("settings.json"), "{\"theme\": \"dark\"}");
+        // 源机外部根存在但为空：照样声明，目标机多出的技能全是删除候选。
+        fs::create_dir_all(home.join(".agents/skills")).expect("创建空外部根");
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+        snapshot::export_with(
+            &agent,
+            Some(&home),
+            &sync_root,
+            snapshot::SourceVersions::default(),
+        )
+        .expect("导出夹具快照");
+
+        let other_home = temp.path().join("other-home");
+        write_file(
+            &other_home.join(".agents/skills/only-here/SKILL.md"),
+            "# 只在目标机的技能\n",
+        );
+
+        let report = plan_snapshot(
+            &agent,
+            Some(&other_home),
+            &sync_root,
+            &FakeRunner::ok(),
+            HostOs::Posix,
+        )
+        .expect("应生成计划");
+        assert!(report.plan.added.is_empty(), "{:?}", report.plan.added);
+        assert_eq!(
+            rooted(&report.plan.deleted),
+            vec![(RootId::AgentsSkills, "only-here/SKILL.md".to_string())]
+        );
+    }
+
+    #[test]
+    fn external_root_that_is_not_a_directory_fails_the_plan() {
+        let temp = TempDir::new("multi-root-file");
+        let (agent, _home, sync_root) = fixture_multi_root(&temp);
+        let other_home = temp.path().join("other-home");
+        write_file(&other_home.join(".agents/skills"), "not a dir");
+
+        let failure = plan_snapshot(
+            &agent,
+            Some(&other_home),
+            &sync_root,
+            &FakeRunner::ok(),
+            HostOs::Posix,
+        )
+        .expect_err("外部根不是目录应失败");
+        assert_eq!(failure.code, "external_root_invalid");
+    }
+
+    #[test]
+    fn declared_agents_skills_without_a_home_stops_the_plan() {
+        let temp = TempDir::new("multi-root-no-home");
+        let (agent, _home, sync_root) = fixture_multi_root(&temp);
+
+        let failure = plan_snapshot(&agent, None, &sync_root, &FakeRunner::ok(), HostOs::Posix)
+            .expect_err("声明了外部根却解析不到 home 应失败");
+        assert_eq!(failure.code, "home_dir_missing");
     }
 }

@@ -31,9 +31,13 @@ type RequiredPackage = {
 type ExportReport = {
   files: number;
   fingerprint: string;
+  /** 本次写进 manifest 的受管根。 */
+  managedRoots: RootId[];
   requiredPackages: RequiredPackage[];
   skipped: number;
   warnings: SecretFinding[];
+  /** 根级别的告警（例如根是符号链接、外部根是断链）。 */
+  rootWarnings: string[];
   plaintextSecrets: boolean;
   snapshotDir: string;
   manifestPath: string;
@@ -48,8 +52,19 @@ type ExportFailure = {
 /** 计划项的差异类别，与 Rust 侧 `PlanCategory` 一致。 */
 type PlanCategory = 'added' | 'modified' | 'deleted';
 
+/** 受管根，与 Rust 侧 `RootId` 一致：agent 根与用户级 `~/.agents/skills`。 */
+type RootId = 'agent' | 'agents-skills';
+
+/** 受管根的可读名称；与 `RootId` 逐一对应。 */
+const rootLabels: Record<RootId, string> = {
+  agent: '宿主目录',
+  'agents-skills': '~/.agents/skills',
+};
+
 /** 与 Rust 侧 `PlanItem` 一一对应；`deleted` 时 `snapshotSha256` 为 null。 */
 type PlanItem = {
+  /** 所属受管根；`path` 相对它，两个根可能有相同相对路径。 */
+  root: RootId;
   path: string;
   category: PlanCategory;
   /** `link` 只会出现在删除候选里：只删链接本身，不碰目标。 */
@@ -1086,15 +1101,23 @@ export function SnapshotPage() {
             <ResultRow label="文件数" value={String(exported.report.files)} />
             <ResultRow label="指纹" value={exported.report.fingerprint} mono />
             <ResultRow
+              label="受管根"
+              value={exported.report.managedRoots
+                .map((root) => rootLabels[root])
+                .join('、')}
+            />
+            <ResultRow
               label="声明的包"
               value={String(exported.report.requiredPackages.length)}
             />
             <ResultRow label="跳过的条目" value={String(exported.report.skipped)} />
+            <ResultRow label="快照目录" value={exported.report.snapshotDir} mono />
             <ResultRow label="manifest" value={exported.report.manifestPath} mono />
           </dl>
           <p className="mt-md text-sm text-muted-foreground">
             等待云盘上传完成后再在另一台机器上导入；manifest 最后写入，可作为上传完成的信号。
           </p>
+          <WarningList warnings={exported.report.rootWarnings} />
           {exported.report.plaintextSecrets && (
             <p className="mt-sm text-sm text-warning">
               快照含明文密钥（auth.json 或高危命中），manifest 已记录；云盘/WebDAV

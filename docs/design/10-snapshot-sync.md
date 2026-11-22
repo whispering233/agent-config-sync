@@ -46,7 +46,7 @@
 
 WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结构与本地模式一致（见 `40-webdav.md`）。
 
-快照目录本身不包含：`sessions/`、`npm/`、`install/`、缓存与状态文件；只包含 agent 根级的 `auth.json`，子目录同名文件（含 `~/.agents/skills` 内）仍排除。
+快照目录本身不包含 agent 根里的 `sessions/`、`npm/`、`install/`、缓存与状态文件；凭据只包含 agent 根级的 `auth.json`，任何子目录的同名文件（含 `~/.agents/skills` 内）仍排除。`~/.agents/skills` 下的其它内容整棵纳入：`npm/`、`sessions/` 这样的目录名在那里可能只是技能名。
 
 ## 3. 受管范围（白名单 / 排除）
 
@@ -63,9 +63,11 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
 
 ### 排除
 
+下表除 `auth.json` 一条外都只适用于 `agent` 根：`agent_dir` 里的状态、缓存与包本体是宿主自己产生的；`~/.agents/skills` 整个就是技能目录，同名目录在那里是正常技能名，一律纳入。
+
 | 项 | 实测体量 | 理由 |
 | :--- | :--- | :--- |
-| 子目录中的 `auth.json` | — | 只纳入根级；扩展自带的同名文件不碰 |
+| 任何根的子目录中的 `auth.json` | — | 只纳入 agent 根级；扩展自带的同名文件不碰。`~/.agents/skills` 根级的 `auth.json` 也不纳入 |
 | `sessions/` | 1.6 GB / 2962 文件 | 隐私与体积 |
 | `install/` | 313 MB | 宿主自身安装，平台相关 |
 | `npm/` | 285 MB / 17138 文件 | 包本体，跨平台会损坏；对端改为重装 |
@@ -80,7 +82,7 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
 ### 多根规则
 
 - `agent` 根：`<agent_dir>`，始终纳入。
-- `agents-skills` 根：`<home>/.agents/skills`，仅当源机存在该目录时纳入；不存在则不声明，目标机完全不读、不写、不删。存在但为空也声明，目标机多出的技能会列为删除候选。存在但不可读或不是目录时导出失败；是断链时按不存在处理并告警。
+- `agents-skills` 根：`<home>/.agents/skills`，仅当源机存在该目录时纳入；不存在则不声明，目标机完全不读、不写、不删。存在但为空也声明，目标机多出的技能会列为删除候选。存在但不可读或不是目录时导出失败；是断链时按不存在处理并告警。导出与应用都要用 home 解析这个根：解析不到 home 时导出不猜位置，按 `home_dir_missing` 失败，避免静默导出一份少了外部技能的快照。
 - 根的类型（真实目录/符号链接）不进入快照：根是链接时跟随读取内容，导出与应用各给一条告警；apply 不重建根链接。根链接不按“链接之下跳过”处理——它是根的边界，不是 manifest 条目；写入/删除会落到链接目标，UI 必须明示。
 - 项目级 `.pi/skills`、祖先 `.agents/skills` 与 `settings.json` 的 `skills` 指向的其它外部路径不纳管，只在技能盘点中展示。
 - 包内 `skills/` 不进快照；包体在 `npm/`，由目标机重装声明包恢复。
@@ -224,7 +226,8 @@ idle → reading → verifying → planning → previewing → backing-up → ap
 | :--- | :--- |
 | `manifest_missing` / `manifest_corrupt` / `manifest_unsupported` | 快照缺失、无法解析或格式版本/受管根 id 不支持 |
 | `external_root_invalid` / `external_root_unreadable` | `~/.agents/skills` 存在但不是目录 / 无法读取 |
-| `home_dir_missing` | manifest 声明了 `agents-skills`，但本机无法解析 home 目录 |
+| `home_dir_missing` | 解析不到 home 目录：导出无法判断是否需要声明 `~/.agents/skills`，应用时无法解析已声明的外部根 |
+| `sync_root_overlaps_agent_dir` / `sync_root_overlaps_external_root` | 同步文件夹与受管根（宿主目录 / `~/.agents/skills`）相同或互相嵌套（导出预检） |
 | `hash_mismatch` | 快照文件与 manifest 不一致 |
 | `plan_stale` | 应用前重算的指纹与用户确认时不同 |
 | `delete_not_in_plan` | 请求删除的路径不在本次计划或受管范围内 |
