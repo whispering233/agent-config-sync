@@ -25,11 +25,11 @@ Linux：
 
 ```bash
 # deb（推荐）
-sudo dpkg -i "src-tauri/target/release/bundle/deb/Agent Config Sync_0.0.2_amd64.deb"
+sudo dpkg -i "src-tauri/target/release/bundle/deb/Agent Config Sync_0.0.3_amd64.deb"
 
 # AppImage（不安装）
-chmod +x "src-tauri/target/release/bundle/appimage/Agent Config Sync_0.0.2_amd64.AppImage"
-"./Agent Config Sync_0.0.2_amd64.AppImage"
+chmod +x "src-tauri/target/release/bundle/appimage/Agent Config Sync_0.0.3_amd64.AppImage"
+"./Agent Config Sync_0.0.3_amd64.AppImage"
 ```
 
 文件名含空格，命令需要引号。deb 依赖 `libwebkit2gtk-4.1-0` 与 `libgtk-3-0`。

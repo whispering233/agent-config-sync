@@ -1138,7 +1138,8 @@ function CreatedFiles({ files }: { files: string[] }) {
         本次 RPC 在宿主目录新建了 {files.join('、')}
       </p>
       <p className="mt-xs text-xs leading-relaxed text-muted-foreground">
-        这些文件不会被自动删除；已存在的文件内容没有变化。空 `auth.json`
+        这些文件不会被自动删除；已存在的文件内容没有变化。空{' '}
+        <span className="font-mono">auth.json</span>{' '}
         会被后续导出当作源机凭据状态纳入，并在应用端覆盖目标凭据（覆盖前有备份）。
       </p>
     </div>

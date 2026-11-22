@@ -1202,12 +1202,15 @@ fn skills_check(agent_dir: Option<&Path>, home_dir: Option<&Path>) -> Check {
         if platform::is_link_like(&dir) {
             // 根本身是链接：目标是断的就没有内容可扫，但必须告警。
             if fs::metadata(&dir).is_err() {
-                broken_roots.push(format!("{} 是断链，按没有该目录处理", root.label()));
+                broken_roots.push(format!(
+                    "{} 是断链，按没有该目录处理",
+                    checked_dir_label(root)
+                ));
                 continue;
             }
             notes.push(format!(
                 "{} 本身是链接，按链接目标的实际内容检查",
-                root.label()
+                checked_dir_label(root)
             ));
         }
         match skills_links(&dir) {
@@ -1215,7 +1218,9 @@ fn skills_check(agent_dir: Option<&Path>, home_dir: Option<&Path>) -> Check {
                 links += count;
                 broken.extend(names.iter().map(|name| broken_label(root, name)));
             }
-            Err(error) => unreadable.push(format!("无法读取 {}（{error}）", root.label())),
+            Err(error) => {
+                unreadable.push(format!("无法读取 {}（{error}）", checked_dir_label(root)))
+            }
         }
     }
 
@@ -1253,6 +1258,15 @@ fn skills_check(agent_dir: Option<&Path>, home_dir: Option<&Path>) -> Check {
         Some(findings.join("；")),
         Some("skills.relink"),
     )
+}
+
+/// 被检查的目录本身怎么称呼：agent 根下的目录在 `skills/` 里，外部根本身就是技能目录。
+/// 只说「宿主目录」会让人以为检查的是宿主目录根，指错要找的位置。
+fn checked_dir_label(root: RootId) -> String {
+    match root {
+        RootId::Agent => root.describe("skills"),
+        RootId::AgentsSkills => root.label().to_string(),
+    }
 }
 
 /// 断链在告警里的位置：agent 根下的链接在 `skills/` 里，外部根本身就是技能目录。
@@ -2196,7 +2210,7 @@ mod tests {
         assert_eq!(check.value.as_deref(), Some("0 个链接"));
         let detail = check.detail.clone().unwrap_or_default();
         assert!(
-            detail.contains("宿主目录 本身是链接，按链接目标的实际内容检查"),
+            detail.contains("宿主目录 里的 skills 本身是链接，按链接目标的实际内容检查"),
             "{detail}"
         );
     }

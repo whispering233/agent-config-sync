@@ -532,8 +532,9 @@ pub async fn skills_inventory(app: tauri::AppHandle) -> Result<SkillInventory, S
 fn probe(app: &tauri::AppHandle) -> Result<SkillInventory, String> {
     use tauri::Manager;
 
-    // 用户手动动作：与上传/下载/应用/回滚、自动上行串行，
-    // 免得宿主刚创建的空 auth.json 被同时跑着的导出带进快照。
+    // 用户手动动作：与上传（含其内部导出）/下载/应用/回滚、自动上行串行，
+    // 免得宿主刚创建的空 auth.json 被同时进行的那次导出带进快照。本地导出不取锁，
+    // 这个窗口本身记在 backlog，不在这里拦。
     let _guard = crate::runtime::lock_operation();
 
     let config_dir = app
@@ -1327,6 +1328,14 @@ mod tests {
         assert!(
             demo.path.as_deref().is_some_and(|path| !path.is_empty()),
             "{demo:?}"
+        );
+        // 只看非空会把「宿主报了别的目录」也算通过：确认路径就在临时宿主目录的技能目录下。
+        let path = demo.path.clone().unwrap_or_default();
+        let skills_dir = agent.join("skills");
+        assert!(
+            Path::new(&path).starts_with(&skills_dir),
+            "demo 技能应在 {} 下：{path}",
+            skills_dir.display()
         );
     }
 
