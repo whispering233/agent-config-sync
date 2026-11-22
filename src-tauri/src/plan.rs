@@ -9,6 +9,7 @@
 use crate::config;
 use crate::doctor::{self, CommandOutcome, CommandRunner, ShellRunner, Version, PROBE_TIMEOUT};
 use crate::platform::{HostOs, ProgramPath};
+use crate::runtime;
 use crate::scope::{self, EntryKind};
 use crate::snapshot::{
     self, Manifest, ManifestFile, Requirements, SourceInfo, FORMAT_VERSION, MANIFEST_FILE_NAME,
@@ -81,6 +82,17 @@ pub struct PlanTotals {
     pub modified: usize,
     pub deleted: usize,
     pub unchanged: usize,
+}
+
+/// 两份 manifest 的文件级差异。三组路径都是相对宿主目录的形式，组内升序。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManifestDiff {
+    /// 右边有、左边没有。
+    pub added: Vec<String>,
+    /// 两边都有但哈希不同。
+    pub modified: Vec<String>,
+    /// 左边有、右边没有。
+    pub removed: Vec<String>,
 }
 
 /// manifest 摘要，供 UI 显示"是不是同一份快照"。
@@ -179,6 +191,24 @@ pub fn plan_snapshot(
     runner: &dyn CommandRunner,
     host: HostOs,
 ) -> Result<PlanReport, PlanFailure> {
+    plan_with(agent_dir, sync_root, Some((runner, host)))
+}
+
+/// 同一套校验与计划，但不探测宿主版本：对比表只关心差异计数与删除路径。
+///
+/// 一份候选包起两个子进程（各最多 5 秒）的代价换不来表里任何一列，所以对比走这里。
+pub fn plan_snapshot_without_probe(
+    agent_dir: &Path,
+    sync_root: &Path,
+) -> Result<PlanReport, PlanFailure> {
+    plan_with(agent_dir, sync_root, None)
+}
+
+fn plan_with(
+    agent_dir: &Path,
+    sync_root: &Path,
+    probe: Option<(&dyn CommandRunner, HostOs)>,
+) -> Result<PlanReport, PlanFailure> {
     let manifest = read_manifest(sync_root)?;
 
     let (mismatches, mismatch_total) = verify_manifest_files(sync_root, &manifest.files);
@@ -209,12 +239,47 @@ pub fn plan_snapshot(
         },
         plan,
         totals,
-        requirements: requirement_checks(&manifest.requirements, agent_dir, runner, host),
+        requirements: match probe {
+            Some((runner, host)) => {
+                requirement_checks(&manifest.requirements, agent_dir, runner, host)
+            }
+            None => Vec::new(),
+        },
     })
 }
 
+/// 逐文件比较两份 manifest：只比 `files`（链接与声明包不进对比表）。
+///
+/// `BTreeMap` 的键序就是路径升序，不必再排一次。
+pub fn diff_manifests(left: &Manifest, right: &Manifest) -> ManifestDiff {
+    let (left_files, right_files) = (manifest_hashes(left), manifest_hashes(right));
+
+    let mut diff = ManifestDiff::default();
+    for (path, sha256) in &right_files {
+        match left_files.get(path) {
+            None => diff.added.push(path.clone()),
+            Some(before) if before != sha256 => diff.modified.push(path.clone()),
+            Some(_) => {}
+        }
+    }
+    for path in left_files.keys() {
+        if !right_files.contains_key(path) {
+            diff.removed.push(path.clone());
+        }
+    }
+    diff
+}
+
+fn manifest_hashes(manifest: &Manifest) -> BTreeMap<String, &str> {
+    manifest
+        .files
+        .iter()
+        .map(|file| (live_relative(&file.path).to_string(), file.sha256.as_str()))
+        .collect()
+}
+
 /// 读 manifest：不存在 → `manifest_missing`；版本不认识 → `manifest_unsupported`；其余 → `manifest_corrupt`。
-fn read_manifest(sync_root: &Path) -> Result<Manifest, PlanFailure> {
+pub(crate) fn read_manifest(sync_root: &Path) -> Result<Manifest, PlanFailure> {
     let path = sync_root.join(MANIFEST_FILE_NAME);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -636,14 +701,7 @@ fn probe(app: &AppHandle, root: Option<String>) -> Result<PlanReport, PlanFailur
         })?,
     };
 
-    // 只读取这一个文档化的环境变量；错误信息里不回显其内容。
-    let env_agent_dir = std::env::var_os(config::AGENT_DIR_ENV_VAR).map(PathBuf::from);
-    let home_dir = app.path().home_dir().ok();
-    let resolved =
-        config::resolve_agent_dir(&config, env_agent_dir.as_deref(), home_dir.as_deref());
-    let agent_dir = resolved.path.ok_or_else(|| {
-        PlanFailure::new("agent_dir_missing", "无法确定宿主目录，请先在设置页填写")
-    })?;
+    let agent_dir = agent_dir(app, &config)?;
 
     plan_snapshot(
         &agent_dir,
@@ -653,15 +711,34 @@ fn probe(app: &AppHandle, root: Option<String>) -> Result<PlanReport, PlanFailur
     )
 }
 
+/// 宿主目录：配置 + 环境变量 + 家目录兜底。对比与检查都要它，抽出来免得两处各解析一遍。
+pub(crate) fn agent_dir(
+    app: &AppHandle,
+    config: &config::AppConfig,
+) -> Result<PathBuf, PlanFailure> {
+    // 只读取这一个文档化的环境变量；错误信息里不回显其内容。
+    let env_agent_dir = std::env::var_os(config::AGENT_DIR_ENV_VAR).map(PathBuf::from);
+    let home_dir = app.path().home_dir().ok();
+    let resolved = config::resolve_agent_dir(config, env_agent_dir.as_deref(), home_dir.as_deref());
+
+    resolved
+        .path
+        .ok_or_else(|| PlanFailure::new("agent_dir_missing", "无法确定宿主目录，请先在设置页填写"))
+}
+
 /// 子进程会阻塞最多 5 秒，放阻塞线程池，别占住 UI 线程。
 #[tauri::command]
 pub async fn verify_and_plan(
     app: AppHandle,
     root: Option<String>,
 ) -> Result<PlanReport, PlanFailure> {
-    tauri::async_runtime::spawn_blocking(move || probe(&app, root))
-        .await
-        .map_err(|error| PlanFailure::new("plan_failed", format!("检查失败：{error}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        // 与上传/下载/应用/回滚共用一把锁：计划要读暂存目录，而取包成功后会清掉旧暂存。
+        let _guard = runtime::lock_operation();
+        probe(&app, root)
+    })
+    .await
+    .map_err(|error| PlanFailure::new("plan_failed", format!("检查失败：{error}")))?
 }
 
 #[cfg(test)]
@@ -818,7 +895,7 @@ mod tests {
         write_file(&agent.join("auth.json"), "{}");
         write_file(&agent.join("sessions/session.json"), "{}");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        snapshot::export(&agent, &sync_root).expect("导出夹具快照");
+        snapshot::export_fixture(&agent, &sync_root).expect("导出夹具快照");
         (agent, sync_root)
     }
 
@@ -855,7 +932,7 @@ mod tests {
         write_file(&agent.join("settings.json"), "{\"theme\": \"dark\"}");
         write_file(&outside.join("keep.txt"), "keep");
         fs::create_dir_all(&sync_root).expect("建同步目录");
-        snapshot::export(&agent, &sync_root).expect("导出夹具快照");
+        snapshot::export_fixture(&agent, &sync_root).expect("导出夹具快照");
         // 导出之后才出现的链接：快照里没有它，只能删链接本身。
         fs::create_dir_all(agent.join("skills")).expect("建 skills");
         symlink(&outside, agent.join("skills/extra")).expect("建目录链接");
@@ -885,7 +962,7 @@ mod tests {
         fs::create_dir_all(agent.join("skills")).expect("建 skills");
         fs::create_dir_all(&sync_root).expect("建同步目录");
         symlink(&outside, agent.join("skills/extra")).expect("建目录链接");
-        snapshot::export(&agent, &sync_root).expect("导出夹具快照");
+        snapshot::export_fixture(&agent, &sync_root).expect("导出夹具快照");
 
         let report =
             plan_snapshot(&agent, &sync_root, &FakeRunner::ok(), HostOs::Posix).expect("生成计划");
@@ -1100,6 +1177,83 @@ mod tests {
             "{}",
             failure.message
         );
+    }
+
+    /// 只造 `files`，其余字段固定：对比只看文件路径与哈希。
+    fn manifest_of(files: &[(&str, &str)]) -> Manifest {
+        let files: Vec<ManifestFile> = files
+            .iter()
+            .map(|(path, content)| ManifestFile {
+                path: format!("{SNAPSHOT_DIR_NAME}/{path}"),
+                sha256: snapshot::sha256_hex(content.as_bytes()),
+                size: content.len() as u64,
+                kind: "text".to_string(),
+            })
+            .collect();
+
+        Manifest {
+            format_version: FORMAT_VERSION,
+            profile_id: snapshot::PROFILE_ID.to_string(),
+            created_at: "2026-11-22T10:52:30Z".to_string(),
+            fingerprint: snapshot::fingerprint(FORMAT_VERSION, &files),
+            source: SourceInfo {
+                app: "0.1.0".to_string(),
+                os: "linux".to_string(),
+                arch: "x64".to_string(),
+                pi: None,
+                node: None,
+            },
+            requirements: Requirements {
+                node: ">=22.19.0".to_string(),
+                pi: ">=1.5.0".to_string(),
+            },
+            files,
+            symlinks: Vec::new(),
+            required_packages: Vec::new(),
+            plaintext_secrets: false,
+        }
+    }
+
+    #[test]
+    fn diff_manifests_ignores_files_that_match() {
+        let left = manifest_of(&[("settings.json", "{}"), ("skills/a.md", "a")]);
+        let right = manifest_of(&[("skills/a.md", "a"), ("settings.json", "{}")]);
+
+        assert_eq!(diff_manifests(&left, &right), ManifestDiff::default());
+    }
+
+    #[test]
+    fn diff_manifests_reports_files_only_one_side_has() {
+        let left = manifest_of(&[("mcp.json", "{}"), ("skills/only-left.md", "a")]);
+        let right = manifest_of(&[("mcp.json", "{}"), ("skills/only-right.md", "b")]);
+
+        let diff = diff_manifests(&left, &right);
+        assert_eq!(diff.added, vec!["skills/only-right.md".to_string()]);
+        assert_eq!(diff.removed, vec!["skills/only-left.md".to_string()]);
+        assert!(diff.modified.is_empty());
+    }
+
+    #[test]
+    fn diff_manifests_reports_hash_changes() {
+        let left = manifest_of(&[("settings.json", "{\"v\":1}")]);
+        let right = manifest_of(&[("settings.json", "{\"v\":2}")]);
+
+        let diff = diff_manifests(&left, &right);
+        assert_eq!(diff.modified, vec!["settings.json".to_string()]);
+        assert!(diff.added.is_empty() && diff.removed.is_empty());
+    }
+
+    #[test]
+    fn diff_manifests_against_an_empty_side_is_sorted() {
+        let empty = manifest_of(&[]);
+        let full = manifest_of(&[("skills/b.md", "b"), ("AGENTS.md", "#")]);
+
+        assert_eq!(
+            diff_manifests(&empty, &full).added,
+            vec!["AGENTS.md".to_string(), "skills/b.md".to_string()]
+        );
+        assert_eq!(diff_manifests(&full, &empty).removed.len(), 2);
+        assert!(diff_manifests(&empty, &empty).added.is_empty());
     }
 
     #[test]

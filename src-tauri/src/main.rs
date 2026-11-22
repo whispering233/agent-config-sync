@@ -8,15 +8,19 @@ mod conflicts;
 mod credentials;
 mod doctor;
 mod installer;
+mod package;
 mod packages;
 mod plan;
 mod platform;
+mod remote_state;
 mod rollback;
 mod runtime;
 mod scope;
 mod secrets;
 mod snapshot;
+mod store;
 mod tray;
+mod upload;
 mod versions;
 mod webdav;
 mod webdav_transfer;
@@ -57,6 +61,9 @@ fn main() {
             commands::save_webdav_credentials,
             commands::test_webdav_connection,
             commands::download_remote_snapshot,
+            commands::list_snapshot_packages,
+            commands::compare_snapshot_packages,
+            commands::cleanup_upload_leftovers,
             commands::upload_snapshot,
             doctor::run_check,
             installer::preview_install,

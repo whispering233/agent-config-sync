@@ -61,61 +61,175 @@ export function testWebdavConnection(input: WebdavInput): Promise<WebdavProbe> {
   });
 }
 
-/** 与 Rust 侧 `DownloadView` 一一对应：一次下载落到了本机暂存目录。 */
+/** 与 Rust 侧 `DownloadView` 一一对应：一份包已经解到本机暂存目录。 */
 export type RemoteDownload = {
+  /** 包名：`<UTC yyyymmdd-HHmmss>-<指纹前 8 位>.zip`。 */
+  package: string;
+  /** 包文件字节数。 */
+  size: number;
+  /** 包内快照文件数（不含 manifest）。 */
+  files: number;
+  /** manifest 里的完整指纹。 */
+  fingerprint: string;
+  /** manifest 里的创建时间，RFC 3339 UTC。 */
+  createdAt: string;
   /** 暂存目录；可以当作 `root` 传给 `verify_and_plan` 与 `apply_snapshot`。 */
   stagingRoot: string;
-  fingerprint: string;
-  fileCount: number;
-  createdAt: string;
-  /** 本次下载之前记录的同步时间；本机没有记录时为 null。 */
+  /** 上一次成功上传/下载时看到的远端时间；本地文件夹模式没有远端，为 null。 */
   previousSeenAt: string | null;
 };
 
-/** 按远端 manifest 把快照取到本机暂存目录。不写本机配置，也不碰同步文件夹。 */
-export function downloadRemoteSnapshot(): Promise<RemoteDownload> {
-  return invoke<RemoteDownload>('download_remote_snapshot');
-}
+/** 存储根 / 云端里的一个包。 */
+export type PackageEntry = {
+  /** `<UTC yyyymmdd-HHmmss>-<指纹前 8 位>.zip`。 */
+  name: string;
+  size: number;
+  /** 包名里的时间戳换算成的 RFC 3339 UTC；展示时换算本地时区。 */
+  createdAt: string;
+  /** 包名里的指纹前 8 位：只用于显示与人工核对。 */
+  fingerprint8: string;
+  /** 名字最大的一份：列表的默认选中项。 */
+  isNewest: boolean;
+};
 
-/** 一次上传的结局。冲突不是错误：远端一个字节都没写，等用户选一边。 */
-export type RemoteUpload =
-  | {
-      kind: 'uploaded';
-      fingerprint: string;
-      /** 真正 PUT 上去的文件数。 */
-      uploaded: number;
-      /** 与远端已一致、跳过的文件数。 */
-      skipped: number;
-      /** 本次上传后记录的同步时间。 */
-      seenAt: string;
-    }
-  | {
-      kind: 'conflict';
-      remoteFingerprint: string;
-      /** 下面三个清单描述远端相对上次记录的变化；本机无记录时都是空数组。 */
-      added: string[];
-      modified: string[];
-      removed: string[];
-      /** 远端清单损坏：只能覆盖，无法先下载。 */
-      remoteCorrupt: boolean;
-    };
+/** 与 Rust 侧 `PackageListView` 一一对应。 */
+export type PackageList = {
+  /** 按名字倒序：最新在前。 */
+  packages: PackageEntry[];
+  /** 无法识别的文件（`.tmp-*`、云盘冲突副本等）：只展示，不可操作。 */
+  unrecognized: string[];
+  /** `unrecognized` 里名字是本应用上传残留的那些：只有它们可以被清理动作删掉。 */
+  tempFiles: string[];
+  /** 上次成功上传/下载时看到的云端时间；本地文件夹模式没有记录，为 null。 */
+  seenAt: string | null;
+  /** 云端有、本机记录里没有的包数；本地文件夹模式恒为 0。 */
+  unseenCount: number;
+};
 
 /**
- * 把当前配置导出并推到 WebDAV。
- *
- * `overwrite` 只在用户看过冲突清单后点「覆盖云端」时为 true。
+ * 列举当前传输方式的快照包，按名字倒序。只读：WebDAV 模式下只发 `PROPFIND`，
+ * 不改远端，也不改本机记录。
  */
-export function uploadSnapshot(overwrite: boolean): Promise<RemoteUpload> {
-  return invoke<RemoteUpload>('upload_snapshot', { overwrite });
+export function listSnapshotPackages(): Promise<PackageList> {
+  return invoke<PackageList>('list_snapshot_packages');
 }
 
+/** 对比表的一行：一份候选包对当前配置的只读计划结果。 */
+export type CompareRow = {
+  /** 包名：`<UTC yyyymmdd-HHmmss>-<指纹前 8 位>.zip`。 */
+  package: string;
+  /** 包名时间戳换算成的 RFC 3339 UTC。 */
+  createdAt: string;
+  /** 包名里的指纹前 8 位。 */
+  fingerprint8: string;
+  /** 失败行为 null：下面的计数与路径都不成立。 */
+  added: number | null;
+  modified: number | null;
+  /** 「将删除」：当前配置里有、包里没有的受管文件数。 */
+  deleted: number | null;
+  unchanged: number | null;
+  /** 将被删掉的具体路径。 */
+  deletedPaths: string[];
+  error: { code: string; message: string } | null;
+};
+
+/** 两个候选包之间的文件级差异：`added` 是右边有左边没有。 */
+export type ComparePair = {
+  left: string;
+  right: string;
+  added: string[];
+  modified: string[];
+  removed: string[];
+};
+
+/** 与 Rust 侧 `CompareReport` 一一对应：`rows` 按包名倒序。 */
+export type CompareReport = {
+  rows: CompareRow[];
+  /** 候选少于两份时为 null。 */
+  pair: ComparePair | null;
+};
+
+/**
+ * 对比候选包与当前配置：只读，不改本机配置、不改云端、不写备份。
+ *
+ * 缺省不传名字就没得对比；每份包解到临时目录跑计划，结束后整体清掉。
+ */
+export function compareSnapshotPackages(
+  packages: string[],
+): Promise<CompareReport> {
+  return invoke<CompareReport>('compare_snapshot_packages', { packages });
+}
+
+/** 与 Rust 侧 `CleanupOutcome` 一一对应：清理上传残留的三桶结果。 */
+export type LeftoverCleanup = {
+  /** 已删掉的项。 */
+  deleted: string[];
+  /** 删不掉的项：单项失败不影响其它项，整次清理仍算跑完。 */
+  failed: { name: string; reason: string }[];
+  /** 不在清理范围、没有动的无法识别文件。 */
+  skipped: string[];
+};
+
+/**
+ * 清理当前传输方式下的上传残留，只删本应用自己产生过的临时名。
+ *
+ * 候选由核心侧重新列举后算出，因此重复调用是幂等的；合法包、`manifest.json`、
+ * `snapshot/` 与外来文件不会进入候选。
+ */
+export function cleanupUploadLeftovers(): Promise<LeftoverCleanup> {
+  return invoke<LeftoverCleanup>('cleanup_upload_leftovers');
+}
+
+/**
+ * 取一份包到本机暂存目录，不写本机配置。
+ *
+ * 省略 `packageName` 时取存储里名字最大的一份。
+ */
+export function downloadRemoteSnapshot(
+  packageName?: string | null,
+): Promise<RemoteDownload> {
+  return invoke<RemoteDownload>('download_remote_snapshot', {
+    package: packageName ?? null,
+  });
+}
+
+/** 与 Rust 侧 `ExportReport` 一一对应：导出得到的包。 */
+export type SnapshotExport = {
+  /** 内容与存储里最新包相同：这次没有写新包。 */
+  unchanged: boolean;
+  packageName: string;
+  /** 包文件字节数。 */
+  size: number;
+  /** 包内快照文件数（不含 manifest）。 */
+  files: number;
+  fingerprint: string;
+  createdAt: string;
+  plaintextSecrets: boolean;
+};
+
+/** 与 Rust 侧 `UploadView` 一一对应：一次上传的包语义结果。 */
+export type UploadResult = {
+  /** 上传的包名；内容未变时是上次上传的那份。 */
+  package: string;
+  /** 内容与上次上传相同：没有写新包、没动远端。 */
+  unchanged: boolean;
+  /** 本次清理掉的旧包名。 */
+  pruned: string[];
+  /** 清理失败的份：不阻塞上传成功。`name` 为空表示整个清理动作失败。 */
+  pruneFailed: { name: string; reason: string }[];
+};
+
+/** 把当前配置导出成一个快照包，WebDAV 模式下同时上传并清理旧包。 */
+export function uploadSnapshot(): Promise<UploadResult> {
+  return invoke<UploadResult>('upload_snapshot');
+}
 
 /** 与 Rust 侧 `AutoSyncStatus` 一一对应。`state` 是有限状态机，不是自由文本。 */
 export type AutoSyncState =
   | 'idle'
   | 'running'
   | 'success'
-  | 'conflict'
+  | 'diverged'
   | 'failed'
   | 'skipped'
   | 'paused';
