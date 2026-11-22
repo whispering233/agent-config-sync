@@ -128,8 +128,8 @@ export type CompareRow = {
   /** 「将删除」：当前配置里有、包里没有的受管文件数。 */
   deleted: number | null;
   unchanged: number | null;
-  /** 将被删掉的具体路径。 */
-  deletedPaths: string[];
+  /** 将被删掉的具体条目：所属根 + 根内相对路径。 */
+  deletedItems: { root: RootId; path: string }[];
   error: { code: string; message: string } | null;
 };
 
@@ -193,6 +193,18 @@ export function downloadRemoteSnapshot(
   });
 }
 
+/** 受管根，与 Rust 侧 `RootId` 一致：宿主目录与用户级 `~/.agents/skills`。 */
+export type RootId = 'agent' | 'agents-skills';
+
+/** 一次导出里的一条密钥提示：只有位置，不含密钥值。 */
+export type SecretFinding = {
+  path: string;
+  field: string | null;
+  line: number;
+  level: 'high' | 'low';
+  rule: string;
+};
+
 /** 与 Rust 侧 `ExportReport` 一一对应：导出得到的包。 */
 export type SnapshotExport = {
   /** 内容与存储里最新包相同：这次没有写新包。 */
@@ -204,6 +216,15 @@ export type SnapshotExport = {
   files: number;
   fingerprint: string;
   createdAt: string;
+  /** 本次快照声明的受管根。 */
+  managedRoots: RootId[];
+  requiredPackages: { source: string; enabled: boolean }[];
+  /** 断链等被跳过的条目数。 */
+  skipped: number;
+  /** 只读扫描结果：不阻断，也没有自动改写。 */
+  warnings: SecretFinding[];
+  /** 根级别的告警：根是符号链接、外部根是断链等。 */
+  rootWarnings: string[];
   plaintextSecrets: boolean;
 };
 
@@ -217,6 +238,8 @@ export type UploadResult = {
   pruned: string[];
   /** 清理失败的份：不阻塞上传成功。`name` 为空表示整个清理动作失败。 */
   pruneFailed: { name: string; reason: string }[];
+  /** 导出时的根告警（根是链接、外部根断链等）。 */
+  rootWarnings: string[];
 };
 
 /** 把当前配置导出成一个快照包，WebDAV 模式下同时上传并清理旧包。 */

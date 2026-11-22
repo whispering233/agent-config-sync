@@ -126,6 +126,38 @@ type AlignRunState =
   | { kind: 'done'; report: AlignReport }
   | { kind: 'failed'; message: string };
 
+/** 与 Rust 侧 `scope::RootId` 一一对应。 */
+type SkillRoot = 'agent' | 'agents-skills';
+
+/** 与 Rust 侧 `skills::SkillSource` 一一对应。 */
+type SkillSource = 'user' | 'package' | 'project' | 'other';
+
+/** 与 Rust 侧 `skills::SkillEntry` 一一对应。 */
+type SkillEntry = {
+  name: string;
+  description: string | null;
+  path: string | null;
+  root: SkillRoot | null;
+  snapshot: boolean;
+  source: SkillSource;
+  reason: string | null;
+};
+
+/** 与 Rust 侧 `skills::SkillInventory` 一一对应。 */
+type SkillInventory = {
+  error: string | null;
+  skills: SkillEntry[];
+  warnings: string[];
+  createdFiles: string[];
+};
+
+type SkillsState =
+  | { kind: 'idle' }
+  | { kind: 'loading' }
+  | { kind: 'browser' }
+  | { kind: 'ready'; report: SkillInventory }
+  | { kind: 'failed'; message: string };
+
 type InstallRunState =
   | { kind: 'idle' }
   | { kind: 'confirming'; command: InstallCommand }
@@ -151,6 +183,10 @@ function loadPackageStatus(): Promise<PackageStatus> {
 
 function runAlignPackages(sources: string[]): Promise<AlignReport> {
   return invoke<AlignReport>('align_packages', { sources, confirm: true });
+}
+
+function loadSkillInventory(): Promise<SkillInventory> {
+  return invoke<SkillInventory>('skills_inventory');
 }
 
 const groupOrder = ['环境', '宿主与工具', '凭据', '扩展包', '技能'] as const;
@@ -414,6 +450,8 @@ export function DoctorPage() {
       />
 
       <PackagesCard latest={state.kind === 'ready' ? state.report.latest : null} />
+
+      <SkillsCard />
 
       {state.kind === 'idle' && (
         <Card className="p-lg text-center">
@@ -699,7 +737,8 @@ function PackagesCard({ latest }: { latest: LatestVersions | null }) {
     <Card className="p-lg">
       <h2 className="text-sm font-semibold text-foreground">包对齐</h2>
       <p className="mt-xs text-sm text-muted-foreground">
-        比对 settings.json 的 packages 声明与 `pi list` 的实装。只安装缺失项；多余包只列出，不会自动删除。
+        比对 <span className="font-mono">settings.json</span> 的 packages 声明与{' '}
+        <span className="font-mono">pi list</span> 的实装。只安装缺失项；多余包只列出，不会自动删除。
       </p>
 
       {view.kind === 'loading' && (
@@ -707,8 +746,10 @@ function PackagesCard({ latest }: { latest: LatestVersions | null }) {
       )}
       {view.kind === 'browser' && (
         <p className="mt-md text-xs leading-relaxed text-muted-foreground">
-          浏览器预览里没有 Rust 进程，读不到 settings.json 也执行不了 `pi list`。
-          包状态与安装命令只在 Tauri 桌面版可用。
+          浏览器预览里没有 Rust 进程，读不到{' '}
+          <span className="font-mono">settings.json</span> 也执行不了{' '}
+          <span className="font-mono">pi list</span>
+          。包状态与安装命令只在 Tauri 桌面版可用。
         </p>
       )}
       {view.kind === 'failed' && (
@@ -945,6 +986,218 @@ function InfoRow({
       >
         {value}
       </dd>
+    </div>
+  );
+}
+
+const skillRootLabels: Record<SkillRoot, string> = {
+  agent: '宿主目录',
+  'agents-skills': '~/.agents/skills',
+};
+
+/**
+ * 技能清单只在用户点击后拉取：RPC 会启动宿主，宿主可能创建空文件，
+ * 所以首次点击前先把副作用说清楚，不能用挂载即请求的方式。
+ */
+function SkillsCard() {
+  const [state, setState] = useState<SkillsState>(
+    isDesktop ? { kind: 'idle' } : { kind: 'browser' },
+  );
+
+  const running = state.kind === 'loading';
+  const report = state.kind === 'ready' ? state.report : null;
+
+  async function refresh() {
+    setState({ kind: 'loading' });
+    try {
+      setState({ kind: 'ready', report: await loadSkillInventory() });
+    } catch (error) {
+      setState({ kind: 'failed', message: errorMessage(error) });
+    }
+  }
+
+  return (
+    <Card className="p-lg">
+      <h2 className="text-sm font-semibold text-foreground">技能</h2>
+      <p className="mt-xs text-sm text-muted-foreground">
+        读宿主实际加载的技能，并标出哪些随快照。只读展示，不修复、不改文件。
+      </p>
+
+      {state.kind === 'browser' && (
+        <p className="mt-md text-xs leading-relaxed text-muted-foreground">
+          浏览器预览里没有 Rust 进程，起不了宿主 RPC；技能清单只在桌面版可用。
+        </p>
+      )}
+
+      {(state.kind === 'idle' || state.kind === 'browser') && (
+        <div className="mt-md rounded-md bg-surface-muted px-md py-sm">
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            刷新会启动{' '}
+            <span className="break-all font-mono">
+              pi --mode rpc --offline --no-session --no-extensions --no-approve
+            </span>
+            ，最多等 15 秒，失败不重试。若宿主目录缺少{' '}
+            <span className="font-mono">auth.json</span> 或{' '}
+            <span className="font-mono">models-store.json</span>
+            ，宿主会创建空文件：本应用不删除它们；新建的空{' '}
+            <span className="font-mono">auth.json</span>{' '}
+            会被后续导出当作源机凭据状态纳入，并在应用端覆盖目标凭据（覆盖前有备份）。
+          </p>
+        </div>
+      )}
+
+      <div className="mt-md flex flex-wrap items-center gap-sm">
+        <Button onClick={() => void refresh()} disabled={!isDesktop || running}>
+          {running ? '读取中…' : '刷新技能'}
+        </Button>
+        {!isDesktop && (
+          <span className="text-sm text-muted-foreground">仅桌面版可用</span>
+        )}
+        {report !== null && report.error === null && (
+          <span className="text-sm text-muted-foreground">
+            共 {report.skills.length} 个技能
+          </span>
+        )}
+      </div>
+
+      {running && (
+        <p className="mt-sm text-xs text-muted-foreground">
+          正在启动宿主 RPC，最多 15 秒…
+        </p>
+      )}
+
+      {state.kind === 'failed' && (
+        <p className="mt-md text-sm text-danger">{state.message}</p>
+      )}
+
+      {report !== null && (
+        <>
+          {report.error !== null && (
+            <p className="mt-md text-sm text-danger">{report.error}</p>
+          )}
+          <CreatedFiles files={report.createdFiles} />
+
+          {report.error === null &&
+            (report.skills.length === 0 ? (
+              <p className="mt-md text-sm text-muted-foreground">
+                宿主没有加载技能。
+              </p>
+            ) : (
+              <>
+                <SkillGroup
+                  title="随快照"
+                  hint="导出会带上，应用时按所属根落地"
+                  skills={report.skills.filter((skill) => skill.snapshot)}
+                />
+                <SkillGroup
+                  title="包提供"
+                  hint="随包重装恢复，不进快照"
+                  skills={report.skills.filter(
+                    (skill) => !skill.snapshot && skill.source === 'package',
+                  )}
+                />
+                <SkillGroup
+                  title="不随快照"
+                  skills={report.skills.filter(
+                    (skill) => !skill.snapshot && skill.source !== 'package',
+                  )}
+                />
+              </>
+            ))}
+
+          {report.warnings.length > 0 && (
+            <ul className="mt-md flex flex-col gap-sm">
+              {report.warnings.map((warning) => (
+                <li
+                  key={warning}
+                  className="flex items-start gap-sm text-xs leading-relaxed text-warning"
+                >
+                  <TriangleAlert
+                    className="mt-0.5 h-4 w-4 shrink-0"
+                    aria-hidden="true"
+                  />
+                  <span className="break-all">{warning}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+    </Card>
+  );
+}
+
+function CreatedFiles({ files }: { files: string[] }) {
+  if (files.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="mt-md rounded-md bg-surface-muted px-md py-sm">
+      <p className="text-sm font-medium text-warning">
+        本次 RPC 在宿主目录新建了 {files.join('、')}
+      </p>
+      <p className="mt-xs text-xs leading-relaxed text-muted-foreground">
+        这些文件不会被自动删除；已存在的文件内容没有变化。空{' '}
+        <span className="font-mono">auth.json</span>{' '}
+        会被后续导出当作源机凭据状态纳入，并在应用端覆盖目标凭据（覆盖前有备份）。
+      </p>
+    </div>
+  );
+}
+
+function SkillGroup({
+  title,
+  hint,
+  skills,
+}: {
+  title: string;
+  hint?: string;
+  skills: SkillEntry[];
+}) {
+  if (skills.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="mt-md">
+      <p className="text-xs text-muted-foreground">
+        {title}（{skills.length} 个）{hint !== undefined && ` · ${hint}`}
+      </p>
+      <ul className="mt-xs flex flex-col gap-xs">
+        {skills.map((skill) => (
+          <li
+            key={`${skill.root ?? skill.source}-${skill.name}-${skill.path ?? ''}`}
+            className="rounded-md bg-surface-muted px-md py-xs"
+          >
+            <div className="flex flex-wrap items-baseline gap-sm">
+              <span className="text-sm font-medium text-foreground">
+                {skill.name}
+              </span>
+              {skill.root !== null && (
+                <span className="text-xs text-muted-foreground">
+                  {skillRootLabels[skill.root]}
+                </span>
+              )}
+            </div>
+            {skill.description !== null && (
+              <p className="mt-xs text-xs leading-relaxed text-muted-foreground">
+                {skill.description}
+              </p>
+            )}
+            {skill.path !== null && (
+              <p className="mt-xs break-all font-mono text-xs text-muted-foreground">
+                {skill.path}
+              </p>
+            )}
+            {skill.reason !== null && (
+              <p className="mt-xs text-xs leading-relaxed text-warning">
+                {skill.reason}
+              </p>
+            )}
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

@@ -17,6 +17,7 @@ mod rollback;
 mod runtime;
 mod scope;
 mod secrets;
+mod skills;
 mod snapshot;
 mod store;
 mod tray;
@@ -73,6 +74,7 @@ fn main() {
             snapshot::export_snapshot,
             plan::verify_and_plan,
             conflicts::scan_conflicts,
+            skills::skills_inventory,
             apply::apply_snapshot,
             rollback::list_backups,
             rollback::restore_backup,

@@ -24,6 +24,8 @@ pub struct UploadView {
     pub pruned: Vec<String>,
     /// 清理失败的份：不阻塞上传成功，单独上报。
     pub prune_failed: Vec<PruneFailure>,
+    /// 导出时的根告警（根是链接、外部根断链等）；上传成功后仍需让用户看见。
+    pub root_warnings: Vec<String>,
 }
 
 /// 清理失败的一份包。整个清理动作失败（列不出来）时 `name` 为空。
@@ -69,6 +71,7 @@ impl UploadView {
             unchanged: report.unchanged,
             pruned: prune.pruned,
             prune_failed: prune_failures(prune.failed),
+            root_warnings: report.root_warnings,
         }
     }
 }
@@ -90,6 +93,7 @@ pub fn upload_to_webdav(
     endpoint: &str,
     app_data: &Path,
     agent_dir: &Path,
+    home_dir: Option<&Path>,
     versions: SourceVersions,
     include_auth: bool,
 ) -> Result<UploadOutcome, UploadFailure> {
@@ -104,9 +108,17 @@ pub fn upload_to_webdav(
 
     let state = remote_state::load(app_data);
     let baseline = state.last_uploaded_fingerprint.as_deref();
-    let stored =
-        snapshot::pack_and_store(store, baseline, agent_dir, app_data, versions, include_auth)
-            .map_err(|failure| UploadFailure::new(failure.code, failure.message))?;
+    let stored = snapshot::pack_and_store(
+        store,
+        baseline,
+        agent_dir,
+        home_dir,
+        app_data,
+        None,
+        versions,
+        include_auth,
+    )
+    .map_err(|failure| UploadFailure::new(failure.code, failure.message))?;
 
     let Some(stored) = stored else {
         // 内容没变：不写包、不碰远端。但远端集合可能已被他机改过（另一台机器推了新包），
@@ -120,6 +132,7 @@ pub fn upload_to_webdav(
                     unchanged: true,
                     pruned: Vec::new(),
                     prune_failed: Vec::new(),
+                    root_warnings: Vec::new(),
                 },
             });
         };
@@ -149,6 +162,7 @@ pub fn upload_to_webdav(
                 unchanged: true,
                 pruned: Vec::new(),
                 prune_failed: Vec::new(),
+                root_warnings: Vec::new(),
             },
         });
     };
@@ -205,6 +219,7 @@ pub fn upload_to_webdav(
             unchanged: false,
             pruned,
             prune_failed,
+            root_warnings: stored.root_warnings,
         },
     })
 }
@@ -265,6 +280,7 @@ pub fn upload_from_app(
         &credentials.url,
         &context.app_data,
         &context.agent_dir,
+        context.home_dir.as_deref(),
         context.versions,
         include_auth,
     )
@@ -506,6 +522,13 @@ mod tests {
             self.temp.path().join("app-data")
         }
 
+        /// 单根家目录：存在但没有 `~/.agents/skills`，导出只声明 agent 根。
+        fn home(&self) -> PathBuf {
+            let home = self.temp.path().join("home");
+            fs::create_dir_all(&home).expect("创建 home");
+            home
+        }
+
         fn upload(&self, endpoint: &str) -> Result<UploadOutcome, UploadFailure> {
             let client = WebdavClient::new(self.remote.clone(), BASE);
             let store = WebdavStore::new(&client);
@@ -514,6 +537,7 @@ mod tests {
                 endpoint,
                 &self.app_data(),
                 &self.agent(),
+                Some(&self.home()),
                 SourceVersions::default(),
                 true,
             )
@@ -654,6 +678,7 @@ mod tests {
             BASE,
             &fixture.app_data(),
             &fixture.agent(),
+            Some(&fixture.home()),
             SourceVersions::default(),
             true,
         )

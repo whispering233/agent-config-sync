@@ -16,6 +16,7 @@ import {
   type LeftoverCleanup,
   type PackageList,
   type RemoteDownload,
+  type RootId,
   type SnapshotExport,
   type UploadResult,
 } from '../lib/desktop';
@@ -30,8 +31,16 @@ type ExportFailure = {
 /** 计划项的差异类别，与 Rust 侧 `PlanCategory` 一致。 */
 type PlanCategory = 'added' | 'modified' | 'deleted';
 
+/** 受管根的可读名称；与 `RootId` 逐一对应。 */
+const rootLabels: Record<RootId, string> = {
+  agent: '宿主目录',
+  'agents-skills': '~/.agents/skills',
+};
+
 /** 与 Rust 侧 `PlanItem` 一一对应；`deleted` 时 `snapshotSha256` 为 null。 */
 type PlanItem = {
+  /** 所属受管根；`path` 相对它，两个根可能有相同相对路径。 */
+  root: RootId;
   path: string;
   category: PlanCategory;
   /** `link` 只会出现在删除候选里：只删链接本身，不碰目标。 */
@@ -98,6 +107,12 @@ type ApplyReport = {
   skippedDeletes: number;
   warnings: string[];
   failedAt: string | null;
+};
+
+/** 一条删除请求：所属根 + 根内相对路径，与 Rust 侧 `DeleteRequest` 一一对应。 */
+type DeleteRequest = {
+  root: RootId;
+  path: string;
 };
 
 /** 与 Rust 侧 `ApplyFailure` 一一对应。 */
@@ -225,6 +240,21 @@ const APPLY_WARNING_LIMIT = 5;
 /** 备份卡片最多列出的份数；更旧的仍在磁盘上。 */
 const BACKUP_LIST_SHOWN = 5;
 
+/** 删除选择按 root + path 做 key：两个根可能有同一相对路径，裸路径会串。 */
+function deleteKey(request: DeleteRequest): string {
+  return `${request.root}:${request.path}`;
+}
+
+/** 「全选」只选 agent 根：外部共享目录里的删除必须逐项确认。 */
+function selectableDeletes(items: PlanItem[]): DeleteRequest[] {
+  return items
+    .filter((item) => item.root === 'agent')
+    .map((item) => ({ root: item.root, path: item.path }));
+}
+
+/** 外部共享目录的删除条目提示：别的 agent 工具也可能在用这些技能。 */
+const SHARED_ROOT_HINT = '共享目录，其它 agent 工具也可能使用';
+
 const mismatchReasonText: Record<HashMismatch['reason'], string> = {
   missing: '快照里没有这个文件',
   unreadable: '文件读不出来',
@@ -308,7 +338,7 @@ export function SnapshotPage() {
   const [planRoot, setPlanRoot] = useState<string | null>(null);
   const [exported, setExported] = useState<ExportState>({ kind: 'idle' });
   const [planning, setPlanning] = useState<PlanState>({ kind: 'idle' });
-  const [selected, setSelected] = useState<string[]>([]);
+  const [selected, setSelected] = useState<DeleteRequest[]>([]);
   const [applying, setApplying] = useState<ApplyState>({ kind: 'idle' });
   const [backups, setBackups] = useState<BackupsState>({ kind: 'idle' });
   const [restoring, setRestoring] = useState<RestoreState>({ kind: 'idle' });
@@ -512,7 +542,7 @@ export function SnapshotPage() {
     try {
       const report = await invoke<ApplyReport>('apply_snapshot', {
         expectedFingerprint: fingerprint,
-        deletePaths: selected,
+        deleteRequests: selected,
         root: planRoot,
       });
       setApplying({ kind: 'done', report });
@@ -539,9 +569,12 @@ export function SnapshotPage() {
       planning.report.totals.modified > 0 ||
       selected.length > 0);
 
-  function toggleDelete(path: string) {
+  function toggleDelete(request: DeleteRequest) {
+    const key = deleteKey(request);
     setSelected((current) =>
-      current.includes(path) ? current.filter((item) => item !== path) : [...current, path],
+      current.some((item) => deleteKey(item) === key)
+        ? current.filter((item) => deleteKey(item) !== key)
+        : [...current, request],
     );
   }
 
@@ -740,6 +773,12 @@ export function SnapshotPage() {
             同步文件夹里的历史包，按名字（UTC 时间）倒序；选一份解到本机暂存目录，再走下面的检查与应用。暂存只保留当前这一份。
           </p>
 
+          {!isDesktop && (
+            <p className="mt-sm text-xs leading-relaxed text-muted-foreground">
+              浏览器预览里没有 Rust 进程，读不到存储里的包列表；包历史与对比只在桌面版可用。
+            </p>
+          )}
+
           {packages.kind === 'loading' && (
             <p className="mt-sm text-sm text-muted-foreground">正在读取存储里的包…</p>
           )}
@@ -851,7 +890,7 @@ export function SnapshotPage() {
             <PlanGroup title="新增" items={planning.report.plan.added} />
             <PlanGroup title="修改" items={planning.report.plan.modified} />
             {[...planning.report.plan.added, ...planning.report.plan.modified, ...planning.report.plan.deleted].some(
-              (item) => item.path === 'auth.json',
+              (item) => item.root === 'agent' && item.path === 'auth.json',
             ) && (
               <p className="flex items-start gap-sm text-sm text-warning">
                 <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
@@ -940,7 +979,9 @@ export function SnapshotPage() {
                 <div className="flex gap-sm">
                   <Button
                     variant="secondary"
-                    onClick={() => setSelected(planning.report.plan.deleted.map((item) => item.path))}
+                    onClick={() =>
+                      setSelected(selectableDeletes(planning.report.plan.deleted))
+                    }
                     disabled={!isDesktop || applyBusy}
                   >
                     全选
@@ -954,28 +995,48 @@ export function SnapshotPage() {
                   </Button>
                 </div>
               </div>
+              <p className="mt-xs text-xs text-muted-foreground">
+                “全选”只勾宿主目录的条目；{rootLabels['agents-skills']} 是共享目录，只能逐项确认。
+              </p>
               <ul className="mt-xs flex flex-col gap-sm">
-                {planning.report.plan.deleted.map((item) => (
-                  <li key={item.path} className="rounded-md bg-surface-muted px-md py-sm">
-                    <label className="flex items-start gap-sm">
-                      <input
-                        type="checkbox"
-                        className="mt-xs h-4 w-4"
-                        checked={selected.includes(item.path)}
-                        onChange={() => toggleDelete(item.path)}
-                        disabled={!isDesktop || applyBusy}
-                      />
-                      <span className="break-all font-mono text-xs text-foreground">
-                        {item.path}
-                        {item.kind === 'link' && (
-                          <span className="ml-xs font-sans text-muted-foreground">
-                            · 链接，只删链接本身
+                {planning.report.plan.deleted.map((item) => {
+                  const request: DeleteRequest = { root: item.root, path: item.path };
+                  const checked = selected.some(
+                    (chosen) => deleteKey(chosen) === deleteKey(request),
+                  );
+                  return (
+                    <li
+                      key={deleteKey(request)}
+                      className="rounded-md bg-surface-muted px-md py-sm"
+                    >
+                      <label className="flex items-start gap-sm">
+                        <input
+                          type="checkbox"
+                          className="mt-xs h-4 w-4"
+                          checked={checked}
+                          onChange={() => toggleDelete(request)}
+                          disabled={!isDesktop || applyBusy}
+                        />
+                        <span className="flex flex-col gap-xs">
+                          <span className="font-mono text-xs text-foreground">
+                            <span className="mr-sm rounded bg-surface px-xs py-px font-sans text-muted-foreground">
+                              {rootLabels[item.root]}
+                            </span>
+                            {item.path}
+                            {item.kind === 'link' && (
+                              <span className="ml-xs font-sans text-muted-foreground">
+                                · 链接，只删链接本身
+                              </span>
+                            )}
                           </span>
-                        )}
-                      </span>
-                    </label>
-                  </li>
-                ))}
+                          {item.root !== 'agent' && (
+                            <span className="text-xs text-warning">{SHARED_ROOT_HINT}</span>
+                          )}
+                        </span>
+                      </label>
+                    </li>
+                  );
+                })}
               </ul>
             </div>
           )}
@@ -993,8 +1054,15 @@ export function SnapshotPage() {
             <div className="mt-md rounded-md bg-surface-muted px-md py-sm">
               <p className="text-sm text-foreground">
                 将写入 {planning.report.totals.added + planning.report.totals.modified}{' '}
-                个文件、删除 {selected.length} 个文件；覆盖与删除前会先备份到本机。
+                个文件，勾选 {selected.length} 项删除（落在链接之下的会跳过）；覆盖与删除前会先备份到本机。
               </p>
+              {selected.some((item) => item.root !== 'agent') && (
+                <p className="mt-xs text-sm text-warning">
+                  其中 {selected.filter((item) => item.root !== 'agent').length} 项在{
+                    rootLabels['agents-skills']
+                  }（共享目录）：其它 agent 工具也可能在用这些技能，原内容会进备份。
+                </p>
+              )}
               <div className="mt-sm flex flex-wrap gap-sm">
                 <Button onClick={() => void runApply()} disabled={applyBusy}>
                   确认应用
@@ -1191,6 +1259,12 @@ export function SnapshotPage() {
               ? '存储里最新的一份包就是这份内容：没有写新包，历史不会重复堆积。'
               : '包在存储里出现即代表完整：云盘客户端传完后，另一台机器就能在「本地存储」里选到它。'}
           </p>
+          <WarningList warnings={exported.report.rootWarnings} />
+          {exported.report.warnings.length > 0 && (
+            <p className="mt-sm text-sm text-muted-foreground">
+              另有 {exported.report.warnings.length} 条密钥提示，文件已原样保留。
+            </p>
+          )}
         </Card>
       )}
 
@@ -1216,7 +1290,7 @@ function sourceText(source: PlanReport['manifestInfo']['source']): string {
   } · node ${source.node ?? '未知'}`;
 }
 
-/** 导出/上传的结果：包名、大小、文件数、指纹。 */
+/** 导出/上传的结果：包名、大小、文件数、指纹、受管根。 */
 function ExportResult({ report }: { report: SnapshotExport }) {
   return (
     <>
@@ -1226,6 +1300,15 @@ function ExportResult({ report }: { report: SnapshotExport }) {
         <ResultRow label="文件数" value={String(report.files)} />
         <ResultRow label="指纹" value={report.fingerprint} mono />
         <ResultRow label="创建时间" value={report.createdAt} />
+        <ResultRow
+          label="受管根"
+          value={report.managedRoots.map((root) => rootLabels[root]).join('、')}
+        />
+        <ResultRow
+          label="声明的包"
+          value={String(report.requiredPackages.length)}
+        />
+        <ResultRow label="跳过的条目" value={String(report.skipped)} />
       </dl>
       {report.plaintextSecrets && (
         <p className="mt-sm text-sm text-warning">
@@ -1257,6 +1340,11 @@ function UploadResultView({ result }: { result: UploadResult }) {
         <p className="mt-sm text-sm text-muted-foreground">
           已清理 {result.pruned.length} 份旧包：{result.pruned.join('、')}
         </p>
+      )}
+      {result.rootWarnings.length > 0 && (
+        <div className="mt-sm">
+          <WarningList warnings={result.rootWarnings} />
+        </div>
       )}
       {result.pruneFailed.length > 0 && (
         <div className="mt-sm text-sm text-warning">
@@ -1548,10 +1636,10 @@ function CompareTable({
               {expanded === row.package && (
                 <tr className="border-t border-border">
                   <td colSpan={7} className="py-sm">
-                    <PathList
+                    <PlanPathList
                       title="将被删除"
                       hint="应用时默认不勾选，逐项确认"
-                      paths={row.deletedPaths}
+                      items={row.deletedItems}
                     />
                   </td>
                 </tr>
@@ -1580,6 +1668,51 @@ function PairDiff({ pair }: { pair: ComparePair }) {
         <PathList title="右侧修改" paths={pair.modified} />
         <PathList title="右侧没有" paths={pair.removed} />
       </div>
+    </div>
+  );
+}
+
+/** 计划条目的路径清单：带上所属根，两个根同相对路径也不串。 */
+function PlanPathList({
+  title,
+  hint,
+  items,
+}: {
+  title: string;
+  hint?: string;
+  items: { root: RootId; path: string }[];
+}) {
+  if (items.length === 0) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        {title}：0 项
+      </p>
+    );
+  }
+  const shown = items.slice(0, PLAN_LIST_LIMIT);
+  return (
+    <div>
+      <h4 className="text-xs font-semibold text-foreground">
+        {title} {items.length} 项
+        {hint !== undefined && (
+          <span className="ml-xs font-normal text-muted-foreground">· {hint}</span>
+        )}
+      </h4>
+      <ul className="mt-xs flex flex-col gap-xs">
+        {shown.map((item) => (
+          <li key={`${item.root}:${item.path}`} className="flex flex-wrap items-baseline gap-xs text-xs">
+            <span className="rounded bg-surface-muted px-xs py-0.5 text-muted-foreground">
+              {rootLabels[item.root]}
+            </span>
+            <span className="break-all font-mono text-foreground">{item.path}</span>
+          </li>
+        ))}
+      </ul>
+      {items.length > shown.length && (
+        <p className="mt-xs text-xs text-muted-foreground">
+          还有 {items.length - shown.length} 项
+        </p>
+      )}
     </div>
   );
 }
@@ -1782,10 +1915,19 @@ function PlanGroup({
       </h3>
       <ul className="mt-xs flex flex-col gap-sm">
         {shown.map((item) => (
-          <li key={item.path} className="rounded-md bg-surface-muted px-md py-sm">
-            <p className="break-all font-mono text-xs text-foreground">{item.path}</p>
+          <li
+            key={`${item.root}:${item.path}`}
+            className="rounded-md bg-surface-muted px-md py-sm"
+          >
+            <p className="break-all font-mono text-xs text-foreground">
+              <span className="mr-sm rounded bg-surface px-xs py-px font-sans text-muted-foreground">
+                {rootLabels[item.root]}
+              </span>
+              {item.path}
+            </p>
             <p className="mt-xs text-xs text-muted-foreground">
               {item.kind === 'link' ? '链接（只删链接本身）' : `${item.size} B`}
+              {item.root !== 'agent' && ` · ${SHARED_ROOT_HINT}`}
             </p>
           </li>
         ))}

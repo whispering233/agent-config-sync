@@ -223,6 +223,7 @@ mod tests {
             package: package.to_string(),
             unchanged,
             pruned: Vec::new(),
+            root_warnings: Vec::new(),
             prune_failed: Vec::new(),
         }
     }

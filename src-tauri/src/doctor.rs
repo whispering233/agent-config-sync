@@ -1,18 +1,19 @@
-//! 只读环境医生：探测 node / npm / pi / 凭据 / 包 / 技能链接，输出分级报告。
+//! 环境检测：探测 node / npm / pi / 凭据 / 包 / 技能链接，输出分级报告。
 //!
 //! 规则来源：`docs/design/20-env-doctor.md`。核心逻辑不依赖 Tauri，
 //! shell 命令通过 [`CommandRunner`] 注入，单测用假命令替代真实进程。
-//! 全程只读：只读文件与环境，不写文件、不改环境变量、不安装任何东西。
+//! 本模块全程只读：只读文件与环境，不写文件、不改环境变量、不安装任何东西。
 
 use crate::config::{self, AGENT_DIR_ENV_VAR};
 use crate::installer::{self, InstallKind};
 use crate::platform::{self, HostOs, ProgramPath};
+use crate::scope::{self, RootId};
 use crate::versions::{self, LatestVersions};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsString;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -149,9 +150,24 @@ impl CommandRunner for ShellRunner {
 
 /// 起一个子进程并把两条管道都读回来。`group` 为真时 POSIX 下独立成进程组，
 /// 超时整组终止（安装命令用它）。
-pub(crate) fn run_child(mut command: Command, timeout: Duration, group: bool) -> CommandOutcome {
+pub(crate) fn run_child(command: Command, timeout: Duration, group: bool) -> CommandOutcome {
+    run_child_with_input(command, timeout, group, None)
+}
+
+/// 与 [`run_child`] 相同，但可以先往 stdin 写一段输入再关闭：宿主 RPC 靠它送请求，
+/// 收到 EOF 后自行退出，不需要额外的关闭命令。
+pub(crate) fn run_child_with_input(
+    mut command: Command,
+    timeout: Duration,
+    group: bool,
+    input: Option<&str>,
+) -> CommandOutcome {
     command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     platform::isolate_group(&mut command, group);
@@ -160,6 +176,17 @@ pub(crate) fn run_child(mut command: Command, timeout: Duration, group: bool) ->
         Ok(child) => child,
         Err(error) => return CommandOutcome::Unavailable(error.to_string()),
     };
+
+    if let Some(input) = input {
+        // 写入放在独立线程：宿主读得慢也不占住下面的退出轮询。
+        if let Some(mut stdin) = child.stdin.take() {
+            let input = input.to_string();
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(input.as_bytes());
+                let _ = stdin.flush();
+            });
+        }
+    }
 
     // 并行读两个管道：边读边轮询，避免子进程写满管道后卡住把超时拖成死锁。
     let stdout_reader = child.stdout.take().map(spawn_reader);
@@ -1134,62 +1161,194 @@ pub fn parse_installed_packages(list: &str) -> BTreeSet<String> {
         .collect()
 }
 
-fn skills_check(agent_dir: Option<&Path>) -> Check {
-    let Some(dir) = agent_dir else {
-        return unknown("skills.links", "无法确定宿主目录，跳过技能链接检查");
-    };
-    let skills = dir.join("skills");
-    if !skills.exists() {
+/// 技能链接检查的两个根：`<agent_dir>/skills` 与 `<home>/.agents/skills`。
+/// 解析不到的根直接不在列表里，检查因而不会把「不知道路径」当成「没有断链」。
+fn skills_dirs(agent_dir: Option<&Path>, home_dir: Option<&Path>) -> Vec<(RootId, PathBuf)> {
+    let mut dirs = Vec::with_capacity(2);
+    if let Some(dir) = agent_dir {
+        dirs.push((RootId::Agent, dir.join("skills")));
+    }
+    if let Some(home) = home_dir {
+        dirs.push((RootId::AgentsSkills, scope::agents_skills_path(home)));
+    }
+    dirs
+}
+
+fn skills_check(agent_dir: Option<&Path>, home_dir: Option<&Path>) -> Check {
+    let dirs = skills_dirs(agent_dir, home_dir);
+    if dirs.is_empty() {
+        return unknown(
+            "skills.links",
+            "无法确定宿主目录与 home 目录，跳过技能链接检查",
+        );
+    }
+
+    let mut links = 0;
+    let mut broken = Vec::new();
+    let mut broken_roots = Vec::new();
+    let mut unreadable = Vec::new();
+    let mut notes = Vec::new();
+    let mut scanned = 0;
+
+    for (root, dir) in dirs {
+        // 根不存在是正常情况（没装这个目录就没有技能），不是错误。
+        // 但要看 `symlink_metadata`：`exists()` 跟着链接走，根本身是断链时它会说“不存在”，
+        // 静静跳过就等于把断链说成没问题。
+        if fs::symlink_metadata(&dir).is_err() {
+            continue;
+        }
+        scanned += 1;
+        if platform::is_link_like(&dir) {
+            // 根本身是链接：目标是断的就没有内容可扫，但必须告警。
+            if fs::metadata(&dir).is_err() {
+                broken_roots.push(format!(
+                    "{} 是断链，按没有该目录处理",
+                    checked_dir_label(root)
+                ));
+                continue;
+            }
+            notes.push(format!(
+                "{} 本身是链接，按链接目标的实际内容检查",
+                checked_dir_label(root)
+            ));
+        }
+        match skills_links(&dir) {
+            Ok((count, names)) => {
+                links += count;
+                broken.extend(names.iter().map(|name| broken_label(root, name)));
+            }
+            Err(error) => {
+                unreadable.push(format!("无法读取 {}（{error}）", checked_dir_label(root)))
+            }
+        }
+    }
+
+    let broken_count = broken.len() + broken_roots.len();
+    let mut findings = Vec::new();
+    if !broken.is_empty() {
+        findings.push(format!("断链：{}", broken.join("、")));
+    }
+    findings.extend(broken_roots);
+    findings.extend(notes);
+
+    if !unreadable.is_empty() {
+        let mut detail = unreadable;
+        detail.extend(findings);
+        return unknown("skills.links", &detail.join("；"));
+    }
+    if scanned == 0 {
         return pass("skills.links", Some("没有 skills 目录".to_string()), None);
     }
 
-    let (links, broken) = match skills_links(&skills) {
-        Ok(result) => result,
-        Err(error) => return unknown("skills.links", &format!("无法读取 skills 目录（{error}）")),
-    };
-
-    if broken.is_empty() {
-        return pass("skills.links", Some(format!("{links} 个链接")), None);
+    if broken_count == 0 {
+        return record(
+            "skills.links",
+            CheckStatus::Pass,
+            Some(format!("{links} 个链接")),
+            (!findings.is_empty()).then(|| findings.join("；")),
+            None,
+        );
     }
 
     record(
         "skills.links",
         CheckStatus::Warn,
-        Some(format!("{links} 个链接，{} 个断链", broken.len())),
-        Some(format!("断链：{}", broken.join("、"))),
+        Some(format!("{links} 个链接，{broken_count} 个断链")),
+        Some(findings.join("；")),
         Some("skills.relink"),
     )
 }
 
-/// 统计 `skills/` 下的链接类条目与断链，返回 (链接数, 断链名)。
+/// 被检查的目录本身怎么称呼：agent 根下的目录在 `skills/` 里，外部根本身就是技能目录。
+/// 只说「宿主目录」会让人以为检查的是宿主目录根，指错要找的位置。
+fn checked_dir_label(root: RootId) -> String {
+    match root {
+        RootId::Agent => root.describe("skills"),
+        RootId::AgentsSkills => root.label().to_string(),
+    }
+}
+
+/// 断链在告警里的位置：agent 根下的链接在 `skills/` 里，外部根本身就是技能目录。
+fn broken_label(root: RootId, relative: &str) -> String {
+    match root {
+        RootId::Agent => root.describe(&format!("skills/{relative}")),
+        RootId::AgentsSkills => root.describe(relative),
+    }
+}
+
+/// 递归统计技能目录下的链接类条目与断链，返回 (链接数, 断链的相对路径)。
 /// Windows 的 junction 也算链接，所以判定走 [`platform::link_like`]。
 pub fn skills_links(skills: &Path) -> Result<(usize, Vec<String>), std::io::Error> {
-    let mut links = 0;
-    let mut broken = Vec::new();
+    let mut scan = SkillsLinkScan::default();
+    scan.walk(skills, Path::new(""), &mut HashSet::new())?;
+    // 排序后告警文本与 readdir 顺序无关。
+    scan.broken.sort();
+    Ok((scan.links, scan.broken))
+}
 
-    for entry in fs::read_dir(skills)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let path = entry.path();
-        if !platform::link_like(file_type.is_symlink(), &fs::read_link(&path)) {
-            continue;
-        }
-        links += 1;
+#[derive(Default)]
+struct SkillsLinkScan {
+    links: usize,
+    broken: Vec<String>,
+}
 
-        // 链接类却读不到目标：目标无从验证，按断链处理。
-        let resolved = fs::read_link(&path).ok().map(|target| {
-            if target.is_absolute() {
-                target
-            } else {
-                skills.join(target)
-            }
-        });
-        if resolved.is_none_or(|target| fs::metadata(&target).is_err()) {
-            broken.push(entry.file_name().to_string_lossy().to_string());
+impl SkillsLinkScan {
+    /// 目录读不出来就上报：把「没检查到」说成「没有断链」会误导用户。
+    fn walk(
+        &mut self,
+        dir: &Path,
+        relative: &Path,
+        active: &mut HashSet<PathBuf>,
+    ) -> std::io::Result<()> {
+        let canonical = fs::canonicalize(dir)?;
+        if !active.insert(canonical.clone()) {
+            return Ok(());
         }
+        let outcome = self.entries(dir, relative, active);
+        active.remove(&canonical);
+        outcome
     }
 
-    Ok((links, broken))
+    fn entries(
+        &mut self,
+        dir: &Path,
+        relative: &Path,
+        active: &mut HashSet<PathBuf>,
+    ) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let path = entry.path();
+            let child = relative.join(entry.file_name());
+            let target = fs::read_link(&path);
+
+            if platform::link_like(file_type.is_symlink(), &target) {
+                self.links += 1;
+                // 链接类却读不到目标：目标无从验证，按断链处理。
+                let resolved = target.ok().map(|target| {
+                    if target.is_absolute() {
+                        target
+                    } else {
+                        dir.join(target)
+                    }
+                });
+                if resolved.is_none_or(|target| fs::metadata(&target).is_err()) {
+                    self.broken.push(relative_text(&child));
+                }
+                // 不进入链接：目标若在根内，它自己的位置会被扫到，避免重复计数与成环。
+                continue;
+            }
+            if file_type.is_dir() {
+                self.walk(&path, &child, active)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 断链明细用 `/` 分隔，告警文本在两条平台上一致。
+fn relative_text(relative: &Path) -> String {
+    relative.to_string_lossy().replace('\\', "/")
 }
 
 /// 取第一个形如 `x.y.z` 的片段，忽略前后杂质。
@@ -1351,13 +1510,19 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// 执行一次完整检查。只读：只有读文件与读命令输出。`host` 由调用方给定：
 /// 生产传 [`HostOs::current`]，单测显式指定，这样两条命令形态在任意平台上都能断言。
 #[cfg(test)]
-pub fn check(agent_dir: Option<&Path>, runner: &dyn CommandRunner, host: HostOs) -> DoctorReport {
-    check_with_latest(agent_dir, runner, host, LatestVersions::default())
+pub fn check(
+    agent_dir: Option<&Path>,
+    home_dir: Option<&Path>,
+    runner: &dyn CommandRunner,
+    host: HostOs,
+) -> DoctorReport {
+    check_with_latest(agent_dir, home_dir, runner, host, LatestVersions::default())
 }
 
 /// 与 [`check`] 相同，但把缓存/新查到的版本写进报告。
 pub fn check_with_latest(
     agent_dir: Option<&Path>,
+    home_dir: Option<&Path>,
     runner: &dyn CommandRunner,
     host: HostOs,
     latest: LatestVersions,
@@ -1377,7 +1542,7 @@ pub fn check_with_latest(
     checks.push(install_kind_check(agent_dir, pi_path.as_deref()));
     checks.extend(auth_checks(agent_dir, pi_path.as_deref(), runner, host));
     checks.push(packages_check(agent_dir, pi_list.as_deref()));
-    checks.push(skills_check(agent_dir));
+    checks.push(skills_check(agent_dir, home_dir));
 
     DoctorReport {
         generated_at: iso8601_now(),
@@ -1441,6 +1606,7 @@ fn probe(app: &tauri::AppHandle, refresh_versions: bool) -> Result<DoctorReport,
 
     Ok(check_with_latest(
         resolved.path.as_deref(),
+        home_dir.as_deref(),
         &runner,
         host,
         latest,
@@ -1612,7 +1778,16 @@ mod tests {
     /// 单测统一按 POSIX 形态检查：命令形态用替身，不碰真实进程，
     /// 这样同一组用例在 Windows 上跑也走登录 shell 那条路。
     fn check_posix(agent_dir: Option<&Path>, runner: &dyn CommandRunner) -> DoctorReport {
-        check(agent_dir, runner, HostOs::Posix)
+        check(agent_dir, None, runner, HostOs::Posix)
+    }
+
+    /// 同上，但把 home 目录也交进去：`skills.links` 要扫外部根。
+    fn check_posix_home(
+        agent_dir: Option<&Path>,
+        home_dir: &Path,
+        runner: &dyn CommandRunner,
+    ) -> DoctorReport {
+        check(agent_dir, Some(home_dir), runner, HostOs::Posix)
     }
 
     fn find<'a>(report: &'a DoctorReport, id: &str) -> &'a Check {
@@ -1942,6 +2117,131 @@ mod tests {
             .clone()
             .unwrap_or_default()
             .contains("bad"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skills_links_recurse_and_label_both_roots() {
+        let agent = TempDir::new("skills-agent");
+        let home = TempDir::new("skills-home");
+        let skills = agent.path().join("skills");
+        let external = home.path().join(".agents/skills");
+        let target = agent.path().join("real-skill");
+        fs::create_dir_all(&target).expect("建目标目录");
+        fs::create_dir_all(skills.join("group")).expect("建嵌套目录");
+        fs::create_dir_all(&external).expect("建外部根");
+        std::os::unix::fs::symlink(&target, skills.join("good")).unwrap();
+        std::os::unix::fs::symlink(agent.path().join("nowhere"), skills.join("bad")).unwrap();
+        // 嵌套链接同样要算：只看顶层会漏掉。
+        std::os::unix::fs::symlink(agent.path().join("nowhere2"), skills.join("group/deep"))
+            .unwrap();
+        std::os::unix::fs::symlink(home.path().join("gone"), external.join("external-bad"))
+            .unwrap();
+
+        let (links, broken) = skills_links(&skills).expect("扫描");
+        assert_eq!(links, 3);
+        assert_eq!(broken, vec!["bad".to_string(), "group/deep".to_string()]);
+
+        let report = check_posix_home(
+            Some(agent.path()),
+            home.path(),
+            &FakeRunner::single(CommandOutcome::Timeout),
+        );
+        let check = find(&report, "skills.links");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(check.value.as_deref(), Some("4 个链接，3 个断链"));
+        let detail = check.detail.clone().unwrap_or_default();
+        assert!(detail.contains("宿主目录 里的 skills/bad"), "{detail}");
+        assert!(
+            detail.contains("宿主目录 里的 skills/group/deep"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("~/.agents/skills 里的 external-bad"),
+            "{detail}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_root_link_is_reported_instead_of_skipped() {
+        let agent = TempDir::new("skills-broken-root-agent");
+        let home = TempDir::new("skills-broken-root-home");
+        let external = home.path().join(".agents/skills");
+        fs::create_dir_all(home.path().join(".agents")).expect("建 .agents");
+        // 外部根本身是断链：`exists()` 跟着链接走，会说它不存在。
+        std::os::unix::fs::symlink(home.path().join("gone"), &external).expect("建断链根");
+
+        let report = check_posix_home(
+            Some(agent.path()),
+            home.path(),
+            &FakeRunner::single(CommandOutcome::Timeout),
+        );
+
+        let check = find(&report, "skills.links");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(check.value.as_deref(), Some("0 个链接，1 个断链"));
+        let detail = check.detail.clone().unwrap_or_default();
+        assert!(
+            detail.contains("~/.agents/skills 是断链，按没有该目录处理"),
+            "{detail}"
+        );
+        assert_eq!(check.action.as_deref(), Some("skills.relink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_root_with_existing_target_passes_and_names_the_target_content() {
+        let agent = TempDir::new("skills-linked-root-agent");
+        let home = TempDir::new("skills-linked-root-home");
+        let real = agent.path().join("real-skills");
+        fs::create_dir_all(real.join("demo")).expect("建真实技能目录");
+        std::os::unix::fs::symlink(&real, agent.path().join("skills")).expect("建根链接");
+
+        let report = check_posix_home(
+            Some(agent.path()),
+            home.path(),
+            &FakeRunner::single(CommandOutcome::Timeout),
+        );
+
+        let check = find(&report, "skills.links");
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(check.value.as_deref(), Some("0 个链接"));
+        let detail = check.detail.clone().unwrap_or_default();
+        assert!(
+            detail.contains("宿主目录 里的 skills 本身是链接，按链接目标的实际内容检查"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn skills_check_reads_both_roots_and_skips_missing_ones() {
+        let agent = TempDir::new("skills-both-agent");
+        let home = TempDir::new("skills-both-home");
+        fs::create_dir_all(agent.path().join("skills")).expect("建 agent 技能目录");
+        fs::create_dir_all(home.path().join(".agents/skills")).expect("建外部根");
+
+        let report = check_posix_home(
+            Some(agent.path()),
+            home.path(),
+            &FakeRunner::single(CommandOutcome::Timeout),
+        );
+        let check = find(&report, "skills.links");
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(check.value.as_deref(), Some("0 个链接"));
+
+        // 两个根都不存在时是「没有目录」，不是「无法检查」。
+        let empty_agent = TempDir::new("skills-empty-agent");
+        let empty_home = TempDir::new("skills-empty-home");
+        let report = check_posix_home(
+            Some(empty_agent.path()),
+            empty_home.path(),
+            &FakeRunner::single(CommandOutcome::Timeout),
+        );
+        assert_eq!(
+            find(&report, "skills.links").value.as_deref(),
+            Some("没有 skills 目录")
+        );
     }
 
     #[test]

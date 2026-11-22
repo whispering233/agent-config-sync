@@ -322,6 +322,7 @@ pub async fn compare_snapshot_packages(
             .map_err(|message| DownloadFailure::new("app_config_unavailable", message))?;
         let agent_dir = plan::agent_dir(&app, &config)
             .map_err(|failure| DownloadFailure::new(failure.code, failure.message))?;
+        let home_dir = app.path().home_dir().ok();
 
         if config.transport == Transport::Local {
             let root = config.sync_root.ok_or_else(|| {
@@ -335,6 +336,7 @@ pub async fn compare_snapshot_packages(
                 &LocalStore::new(root),
                 &app_data,
                 &agent_dir,
+                home_dir.as_deref(),
                 &packages,
             );
         }
@@ -346,6 +348,7 @@ pub async fn compare_snapshot_packages(
             &endpoint,
             &app_data,
             &agent_dir,
+            home_dir.as_deref(),
             &packages,
         )
     })
@@ -689,6 +692,7 @@ mod tests {
                 name: "20261120-091210-7f3e9c01.zip".to_string(),
                 reason: "远端拒绝删除".to_string(),
             }],
+            root_warnings: Vec::new(),
         };
         assert_eq!(
             serde_json::to_value(&view).unwrap(),
@@ -700,6 +704,7 @@ mod tests {
                     "name": "20261120-091210-7f3e9c01.zip",
                     "reason": "远端拒绝删除",
                 }],
+                "rootWarnings": [],
             })
         );
     }

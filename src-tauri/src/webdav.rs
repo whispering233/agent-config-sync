@@ -414,9 +414,6 @@ impl<T: DavTransport> WebdavClient<T> {
     }
 }
 
-/// 写权限测试用的临时文件名由 `package` 统一管理（`PROBE_FILE_NAME`），这样探测失败
-/// 留下的残留也能被「清理上传残留」认出来。落在工作根下，探测结束即删。
-
 /// 一次连接探测的结论：地址、凭据、读权限、写权限是否都可用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProbeOutcome {
@@ -428,6 +425,8 @@ pub struct ProbeOutcome {
 
 /// 探测地址、凭据与写权限：工作根存在（必要时创建）→ 写测试文件 → 删测试文件。
 ///
+/// 写权限测试用的临时文件名由 `package` 统一管理（`PROBE_FILE_NAME`），这样探测失败
+/// 留下的残留也能被「清理上传残留」认出来。落在工作根下，探测结束即删。
 /// 只读不写的账号在删除这一步失败，仍返回成功并标记残留：
 /// 用户需要知道「能连、但删不掉东西」，而不是被一句认证失败挡住。
 pub fn probe<T: DavTransport>(client: &WebdavClient<T>) -> Result<ProbeOutcome, DavError> {

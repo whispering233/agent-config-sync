@@ -9,6 +9,7 @@ use crate::package;
 use crate::plan;
 use crate::platform;
 use crate::remote_state::{self, RemoteState};
+use crate::scope::RootId;
 use crate::snapshot::{self, Manifest};
 use crate::store::{PackageStore, StoreError};
 use crate::webdav::{self, DavError, DavTransport, ProbeOutcome, WebdavClient};
@@ -116,6 +117,14 @@ pub struct CleanupFailure {
     pub reason: String,
 }
 
+/// 一条「将被删除」：所属根 + 根内相对路径。两个根可能有相同相对路径。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompareItem {
+    pub root: RootId,
+    pub path: String,
+}
+
 /// 对比表的一行：一份候选包对 live 的只读计划结果。
 ///
 /// 失败只影响本行（取包、解包或校验没过），其它行照常：一张表里有坏包不该整张判失败。
@@ -133,8 +142,8 @@ pub struct CompareRow {
     /// 「将删除」：live 有、包里没有的受管文件数。
     pub deleted: Option<usize>,
     pub unchanged: Option<usize>,
-    /// 将被删掉的具体路径，逐项来自计划。
-    pub deleted_paths: Vec<String>,
+    /// 将被删掉的具体条目，逐项来自计划。
+    pub deleted_items: Vec<CompareItem>,
     pub error: Option<DownloadFailure>,
 }
 
@@ -509,6 +518,7 @@ pub fn compare_packages(
     store: &dyn PackageStore,
     app_data: &Path,
     agent_dir: &Path,
+    home_dir: Option<&Path>,
     requested: &[String],
 ) -> Result<CompareReport, DownloadFailure> {
     // 重名会撞上同一个解包落点（`unpack` 拒绝已存在的目录）：先去重，保持候选顺序。
@@ -567,7 +577,7 @@ pub fn compare_packages(
 
         let target = compare_root.join(name.as_str());
         let report = fetch_into(store, &compare_root, name, &target).and_then(|_| {
-            plan::plan_snapshot_without_probe(agent_dir, &target)
+            plan::plan_snapshot_without_probe(agent_dir, home_dir, &target)
                 .map_err(|failure| DownloadFailure::new(failure.code, failure.message))
         });
 
@@ -581,11 +591,14 @@ pub fn compare_packages(
                     modified: Some(report.totals.modified),
                     deleted: Some(report.totals.deleted),
                     unchanged: Some(report.totals.unchanged),
-                    deleted_paths: report
+                    deleted_items: report
                         .plan
                         .deleted
                         .iter()
-                        .map(|item| item.path.clone())
+                        .map(|item| CompareItem {
+                            root: item.root,
+                            path: item.path.clone(),
+                        })
                         .collect(),
                     error: None,
                 });
@@ -632,6 +645,7 @@ pub fn compare_from_webdav(
     endpoint: &str,
     app_data: &Path,
     agent_dir: &Path,
+    home_dir: Option<&Path>,
     requested: &[String],
 ) -> Result<CompareReport, DownloadFailure> {
     if !credentials::is_secure_url(endpoint) {
@@ -641,7 +655,7 @@ pub fn compare_from_webdav(
         ));
     }
 
-    compare_packages(store, app_data, agent_dir, requested)
+    compare_packages(store, app_data, agent_dir, home_dir, requested)
 }
 
 /// 失败行：本行的计数与路径都不成立，只留错误码与说明。
@@ -659,7 +673,7 @@ fn failed_row(name: &str, error: DownloadFailure) -> CompareRow {
         modified: None,
         deleted: None,
         unchanged: None,
-        deleted_paths: Vec::new(),
+        deleted_items: Vec::new(),
         error: Some(error),
     }
 }
@@ -730,6 +744,7 @@ fn prune_staging(app_data: &Path, keep: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scope::RootId;
     use crate::snapshot::{
         fingerprint, ManifestFile, Requirements, SourceInfo, FORMAT_VERSION, PROFILE_ID,
     };
@@ -777,8 +792,9 @@ mod tests {
         Manifest {
             format_version: FORMAT_VERSION,
             profile_id: PROFILE_ID.to_string(),
+            managed_roots: vec![RootId::Agent],
             created_at: "2026-11-22T10:52:30Z".to_string(),
-            fingerprint: fingerprint(FORMAT_VERSION, &files),
+            fingerprint: fingerprint(FORMAT_VERSION, &[RootId::Agent], &files),
             source: SourceInfo {
                 app: "0.1.0".to_string(),
                 os: "linux".to_string(),
@@ -845,6 +861,7 @@ mod tests {
             &LocalStore::new(store_root.to_path_buf()),
             app_data,
             agent_dir,
+            None,
             &owned(names),
         )
     }
@@ -1276,6 +1293,7 @@ mod tests {
                 endpoint,
                 &self.app_data(),
                 &self.agent(),
+                None,
                 &owned(names),
             )
         }
@@ -1450,6 +1468,7 @@ mod tests {
         let outcome = fixture.download(BASE, None).expect("取包本身成功");
         let failure = crate::plan::plan_snapshot(
             &agent,
+            None,
             &outcome.staged.staging_root,
             &FakeRunner,
             crate::platform::HostOs::Posix,
@@ -1804,6 +1823,7 @@ pi:1.5.2
         let staged = stage_package(&store, &app_data, None).expect("取包应成功");
         let report = crate::plan::plan_snapshot(
             &agent_dir,
+            None,
             &staged.staging_root,
             &FakeRunner,
             crate::platform::HostOs::Posix,
@@ -1817,6 +1837,7 @@ pi:1.5.2
         let applied = crate::apply::apply(
             &crate::apply::ApplyContext {
                 agent_dir: &agent_dir,
+                home_dir: None,
                 sync_root: &staged.staging_root,
                 app_data_dir: &app_data,
                 backup_retention: crate::config::DEFAULT_BACKUP_RETENTION as usize,
@@ -1882,7 +1903,7 @@ pi:1.5.2
             assert!(row.error.is_none(), "{row:?}");
             assert_eq!(
                 row.deleted,
-                Some(row.deleted_paths.len()),
+                Some(row.deleted_items.len()),
                 "「将删除」的计数与逐项路径必须一致"
             );
         }
@@ -1898,7 +1919,13 @@ pi:1.5.2
             (Some(0), Some(0), Some(1), Some(2)),
             "旧包与 live 只差 skills/old.md"
         );
-        assert_eq!(unchanged_row.deleted_paths, vec!["skills/old.md"]);
+        assert_eq!(
+            unchanged_row.deleted_items,
+            vec![CompareItem {
+                root: RootId::Agent,
+                path: "skills/old.md".to_string()
+            }]
+        );
 
         let mixed = &report.rows[1];
         assert_eq!(
@@ -1971,16 +1998,23 @@ pi:1.5.2
 
         assert_eq!(row.deleted, Some(2));
         assert_eq!(
-            row.deleted_paths,
+            row.deleted_items,
             vec![
-                "skills/extra-one.md".to_string(),
-                "skills/extra-two.md".to_string()
+                CompareItem {
+                    root: RootId::Agent,
+                    path: "skills/extra-one.md".to_string()
+                },
+                CompareItem {
+                    root: RootId::Agent,
+                    path: "skills/extra-two.md".to_string()
+                }
             ]
         );
-        for path in &row.deleted_paths {
+        for item in &row.deleted_items {
             assert!(
-                agent_dir.join(path).exists(),
-                "live 文件不能被对比删掉：{path}"
+                agent_dir.join(&item.path).exists(),
+                "live 文件不能被对比删掉：{}",
+                item.path
             );
         }
         assert_eq!(
@@ -2044,7 +2078,7 @@ pi:1.5.2
             .expect("坏包应在表里");
         let error = failed.error.as_ref().expect("坏包要带失败说明");
         assert_eq!(error.code, "package_corrupt", "{}", error.message);
-        assert!(failed.deleted.is_none() && failed.deleted_paths.is_empty());
+        assert!(failed.deleted.is_none() && failed.deleted_items.is_empty());
         for row in report.rows.iter().filter(|row| row.package != broken) {
             assert!(row.error.is_none(), "其它行照常：{row:?}");
         }

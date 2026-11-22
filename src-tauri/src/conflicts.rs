@@ -5,7 +5,7 @@
 //! 处理动作（保留 / 替换）需要备份能力，不在这里实现。
 
 use crate::config;
-use crate::scope;
+use crate::scope::{self, ManagedRoot, ManagedRoots, RootId};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs;
@@ -76,10 +76,11 @@ impl ConflictSummary {
     }
 }
 
-/// 一对冲突文件。路径相对宿主目录。
+/// 一对冲突文件。路径相对所属受管根，`root` 说明它是哪个根的。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConflictItem {
+    pub root: RootId,
     pub original: PathBuf,
     pub conflict: PathBuf,
     pub pair_status: PairStatus,
@@ -107,22 +108,43 @@ pub struct ConflictReport {
     pub totals: ConflictTotals,
 }
 
-/// 按受管范围扫描冲突文件。`agent_dir` 不可读是硬错误；单个条目读不出只影响该条。
-pub fn scan(agent_dir: &Path) -> io::Result<ConflictReport> {
-    let mut found = Vec::new();
-    walk(
-        agent_dir,
-        Path::new(""),
-        true,
-        &mut HashSet::new(),
-        &mut found,
-    )?;
-    found.sort_by(|left, right| left.relative.cmp(&right.relative));
+/// 按受管范围扫描冲突文件：`agent` 根始终扫，`agents-skills` 根在解析到 home 时参与。
+/// 根不可读是硬错误；单个条目读不出只影响该条。`items` 按 (root, 根内路径) 升序。
+pub fn scan(agent_dir: &Path, home_dir: Option<&Path>) -> io::Result<ConflictReport> {
+    let mut roots = vec![ManagedRoot::agent(agent_dir)];
+    if let Some(home) = home_dir {
+        roots.push(ManagedRoot::agents_skills(home));
+    }
+    let roots = ManagedRoots::new(roots);
 
-    let items: Vec<ConflictItem> = found
-        .into_iter()
-        .map(|found| item(agent_dir, found))
-        .collect();
+    let mut items = Vec::new();
+    for root in roots.iter() {
+        // 外部根不存在就是这台机器没有共享技能目录，不是错误。
+        if root.id != RootId::Agent && !root.path.exists() {
+            continue;
+        }
+        let mut found = Vec::new();
+        walk(
+            root.id,
+            &root.path,
+            Path::new(""),
+            true,
+            &mut HashSet::new(),
+            &mut found,
+        )?;
+        found.sort_by(|left, right| left.relative.cmp(&right.relative));
+        items.extend(
+            found
+                .into_iter()
+                .map(|found| item(root.id, &root.path, found)),
+        );
+    }
+    items.sort_by(|left, right| {
+        left.root
+            .cmp(&right.root)
+            .then_with(|| left.conflict.cmp(&right.conflict))
+    });
+
     let paired = items
         .iter()
         .filter(|item| item.pair_status == PairStatus::Paired)
@@ -160,7 +182,8 @@ pub fn scan_conflicts(app: AppHandle) -> Result<ConflictReport, String> {
         )
     })?;
 
-    scan(&agent_dir).map_err(|error| format!("无法扫描宿主目录 {}：{error}", agent_dir.display()))
+    scan(&agent_dir, home_dir.as_deref())
+        .map_err(|error| format!("无法扫描宿主目录 {}：{error}", agent_dir.display()))
 }
 
 struct Found {
@@ -169,9 +192,9 @@ struct Found {
     size: u64,
 }
 
-fn item(agent_dir: &Path, found: Found) -> ConflictItem {
-    let conflict_path = agent_dir.join(&found.relative);
-    let original_path = agent_dir.join(&found.original);
+fn item(root: RootId, base_dir: &Path, found: Found) -> ConflictItem {
+    let conflict_path = base_dir.join(&found.relative);
+    let original_path = base_dir.join(&found.original);
 
     let (pair_status, original_size, summary) = match fs::metadata(&original_path) {
         Ok(metadata) if metadata.is_file() => {
@@ -190,6 +213,7 @@ fn item(agent_dir: &Path, found: Found) -> ConflictItem {
     };
 
     ConflictItem {
+        root,
         original: found.original,
         conflict: found.relative,
         pair_status,
@@ -256,8 +280,10 @@ fn text_summary(conflict: &str, original: &str) -> ConflictSummary {
     }
 }
 
-/// 遍历受管范围。不进入排除目录，根级只进纳入目录；符号链接跟随，成环即跳过。
+/// 遍历一个受管根。只进入受管目录，符号链接跟随，成环即跳过。
+/// 范围判定全部交给 [`scope::is_managed_relative`]：外部根整棵纳入，`agent` 根按白名单与排除名。
 fn walk(
+    root: RootId,
     dir: &Path,
     relative: &Path,
     is_root: bool,
@@ -289,9 +315,6 @@ fn walk(
             continue;
         };
         let relative_path = relative.join(&name);
-        if scope::is_excluded_relative(&relative_path) {
-            continue;
-        }
 
         let path = entry.path();
         // 跟随链接；断链直接跳过。
@@ -300,46 +323,29 @@ fn walk(
         };
 
         if metadata.is_dir() {
-            if is_root && !scope::INCLUDED_ROOT_DIRS.contains(&name.as_str()) {
+            if !scope::is_managed_relative(root, &relative_path) {
                 continue;
             }
-            walk(&path, &relative_path, false, active, found)?;
+            walk(root, &path, &relative_path, false, active, found)?;
         } else if metadata.is_file() {
-            if is_root && !root_file_included(&name) {
+            let Some(original) = conflict_original_name(&name) else {
+                continue;
+            };
+            // 冲突副本按「原名是否在范围内」判定，根级 `AGENTS-冲突.md` 因此也能被识别；
+            // 根级 auth.json 的副本同样要展示。
+            if !scope::is_managed_relative(root, &relative.join(&original)) {
                 continue;
             }
-            if let Some(original) = conflict_original_name(&name) {
-                // 冲突副本跟随原名的排除规则；根级 auth.json 的副本同样要展示。
-                if scope::is_excluded_relative(&relative.join(&original)) {
-                    continue;
-                }
-                found.push(Found {
-                    original: relative.join(original),
-                    relative: relative_path,
-                    size: metadata.len(),
-                });
-            }
+            found.push(Found {
+                original: relative.join(original),
+                relative: relative_path,
+                size: metadata.len(),
+            });
         }
     }
 
     active.remove(&canonical);
     Ok(())
-}
-
-/// 根级文件是否在受管范围内。冲突副本按"原名是否在范围内"判定，
-/// 这样根级的 `AGENTS-冲突.md` 也能被识别。
-fn root_file_included(name: &str) -> bool {
-    is_included_root_name(name)
-        || conflict_original_name(name).is_some_and(|original| is_included_root_name(&original))
-}
-
-/// 与 `scope` 的根级纳入规则保持一致；该判定未在 `scope` 导出，故在此复述。
-fn is_included_root_name(name: &str) -> bool {
-    scope::INCLUDED_ROOT_FILES.contains(&name)
-        || scope::INCLUDED_ROOT_DIRS.contains(&name)
-        || Path::new(name)
-            .extension()
-            .is_some_and(|extension| extension == "json")
 }
 
 /// 从冲突文件名还原原名：去掉冲突标记与成员昵称后缀，保留扩展名。
@@ -481,7 +487,7 @@ mod tests {
         write_file(&agent.join("settings-冲突.json"), b"{\"a\":2}\n");
         write_file(&agent.join("web-search-NSConflict.json"), b"{\"b\":3}\n");
 
-        let report = scan(agent).expect("扫描");
+        let report = scan(agent, None).expect("扫描");
         assert_eq!(
             conflicts(&report),
             vec!["settings-冲突.json", "web-search-NSConflict.json"],
@@ -524,7 +530,7 @@ mod tests {
         write_file(&agent.join("SYSTEM.md"), b"x\ny\n");
         write_file(&agent.join("SYSTEM-NSConflict.md"), b"x\ny\nz\n");
 
-        let report = scan(agent).expect("扫描");
+        let report = scan(agent, None).expect("扫描");
 
         let first = find(&report, "AGENTS-冲突.md").summary.clone();
         assert_eq!(
@@ -553,7 +559,7 @@ mod tests {
             b"{\"same\":true}\n",
         );
 
-        let report = scan(agent).expect("扫描");
+        let report = scan(agent, None).expect("扫描");
         let item = find(&report, "keybindings-NSConflict.json");
         assert_eq!(item.pair_status, PairStatus::Paired);
         assert_eq!(item.summary, ConflictSummary::plain(SummaryKind::Identical));
@@ -574,7 +580,7 @@ mod tests {
         write_file(&agent.join("prompts/review.md"), b"short\n");
         write_file(&agent.join("prompts/review-NSConflict.md"), &oversized);
 
-        let report = scan(agent).expect("扫描");
+        let report = scan(agent, None).expect("扫描");
 
         let binary = find(&report, "themes/dark-冲突.json");
         assert_eq!(binary.summary, ConflictSummary::plain(SummaryKind::Binary));
@@ -606,7 +612,7 @@ mod tests {
         write_file(&agent.join("auth-冲突.json"), b"{}");
         write_file(&agent.join("skills/auth-NSConflict.json"), b"{}");
 
-        let report = scan(agent).expect("扫描");
+        let report = scan(agent, None).expect("扫描");
         assert_eq!(
             conflicts(&report),
             vec![
@@ -628,8 +634,8 @@ mod tests {
         }
         write_file(&agent.join("skills/z/SKILL-冲突.md"), b"z\n");
 
-        let first = scan(agent).expect("第一次扫描");
-        let second = scan(agent).expect("第二次扫描");
+        let first = scan(agent, None).expect("第一次扫描");
+        let second = scan(agent, None).expect("第二次扫描");
         assert_eq!(first, second);
 
         let paths = conflicts(&first);
@@ -640,13 +646,78 @@ mod tests {
     }
 
     #[test]
+    fn scan_covers_both_managed_roots_with_root_labels() {
+        let temp = TempDir::new("two-roots");
+        let agent = temp.path().join("agent");
+        let home = temp.path().join("home");
+        write_file(&agent.join("settings.json"), b"{\"a\":1}\n");
+        write_file(&agent.join("settings-冲突.json"), b"{\"a\":2}\n");
+
+        // 外部根整棵纳入：名字像缓存目录的也要扫（那里可能只是技能名）。
+        let skills = home.join(".agents/skills");
+        write_file(&skills.join("council/SKILL.md"), b"v1\n");
+        write_file(&skills.join("council/SKILL-NSConflict.md"), b"v2\n");
+        write_file(&skills.join("sessions/SKILL.md"), b"a\n");
+        write_file(&skills.join("sessions/SKILL-NSConflict.md"), b"b\n");
+        // 外部根不纳入 auth.json，其冲突副本同样不展示。
+        write_file(&skills.join("auth.json"), b"{}\n");
+        write_file(&skills.join("auth-冲突.json"), b"{}\n");
+
+        let report = scan(&agent, Some(&home)).expect("扫描");
+
+        assert_eq!(
+            report.totals,
+            ConflictTotals {
+                total: 3,
+                paired: 3,
+                orphan: 0
+            }
+        );
+        assert_eq!(
+            report
+                .items
+                .iter()
+                .map(|item| (
+                    item.root,
+                    item.conflict.to_string_lossy().replace('\\', "/")
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (RootId::Agent, "settings-冲突.json".to_string()),
+                (
+                    RootId::AgentsSkills,
+                    "council/SKILL-NSConflict.md".to_string()
+                ),
+                (
+                    RootId::AgentsSkills,
+                    "sessions/SKILL-NSConflict.md".to_string()
+                ),
+            ],
+            "按 (root, 根内路径) 升序"
+        );
+    }
+
+    #[test]
+    fn missing_external_root_is_skipped() {
+        let temp = TempDir::new("no-external");
+        let agent = temp.path().join("agent");
+        write_file(&agent.join("settings.json"), b"{}\n");
+        write_file(&agent.join("settings-冲突.json"), b"{}\n");
+
+        let report = scan(&agent, Some(&temp.path().join("home"))).expect("扫描");
+
+        assert_eq!(report.totals.total, 1);
+        assert_eq!(report.items[0].root, RootId::Agent);
+    }
+
+    #[test]
     fn report_serializes_with_frontend_field_names() {
         let temp = TempDir::new("serialize");
         let agent = temp.path();
         write_file(&agent.join("settings.json"), b"{}\n");
         write_file(&agent.join("settings-冲突.json"), b"{}\n");
 
-        let report = scan(agent).expect("扫描");
+        let report = scan(agent, None).expect("扫描");
         let value = serde_json::to_value(&report).expect("结果应可序列化");
 
         let item = &value["items"][0];
@@ -663,10 +734,12 @@ mod tests {
                 "original",
                 "originalSize",
                 "pairStatus",
+                "root",
                 "size",
                 "summary",
             ])
         );
+        assert_eq!(item["root"], serde_json::json!("agent"));
         assert_eq!(item["pairStatus"], serde_json::json!("paired"));
         assert_eq!(item["original"], serde_json::json!("settings.json"));
         assert_eq!(item["summary"]["kind"], serde_json::json!("identical"));

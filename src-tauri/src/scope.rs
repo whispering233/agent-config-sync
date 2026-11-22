@@ -1,9 +1,11 @@
 //! 受管范围与遍历。
 //!
 //! 规则来源：`docs/design/10-snapshot-sync.md` 的「受管范围」「符号链接」两节。
-//! 范围判定集中在下面的常量与 [`is_excluded_name`] / [`resolve_within`]，
-//! 快照、计划与落地都复用它们，不另写一套。
+//! 范围判定集中在下面的常量与 [`is_managed_relative`] / [`resolve_within`]，
+//! 快照、计划与落地都复用它们，不另写一套。受管范围以受管根为单位：
+//! `agent` 根走白名单与排除名，`agents-skills` 根整棵纳入、只挡凭据。
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt;
@@ -25,8 +27,9 @@ pub const INCLUDED_ROOT_FILES: &[&str] = &[
 /// 根级纳入的资源目录，进入后整棵子树纳入。
 pub const INCLUDED_ROOT_DIRS: &[&str] = &["skills", "extensions", "prompts", "themes", "agents"];
 
-/// 任何层级都排除的名称：状态、缓存、安装与包本体。
+/// `agent` 根里任何层级都排除的名称：状态、缓存、安装与包本体。
 /// 根级 `auth.json` 是例外，由 [`is_excluded_relative`] 只放行根级。
+/// 外部根不套这张表：`~/.agents/skills` 里的目录名再像缓存也可能就是技能名。
 pub const EXCLUDED_NAMES: &[&str] = &[
     "models-store.json",
     "trust.json",
@@ -56,7 +59,7 @@ pub fn is_excluded_name(name: &str) -> bool {
             .any(|prefix| name.starts_with(prefix))
 }
 
-/// 按相对路径排除：普通排除名按任意层级匹配；`auth.json` 只允许根级。
+/// 按相对路径排除 `agent` 根：普通排除名按任意层级匹配；`auth.json` 只允许根级。
 pub fn is_excluded_relative(relative: &Path) -> bool {
     let nested_auth = relative.components().count() > 1
         && relative.file_name().is_some_and(|name| name == "auth.json");
@@ -74,6 +77,154 @@ fn is_included_root_name(name: &str) -> bool {
         || Path::new(name).extension().is_some_and(|ext| ext == "json")
 }
 
+/// 受管根的 id。manifest 的 `managedRoots` 与计划项的 `root` 都用它。
+///
+/// 顺序有意义：`agent` 始终在，`agents-skills` 只在源机存在 `~/.agents/skills` 时出现。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RootId {
+    /// Pi 宿主目录 `<agent_dir>`，快照根就是它的内容。
+    Agent,
+    /// 用户级 Agent Skills 目录 `<home>/.agents/skills`，快照里放在 `external/agents-skills/`。
+    AgentsSkills,
+}
+
+impl Default for RootId {
+    /// 缺 `root` 字段的旧记录（版本 1 的 `restore.json`）只可能来自 agent 根。
+    fn default() -> Self {
+        Self::Agent
+    }
+}
+
+impl RootId {
+    pub const ALL: [RootId; 2] = [Self::Agent, Self::AgentsSkills];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::AgentsSkills => "agents-skills",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|id| id.as_str() == value)
+    }
+
+    /// 面向用户的根名称。告警与错误信息用它：manifest 里的 id 是格式标识，不是给用户看的。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Agent => "宿主目录",
+            Self::AgentsSkills => "~/.agents/skills",
+        }
+    }
+
+    /// 告警与错误里的位置：根名 + 根内相对路径，两个根的同名路径因此不混。
+    pub fn describe(self, relative: &str) -> String {
+        format!("{} 里的 {relative}", self.label())
+    }
+
+    /// 根内相对路径在快照目录里的前缀。`agent` 根占快照根，其它根放进 `external/<id>/`，
+    /// 这样 v2 的 agent-only 快照路径在 v3 里逐字不变。
+    pub fn snapshot_prefix(self) -> &'static str {
+        match self {
+            Self::Agent => "",
+            Self::AgentsSkills => "external/agents-skills",
+        }
+    }
+}
+
+/// 一个受管根：id 与本机上的绝对路径。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedRoot {
+    pub id: RootId,
+    pub path: PathBuf,
+}
+
+impl ManagedRoot {
+    pub fn agent(agent_dir: &Path) -> Self {
+        Self {
+            id: RootId::Agent,
+            path: agent_dir.to_path_buf(),
+        }
+    }
+
+    pub fn agents_skills(home_dir: &Path) -> Self {
+        Self {
+            id: RootId::AgentsSkills,
+            path: agents_skills_path(home_dir),
+        }
+    }
+}
+
+/// `<home>/.agents/skills`：`pi` 本来就会加载的用户级技能目录。
+pub fn agents_skills_path(home_dir: &Path) -> PathBuf {
+    home_dir.join(".agents").join("skills")
+}
+
+/// 本机的一组受管根。始终含 `agent` 根；`agents-skills` 根要么解析出路径，要么根本不在集合里。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedRoots {
+    roots: Vec<ManagedRoot>,
+}
+
+impl ManagedRoots {
+    /// 按 id 去重排序，保证指纹与计划顺序与构造顺序无关。
+    pub fn new(roots: Vec<ManagedRoot>) -> Self {
+        let mut roots = roots;
+        roots.sort_by_key(|root| root.id);
+        roots.dedup_by_key(|root| root.id);
+        Self { roots }
+    }
+
+    pub fn path(&self, id: RootId) -> Option<&Path> {
+        self.roots
+            .iter()
+            .find(|root| root.id == id)
+            .map(|root| root.path.as_path())
+    }
+
+    /// 已声明的 id，升序。指纹按这个顺序算。
+    pub fn ids(&self) -> Vec<RootId> {
+        self.roots.iter().map(|root| root.id).collect()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, ManagedRoot> {
+        self.roots.iter()
+    }
+}
+
+/// 严格受管判定：遍历、计划与应用共用同一套规则。
+///
+/// - `agent` 根的排除名（状态、缓存、包本体）在任何层级都不进快照；外部根不套这张表。
+/// - `auth.json` 只认 `agent` 根的根级：凭据不认其它位置，避免把子目录（或外部根）里的同名文件当凭据。
+/// - `agents-skills` 根本身就是技能目录：根下每一项都受管，不再套 agent 根的根级白名单。
+/// - `agent` 根深层路径必须落在白名单目录下：被改过的 manifest 不能借深层路径越界。
+pub fn is_managed_relative(root: RootId, relative: &Path) -> bool {
+    let names: Vec<&str> = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<&str>>>()
+        .unwrap_or_default();
+    let Some(first) = names.first().copied() else {
+        return false;
+    };
+
+    if relative.file_name().is_some_and(|name| name == "auth.json") {
+        return root == RootId::Agent && names.len() == 1;
+    }
+    match root {
+        // 排除名描述的是宿主目录里的状态、缓存与包本体；外部根本身就是技能目录，
+        // 里面的 `npm/`、`sessions/` 只是技能名，一律纳入。
+        RootId::Agent if is_excluded_relative(relative) => false,
+        RootId::Agent if names.len() > 1 => INCLUDED_ROOT_DIRS.contains(&first),
+        RootId::Agent => is_included_root_name(first),
+        RootId::AgentsSkills => true,
+    }
+}
+
 /// 条目类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -84,7 +235,7 @@ pub enum EntryKind {
 /// 受管范围内的一个条目。目录条目用于在目标目录里重建空目录。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
-    /// 相对 agent 目录的路径，永不含 `..` 或绝对前缀。
+    /// 相对所属受管根的路径，永不含 `..` 或绝对前缀。
     pub relative_path: PathBuf,
     pub kind: EntryKind,
     /// 文件字节数，目录为 0。
@@ -203,13 +354,14 @@ pub fn resolve_within(root: &Path, relative: &Path) -> Result<PathBuf, ScopeErro
     Ok(joined)
 }
 
-/// 按受管范围遍历 agent 目录。`agent_dir` 本身不可读是硬错误；范围内条目不可读只记录。
-pub fn scan(agent_dir: &Path) -> Result<ScanOutcome, ScopeError> {
+/// 按受管范围遍历一个受管根。根目录本身不可读是硬错误；范围内条目不可读只记录。
+pub fn scan_root(root: &ManagedRoot) -> Result<ScanOutcome, ScopeError> {
     let mut walker = Walker {
+        root: root.id,
         outcome: ScanOutcome::default(),
         active: HashSet::new(),
     };
-    walker.walk(agent_dir, Path::new(""), true)?;
+    walker.walk(&root.path, Path::new(""), true)?;
     let mut outcome = walker.outcome;
     outcome
         .entries
@@ -220,26 +372,15 @@ pub fn scan(agent_dir: &Path) -> Result<ScanOutcome, ScopeError> {
     Ok(outcome)
 }
 
-/// 把受管范围物化复制到 `dest_dir`：符号链接写成真实内容，断链等跳过项不中断整体。
-/// `dest_dir` 必须不存在或为空；任何写入都落在 `dest_dir` 之内。
-pub fn materialize(agent_dir: &Path, dest_dir: &Path) -> Result<MaterializeOutcome, ScopeError> {
-    materialize_inner(agent_dir, dest_dir, true)
-}
-
-/// 与 [`materialize`] 相同，但不复制根级 `auth.json`；自动上行默认用它。
-pub fn materialize_without_auth(
-    agent_dir: &Path,
-    dest_dir: &Path,
-) -> Result<MaterializeOutcome, ScopeError> {
-    materialize_inner(agent_dir, dest_dir, false)
-}
-
-fn materialize_inner(
-    agent_dir: &Path,
+/// 把一个受管根物化复制到 `dest_dir`：符号链接写成真实内容，断链等跳过项不中断整体。
+/// `dest_dir` 是该根在快照里的目录（外部根由调用方定位到 `external/<id>/`）；
+/// 任何写入都落在 `dest_dir` 之内。`include_auth` 为 false 时不复制根级 `auth.json`。
+pub fn materialize_root(
+    root: &ManagedRoot,
     dest_dir: &Path,
     include_auth: bool,
 ) -> Result<MaterializeOutcome, ScopeError> {
-    let scanned = scan(agent_dir)?;
+    let scanned = scan_root(root)?;
 
     if dest_dir.exists() {
         if !dest_dir.is_dir() || fs::read_dir(dest_dir)?.next().is_some() {
@@ -255,7 +396,7 @@ fn materialize_inner(
             continue;
         }
         let destination = resolve_within(dest_dir, &entry.relative_path)?;
-        let source = resolve_within(agent_dir, &entry.relative_path)?;
+        let source = resolve_within(&root.path, &entry.relative_path)?;
         match entry.kind {
             EntryKind::Dir => fs::create_dir_all(&destination)?,
             EntryKind::File => {
@@ -281,6 +422,8 @@ fn materialize_inner(
 }
 
 struct Walker {
+    /// 当前遍历的根：范围规则按根区分（见 [`is_managed_relative`]）。
+    root: RootId,
     outcome: ScanOutcome,
     /// 当前路径上已进入的物理目录，用于识别链接成环。
     active: HashSet<PathBuf>,
@@ -322,7 +465,7 @@ impl Walker {
 
         if let Some(names) = names {
             for name in names {
-                self.visit(physical, relative, &name, is_root)?;
+                self.visit(physical, relative, &name)?;
             }
         }
 
@@ -336,11 +479,9 @@ impl Walker {
         physical: &Path,
         relative: &Path,
         name: &OsString,
-        is_root: bool,
     ) -> Result<(), ScopeError> {
-        let label = name.to_string_lossy();
         let relative_path = relative.join(name);
-        if is_excluded_relative(&relative_path) || (is_root && !is_included_root_name(&label)) {
+        if !is_managed_relative(self.root, &relative_path) {
             return Ok(());
         }
 
@@ -448,6 +589,16 @@ mod tests {
             fs::create_dir_all(parent).expect("创建父目录");
         }
         fs::write(path, content).expect("写入夹具文件");
+    }
+
+    /// 单根扫描的测试入口：范围规则按 agent 根算。
+    fn scan(agent_dir: &Path) -> Result<ScanOutcome, ScopeError> {
+        scan_root(&ManagedRoot::agent(agent_dir))
+    }
+
+    /// 单根物化的测试入口：`dest_dir` 就是 agent 根在快照里的位置。
+    fn materialize(agent_dir: &Path, dest_dir: &Path) -> Result<MaterializeOutcome, ScopeError> {
+        materialize_root(&ManagedRoot::agent(agent_dir), dest_dir, true)
     }
 
     fn scan_paths(outcome: &ScanOutcome) -> Vec<String> {
@@ -831,5 +982,147 @@ mod tests {
             skipped_paths(&outcome),
             vec![("skills/pipe".to_string(), SkipReason::SpecialFile)]
         );
+    }
+
+    #[test]
+    fn root_ids_round_trip_and_carry_snapshot_prefixes() {
+        assert_eq!(RootId::Agent.as_str(), "agent");
+        assert_eq!(RootId::AgentsSkills.as_str(), "agents-skills");
+        for id in RootId::ALL {
+            assert_eq!(RootId::parse(id.as_str()), Some(id));
+        }
+        assert_eq!(RootId::parse("profiles"), None);
+
+        // agent 根占快照根，v2 的 agent-only 路径在 v3 里逐字不变。
+        assert_eq!(RootId::Agent.snapshot_prefix(), "");
+        assert_eq!(
+            RootId::AgentsSkills.snapshot_prefix(),
+            "external/agents-skills"
+        );
+        assert_eq!(
+            agents_skills_path(Path::new("/home/user")),
+            Path::new("/home/user/.agents/skills")
+        );
+    }
+
+    #[test]
+    fn managed_roots_keep_the_agent_root_and_sort_by_id() {
+        let roots = ManagedRoots::new(vec![
+            ManagedRoot {
+                id: RootId::AgentsSkills,
+                path: PathBuf::from("/home/user/.agents/skills"),
+            },
+            ManagedRoot::agent(Path::new("/home/user/.pi/agent")),
+        ]);
+        assert_eq!(roots.ids(), vec![RootId::Agent, RootId::AgentsSkills]);
+        assert_eq!(
+            roots.path(RootId::Agent),
+            Some(Path::new("/home/user/.pi/agent"))
+        );
+        assert!(roots.path(RootId::AgentsSkills).is_some());
+
+        let agent_only = ManagedRoots::new(vec![ManagedRoot::agent(Path::new("/a"))]);
+        assert_eq!(agent_only.ids(), vec![RootId::Agent]);
+        assert!(agent_only.path(RootId::AgentsSkills).is_none());
+    }
+
+    #[test]
+    fn managed_relative_rules_differ_by_root() {
+        for relative in [
+            "settings.json",
+            "web-search.json",
+            "AGENTS.md",
+            "skills",
+            "skills/foo/SKILL.md",
+            "auth.json",
+        ] {
+            assert!(
+                is_managed_relative(RootId::Agent, Path::new(relative)),
+                "agent 根应纳入 {relative}"
+            );
+        }
+        for relative in [
+            "notes.txt",
+            "sessions",
+            "sessions/x.json",
+            "skills/auth.json",
+            "skills/npm/package.json",
+            "",
+        ] {
+            assert!(
+                !is_managed_relative(RootId::Agent, Path::new(relative)),
+                "agent 根不应纳入 {relative}"
+            );
+        }
+
+        // 外部根整棵就是技能目录：没有根级白名单，也不套 agent 根的排除名；
+        // 只有凭据不在那里认。
+        for relative in [
+            "anything",
+            "anything/SKILL.md",
+            "notes.txt",
+            "deep/er/file.md",
+            "npm/package.json",
+            "sessions/x.json",
+            "install",
+        ] {
+            assert!(
+                is_managed_relative(RootId::AgentsSkills, Path::new(relative)),
+                "外部根应纳入 {relative}"
+            );
+        }
+        for relative in ["auth.json", "demo/auth.json"] {
+            assert!(
+                !is_managed_relative(RootId::AgentsSkills, Path::new(relative)),
+                "外部根不应纳入 {relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn agents_skills_root_scans_whole_tree_without_whitelist() {
+        let temp = TempDir::new("agents-skills");
+        let skills = temp.path().join(".agents/skills");
+        write_file(&skills.join("antd/SKILL.md"), "# 技能");
+        write_file(&skills.join("notes.txt"), "不是 skill 目录也能看到");
+        // 排除名是 agent 根的概念：外部根里的 `npm/`、`sessions/` 是普通技能目录。
+        write_file(&skills.join("npm/package.json"), "{}");
+        write_file(&skills.join("sessions/SKILL.md"), "# 技能");
+        // 凭据文件在哪里都不是受管内容。
+        write_file(&skills.join("auth.json"), "{}");
+        write_file(&skills.join("antd/auth.json"), "{}");
+
+        let outcome = scan_root(&ManagedRoot::agents_skills(temp.path())).expect("扫描外部根");
+        assert_eq!(
+            scan_paths(&outcome),
+            vec![
+                "antd",
+                "antd/SKILL.md",
+                "notes.txt",
+                "npm",
+                "npm/package.json",
+                "sessions",
+                "sessions/SKILL.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn materialize_root_skips_credentials_when_asked() {
+        let temp = TempDir::new("materialize-no-auth");
+        let skills = temp.path().join(".agents/skills");
+        write_file(&skills.join("demo/SKILL.md"), "# 技能");
+        write_file(&skills.join("auth.json"), "{}");
+
+        let dest = temp.path().join("snapshot/external/agents-skills");
+        let outcome = materialize_root(&ManagedRoot::agents_skills(temp.path()), &dest, false)
+            .expect("物化外部根");
+        assert_eq!(
+            outcome.written,
+            vec![PathBuf::from("demo"), PathBuf::from("demo/SKILL.md")]
+        );
+        assert!(dest.join("demo/SKILL.md").is_file());
+        // `auth.json` 不论在哪个根都不是受管内容。
+        assert!(!dest.join("auth.json").exists());
     }
 }

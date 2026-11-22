@@ -215,9 +215,16 @@ impl PackageStore for LocalStore {
             Err(error) => return Err(storage_error(&self.root, error)),
         };
 
+        // 逐个读目录的顺序由文件系统决定；先按名字排好，列举结果才不会因平台而异。
+        let mut names: Vec<String> = entries
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+
         let mut listing = StoreListing::default();
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
+        for name in names {
+            let entry = self.root.join(&name);
             // 读不到元数据按 0 字节记：体积只用于展示，不该让整次列举失败。
             let size = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
             classify(&name, size, &mut listing);
