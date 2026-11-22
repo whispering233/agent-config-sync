@@ -6,6 +6,7 @@ use crate::config::{
 };
 use crate::credentials::{self, CredentialError, WebdavCredentials};
 use crate::package;
+use crate::plan;
 use crate::runtime;
 use crate::snapshot;
 use crate::store::{LocalStore, WebdavStore};
@@ -296,6 +297,56 @@ pub async fn list_snapshot_packages(app: AppHandle) -> Result<PackageListView, D
     })
     .await
     .map_err(|error| DownloadFailure::new("list_failed", format!("列举快照包失败：{error}")))?
+}
+
+/// 对比 1..N 份候选包与当前配置：只读。
+///
+/// 每份包解到 `staging/compare/<包名>/` 跑一次计划，结束整体删掉；常驻的 `staging/<包名>/`
+/// 与远端、备份、live 都不动。本地文件夹与 WebDAV 共用同一条链路，只换 store 实现。
+#[tauri::command]
+pub async fn compare_snapshot_packages(
+    app: AppHandle,
+    packages: Vec<String>,
+) -> Result<webdav_transfer::CompareReport, DownloadFailure> {
+    // WebDAV 要发 PROPFIND 与 GET，还要解包，留在 UI 线程会冻住窗口。
+    tauri::async_runtime::spawn_blocking(move || {
+        // 与下载、上传共用同一把锁：对比要写暂存目录。
+        let _guard = runtime::lock_operation();
+        let app_data = app_data_dir(&app)
+            .map_err(|message| DownloadFailure::new("app_data_unavailable", message))?;
+        let config = app_config(&app)
+            .map_err(|message| DownloadFailure::new("app_config_unavailable", message))?;
+        let agent_dir = plan::agent_dir(&app, &config)
+            .map_err(|failure| DownloadFailure::new(failure.code, failure.message))?;
+
+        if config.transport == Transport::Local {
+            let root = config.sync_root.ok_or_else(|| {
+                DownloadFailure::new(
+                    "sync_root_unset",
+                    "还没有设置同步文件夹：请先在设置页选择，再回来对比",
+                )
+            })?;
+
+            return webdav_transfer::compare_packages(
+                &LocalStore::new(root),
+                &app_data,
+                &agent_dir,
+                &packages,
+            );
+        }
+
+        let (client, endpoint) = webdav_client(&app_data)?;
+
+        webdav_transfer::compare_from_webdav(
+            &WebdavStore::new(&client),
+            &endpoint,
+            &app_data,
+            &agent_dir,
+            &packages,
+        )
+    })
+    .await
+    .map_err(|error| DownloadFailure::new("compare_failed", format!("对比快照包失败：{error}")))?
 }
 
 /// 清理当前传输方式下的上传残留：只删本应用自己产生过的临时名，返回删了哪些、哪些失败、

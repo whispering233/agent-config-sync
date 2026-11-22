@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { TriangleAlert } from 'lucide-react';
 import { Button } from '../components/ui/button';
@@ -6,10 +6,13 @@ import { Card } from '../components/ui/card';
 import { loadAppConfig, type PathStatus, type Transport } from '../lib/app-config';
 import {
   cleanupUploadLeftovers,
+  compareSnapshotPackages,
   downloadRemoteSnapshot,
   isDesktop,
   listSnapshotPackages,
   uploadSnapshot,
+  type ComparePair,
+  type CompareReport,
   type LeftoverCleanup,
   type PackageList,
   type RemoteDownload,
@@ -181,6 +184,12 @@ type CleanupState =
   | { kind: 'done'; result: LeftoverCleanup }
   | { kind: 'failed'; code: string | null; message: string };
 
+type CompareState =
+  | { kind: 'idle' }
+  | { kind: 'comparing' }
+  | { kind: 'done'; report: CompareReport }
+  | { kind: 'failed'; code: string | null; message: string };
+
 type PlanState =
   | { kind: 'idle' }
   | { kind: 'checking' }
@@ -306,6 +315,9 @@ export function SnapshotPage() {
   /** 存储根里的包列表，与选中的那一份（缺省跟随最新）。 */
   const [packages, setPackages] = useState<PackagesState>({ kind: 'idle' });
   const [picked, setPicked] = useState<string | null>(null);
+  /** 要对比的包：多选，与「取哪一份」无关。 */
+  const [comparePicked, setComparePicked] = useState<string[]>([]);
+  const [compare, setCompare] = useState<CompareState>({ kind: 'idle' });
   /** 清理上传残留：确认框、执行与结果。 */
   const [cleanup, setCleanup] = useState<CleanupState>({ kind: 'idle' });
 
@@ -442,6 +454,33 @@ export function SnapshotPage() {
         message: failure?.message ?? errorMessage(error),
       });
     }
+  }
+
+  async function runCompare() {
+    if (comparePicked.length === 0) {
+      return;
+    }
+    setCompare({ kind: 'comparing' });
+    try {
+      const report = await compareSnapshotPackages(comparePicked);
+      setCompare({ kind: 'done', report });
+    } catch (error) {
+      // 非 HTTPS、同步文件夹没设、凭据缺失都在这里带着失败码上报，原样展示。
+      const failure = asFailure(error);
+      setCompare({
+        kind: 'failed',
+        code: failure?.code ?? null,
+        message: failure?.message ?? errorMessage(error),
+      });
+    }
+  }
+
+  function toggleCompare(name: string) {
+    setComparePicked((current) =>
+      current.includes(name)
+        ? current.filter((item) => item !== name)
+        : [...current, name],
+    );
   }
 
   async function runCleanup() {
@@ -660,10 +699,13 @@ export function SnapshotPage() {
             <PackageListBlock
               list={packages.list}
               picked={picked}
-              onPick={setPicked}
               onDownload={(name) => void runDownload(name)}
               downloading={downloading}
               emptyText="云端还没有快照包：先上传一次，或者等另一台机器上传。"
+              compare={compare}
+              comparePicked={comparePicked}
+              onToggleCompare={toggleCompare}
+              onCompare={() => void runCompare()}
               cleanup={cleanup}
               onStartCleanup={() => setCleanup({ kind: 'confirming' })}
               onConfirmCleanup={() => void runCleanup()}
@@ -699,10 +741,13 @@ export function SnapshotPage() {
             <PackageListBlock
               list={packages.list}
               picked={picked}
-              onPick={setPicked}
               onDownload={(name) => void runDownload(name)}
               downloading={downloading}
               emptyText="同步文件夹里还没有快照包：先导出一次，或者等云盘把另一台机器的包同步下来。"
+              compare={compare}
+              comparePicked={comparePicked}
+              onToggleCompare={toggleCompare}
+              onCompare={() => void runCompare()}
               cleanup={cleanup}
               onStartCleanup={() => setCleanup({ kind: 'confirming' })}
               onConfirmCleanup={() => void runCleanup()}
@@ -1235,15 +1280,18 @@ function DownloadResult({ view }: { view: RemoteDownload }) {
 /**
  * 历史包列表：本地文件夹与 WebDAV 共用，差别只在标题、空列表文案与是否展示云端状态。
  *
- * 每行自带「下载」：选包就是选那一行，不再另设一个顶部按钮——否则两个控件会各说一套。
+ * 每行自带「用这个包」：取哪一份就在哪一行点；勾选框只用于挑要对比的候选。
  */
 function PackageListBlock({
   list,
   picked,
-  onPick,
   onDownload,
   downloading,
   emptyText,
+  compare,
+  comparePicked,
+  onToggleCompare,
+  onCompare,
   cleanup,
   onStartCleanup,
   onConfirmCleanup,
@@ -1251,15 +1299,20 @@ function PackageListBlock({
 }: {
   list: PackageList;
   picked: string | null;
-  onPick: (name: string) => void;
   onDownload: (name: string) => void;
   downloading: boolean;
   emptyText: string;
+  compare: CompareState;
+  comparePicked: string[];
+  onToggleCompare: (name: string) => void;
+  onCompare: () => void;
   cleanup: CleanupState;
   onStartCleanup: () => void;
   onConfirmCleanup: () => void;
   onCancelCleanup: () => void;
 }) {
+  const comparing = compare.kind === 'comparing';
+
   return (
     <>
       {list.unseenCount > 0 && (
@@ -1285,12 +1338,12 @@ function PackageListBlock({
             >
               <label className="flex min-w-0 flex-1 items-start gap-sm">
                 <input
-                  type="radio"
-                  name="snapshot-package"
+                  type="checkbox"
                   className="mt-xs h-4 w-4"
-                  checked={picked === entry.name}
-                  onChange={() => onPick(entry.name)}
-                  disabled={downloading}
+                  checked={comparePicked.includes(entry.name)}
+                  onChange={() => onToggleCompare(entry.name)}
+                  disabled={comparing}
+                  aria-label={`选择 ${entry.name} 参与对比`}
                 />
                 <span className="flex min-w-0 flex-col gap-xs">
                   <span className="break-all font-mono text-xs text-foreground">
@@ -1311,11 +1364,52 @@ function PackageListBlock({
                 onClick={() => onDownload(entry.name)}
                 disabled={downloading}
               >
-                {downloading && picked === entry.name ? '下载中…' : '下载'}
+                {downloading && picked === entry.name ? '下载中…' : '用这个包'}
               </Button>
             </li>
           ))}
         </ul>
+      )}
+
+      {list.packages.length > 0 && (
+        <div className="mt-md">
+          <div className="flex flex-wrap items-center gap-md">
+            <Button
+              onClick={onCompare}
+              disabled={comparing || comparePicked.length === 0}
+            >
+              {comparing
+                ? '对比中…'
+                : comparePicked.length === 0
+                  ? '对比'
+                  : `对比选中的 ${comparePicked.length} 份`}
+            </Button>
+            <span className="text-xs text-muted-foreground">
+              先勾选候选包，再看应用它会发生什么。对比只读，不会改动你的配置或云端。
+            </span>
+          </div>
+
+          {compare.kind === 'failed' && (
+            <p className="mt-sm flex items-start gap-sm text-sm text-danger">
+              <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
+              <span>
+                对比失败：
+                {compare.code !== null && (
+                  <code className="mr-xs font-mono text-xs">[{compare.code}]</code>
+                )}
+                {compare.message}
+              </span>
+            </p>
+          )}
+
+          {compare.kind === 'done' && (
+            <CompareTable
+              report={compare.report}
+              downloading={downloading}
+              onUse={onDownload}
+            />
+          )}
+        </div>
       )}
 
       {list.unrecognized.length > 0 && (
@@ -1344,6 +1438,165 @@ function PackageListBlock({
         onCancel={onCancelCleanup}
       />
     </>
+  );
+}
+
+/**
+ * 对比结果表：每行一份候选包，横向对比着读。
+ *
+ * 「将删除」列最醒目：应用一份包真正可能弄丢东西的就是这一列，点开看具体路径。
+ */
+function CompareTable({
+  report,
+  downloading,
+  onUse,
+}: {
+  report: CompareReport;
+  downloading: boolean;
+  onUse: (name: string) => void;
+}) {
+  const [expanded, setExpanded] = useState<string | null>(null);
+
+  return (
+    <div className="mt-md">
+      <table className="w-full border-collapse text-sm">
+        <thead>
+          <tr className="text-left text-xs text-muted-foreground">
+            <th className="py-sm pr-md font-medium">包</th>
+            <th className="py-sm pr-md font-medium">创建时间</th>
+            <th className="py-sm pr-md font-medium">新增</th>
+            <th className="py-sm pr-md font-medium">修改</th>
+            <th className="py-sm pr-md font-medium text-danger">将删除</th>
+            <th className="py-sm pr-md font-medium">与当前相同</th>
+            <th className="py-sm font-medium"> </th>
+          </tr>
+        </thead>
+        <tbody>
+          {report.rows.map((row) => (
+            <Fragment key={row.package}>
+              <tr className="border-t border-border align-top">
+                <td className="py-sm pr-md break-all font-mono text-xs text-foreground">
+                  {row.package}
+                </td>
+                <td className="py-sm pr-md whitespace-nowrap text-xs text-muted-foreground">
+                  {packageTime(row.createdAt)}
+                </td>
+                {row.error !== null ? (
+                  <td colSpan={4} className="py-sm pr-md text-xs text-danger">
+                    <code className="mr-xs font-mono">[{row.error.code}]</code>
+                    {row.error.message}
+                  </td>
+                ) : (
+                  <>
+                    <td className="py-sm pr-md text-foreground">{row.added ?? 0}</td>
+                    <td className="py-sm pr-md text-foreground">{row.modified ?? 0}</td>
+                    <td className="py-sm pr-md">
+                      {(row.deleted ?? 0) === 0 ? (
+                        <span className="text-muted-foreground">0</span>
+                      ) : (
+                        <button
+                          type="button"
+                          className="font-semibold text-danger underline"
+                          aria-expanded={expanded === row.package}
+                          onClick={() =>
+                            setExpanded(expanded === row.package ? null : row.package)
+                          }
+                        >
+                          {row.deleted} 项
+                        </button>
+                      )}
+                    </td>
+                    <td className="py-sm pr-md text-foreground">{row.unchanged ?? 0}</td>
+                  </>
+                )}
+                <td className="py-sm">
+                  <Button
+                    variant="secondary"
+                    onClick={() => onUse(row.package)}
+                    disabled={downloading || row.error !== null}
+                  >
+                    {downloading ? '取包中…' : '用这个包'}
+                  </Button>
+                </td>
+              </tr>
+              {expanded === row.package && (
+                <tr className="border-t border-border">
+                  <td colSpan={7} className="py-sm">
+                    <PathList
+                      title="将被删除"
+                      hint="应用时默认不勾选，逐项确认"
+                      paths={row.deletedPaths}
+                    />
+                  </td>
+                </tr>
+              )}
+            </Fragment>
+          ))}
+        </tbody>
+      </table>
+
+      {report.pair !== null && <PairDiff pair={report.pair} />}
+    </div>
+  );
+}
+
+/** 包间差异：两个包互相比，与当前配置无关。 */
+function PairDiff({ pair }: { pair: ComparePair }) {
+  return (
+    <div className="mt-md rounded-md border border-border px-md py-sm">
+      <h3 className="text-xs font-semibold text-foreground">包间差异</h3>
+      <p className="mt-xs break-all text-xs text-muted-foreground">
+        右相对左：<span className="font-mono">{pair.left}</span> →{' '}
+        <span className="font-mono">{pair.right}</span>
+      </p>
+      <div className="mt-sm flex flex-col gap-sm">
+        <PathList title="右侧新增" paths={pair.added} />
+        <PathList title="右侧修改" paths={pair.modified} />
+        <PathList title="右侧没有" paths={pair.removed} />
+      </div>
+    </div>
+  );
+}
+
+/** 路径清单：只列前 20 条，其余只报数量。 */
+function PathList({
+  title,
+  hint,
+  paths,
+}: {
+  title: string;
+  hint?: string;
+  paths: string[];
+}) {
+  if (paths.length === 0) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        {title}：0 项
+      </p>
+    );
+  }
+  const shown = paths.slice(0, PLAN_LIST_LIMIT);
+  return (
+    <div>
+      <h4 className="text-xs font-semibold text-foreground">
+        {title} {paths.length} 项
+        {hint !== undefined && (
+          <span className="ml-xs font-normal text-muted-foreground">· {hint}</span>
+        )}
+      </h4>
+      <ul className="mt-xs flex flex-col gap-xs">
+        {shown.map((path) => (
+          <li key={path} className="break-all font-mono text-xs text-foreground">
+            {path}
+          </li>
+        ))}
+      </ul>
+      {paths.length > shown.length && (
+        <p className="mt-xs text-xs text-muted-foreground">
+          还有 {paths.length - shown.length} 项
+        </p>
+      )}
+    </div>
   );
 }
 

@@ -6,6 +6,7 @@
 
 use crate::credentials;
 use crate::package;
+use crate::plan;
 use crate::platform;
 use crate::remote_state::{self, RemoteState};
 use crate::snapshot::{self, Manifest};
@@ -16,6 +17,8 @@ use std::path::{Path, PathBuf};
 
 /// 暂存目录名：位于应用数据目录下，与 `backups/` 同级，不进云盘也不进快照。
 pub const STAGING_DIR_NAME: &str = "staging";
+/// 对比用的解包目录：在暂存根下，对比结束整体删掉，与常驻的 `staging/<包名>/` 分开。
+pub const COMPARE_DIR_NAME: &str = "compare";
 /// 暂存目录权限：快照可能含明文密钥，只允许本用户读写。
 const STAGING_DIR_MODE: u32 = 0o700;
 
@@ -108,6 +111,50 @@ pub struct CleanupOutcome {
 pub struct CleanupFailure {
     pub name: String,
     pub reason: String,
+}
+
+/// 对比表的一行：一份候选包对 live 的只读计划结果。
+///
+/// 失败只影响本行（取包、解包或校验没过），其它行照常：一张表里有坏包不该整张判失败。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompareRow {
+    pub package: String,
+    /// 由包名时间戳换算的 RFC 3339 UTC。
+    pub created_at: String,
+    /// 包名里的指纹前 8 位。
+    pub fingerprint8: String,
+    /// 失败行为 `None`：计数与路径都不成立。
+    pub added: Option<usize>,
+    pub modified: Option<usize>,
+    /// 「将删除」：live 有、包里没有的受管文件数。
+    pub deleted: Option<usize>,
+    pub unchanged: Option<usize>,
+    /// 将被删掉的具体路径，逐项来自计划。
+    pub deleted_paths: Vec<String>,
+    pub error: Option<DownloadFailure>,
+}
+
+/// 两个候选包之间的文件级差异。路径相对宿主目录，与计划一致。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComparePair {
+    pub left: String,
+    pub right: String,
+    /// 右边有、左边没有。
+    pub added: Vec<String>,
+    /// 两边都有但内容不同。
+    pub modified: Vec<String>,
+    /// 左边有、右边没有。
+    pub removed: Vec<String>,
+}
+
+/// 一次对比的结果：`rows` 按包名倒序，`pair` 只在候选 ≥ 2 时出现。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompareReport {
+    pub rows: Vec<CompareRow>,
+    pub pair: Option<ComparePair>,
 }
 
 fn store_failure(error: StoreError) -> DownloadFailure {
@@ -313,26 +360,7 @@ pub fn stage_package(
         remove_path(&target)?;
     }
 
-    let bytes = store
-        .get(&chosen.name)
-        .map_err(store_failure)?
-        .ok_or_else(|| {
-            DownloadFailure::new(
-                "package_not_found",
-                format!("取包时存储里已经没有这份包：{}", chosen.name),
-            )
-        })?;
-    // `unpack` 只认路径：先把包落到暂存根下的临时名，解完立刻删。
-    let archive = root.join(format!("{}.incoming", chosen.name));
-    fs::write(&archive, &bytes).map_err(|error| {
-        DownloadFailure::new(
-            "no_write_permission",
-            format!("无法写入临时包 {}：{error}", archive.display()),
-        )
-    })?;
-    let unpacked = package::unpack(&archive, &target);
-    let _ = fs::remove_file(&archive);
-    unpacked.map_err(package_failure)?;
+    let size = fetch_into(store, &root, &chosen.name, &target)?;
     // 暂存常驻只保留当前这一份：更早的解包结果已经不可能被应用。
     prune_staging(app_data, &target);
 
@@ -346,7 +374,7 @@ pub fn stage_package(
     };
     Ok(StagedPackage {
         package_name: chosen.name.clone(),
-        size: bytes.len() as u64,
+        size,
         file_count: manifest.files.len(),
         fingerprint: manifest.fingerprint,
         created_at: manifest.created_at,
@@ -398,6 +426,208 @@ pub fn download_from_webdav(
         // 空记录读出来的 `seenAt` 是空串：没有上一次就不该报一个时间。
         previous_seen_at: (!state.seen_at.is_empty()).then_some(state.seen_at),
     })
+}
+
+/// 取一份包并解到 `target`：`unpack` 只认路径，包先落到 `temp_dir` 下的临时名，解完立刻删。
+///
+/// 下载与对比共用这一段：两者的差别只在落点，取包与清临时名的顺序不该有两套。
+fn fetch_into(
+    store: &dyn PackageStore,
+    temp_dir: &Path,
+    name: &str,
+    target: &Path,
+) -> Result<u64, DownloadFailure> {
+    let bytes = store.get(name).map_err(store_failure)?.ok_or_else(|| {
+        DownloadFailure::new(
+            "package_not_found",
+            format!("取包时存储里已经没有这份包：{name}"),
+        )
+    })?;
+    let archive = temp_dir.join(format!("{name}.incoming"));
+    fs::write(&archive, &bytes).map_err(|error| {
+        DownloadFailure::new(
+            "no_write_permission",
+            format!("无法写入临时包 {}：{error}", archive.display()),
+        )
+    })?;
+    let unpacked = package::unpack(&archive, target);
+    let _ = fs::remove_file(&archive);
+    unpacked.map_err(package_failure)?;
+
+    Ok(bytes.len() as u64)
+}
+
+/// 对比 1..N 份候选包与 live：只读，不写 live、不写远端、不写备份。
+///
+/// 每份包解到 `staging/compare/<包名>/`（常驻的 `staging/<包名>/` 不动），在那里跑一次
+/// 不探测宿主版本的计划；候选 ≥ 2 时再用 [`plan::diff_manifests`] 比前两份的 manifest。
+/// 无论成败，返回前整棵 `staging/compare/` 都会被删掉。
+pub fn compare_packages(
+    store: &dyn PackageStore,
+    app_data: &Path,
+    agent_dir: &Path,
+    requested: &[String],
+) -> Result<CompareReport, DownloadFailure> {
+    // 重名会撞上同一个解包落点（`unpack` 拒绝已存在的目录）：先去重，保持候选顺序。
+    let mut names: Vec<String> = Vec::new();
+    for name in requested {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    if names.is_empty() {
+        return Err(DownloadFailure::new("compare_empty", "没有选中要对比的包"));
+    }
+
+    let listing = store.list().map_err(store_failure)?;
+    let compare_root = app_data.join(STAGING_DIR_NAME).join(COMPARE_DIR_NAME);
+    // 上一次崩在中途会留下半套解包：先清掉，否则这次会被「已存在」拦住。
+    let _ = fs::remove_dir_all(&compare_root);
+    platform::create_dir_all_mode(&compare_root, STAGING_DIR_MODE).map_err(|error| {
+        DownloadFailure::new(
+            "no_write_permission",
+            format!("无法创建对比目录 {}：{error}", compare_root.display()),
+        )
+    })?;
+    let _compare_staging = CompareStaging(compare_root.clone());
+
+    let mut rows: Vec<CompareRow> = Vec::new();
+    // 包间差异只看最先选中的两份（取不到的那份不算）：更多份两两比只会淹掉真正要决定的那一对。
+    let mut compared: Vec<(String, PathBuf)> = Vec::new();
+
+    for name in &names {
+        let found = package::parse_name(name)
+            .zip(listing.packages.iter().find(|entry| &entry.name == name));
+        let Some((parsed, entry)) = found else {
+            rows.push(failed_row(
+                name,
+                DownloadFailure::new(
+                    "package_not_found",
+                    format!("选中的快照包已不在存储里：{name}"),
+                ),
+            ));
+            continue;
+        };
+
+        // 体积先按列举值判：超限的包不该被整份取到内存里才发现。
+        let limit = package::Limits::default().package_bytes;
+        if entry.size > limit {
+            rows.push(failed_row(
+                name,
+                DownloadFailure::new(
+                    "package_too_large",
+                    format!("包体积 {} 字节，超过上限 {limit} 字节", entry.size),
+                ),
+            ));
+            continue;
+        }
+
+        let target = compare_root.join(name.as_str());
+        let report = fetch_into(store, &compare_root, name, &target).and_then(|_| {
+            plan::plan_snapshot_without_probe(agent_dir, &target)
+                .map_err(|failure| DownloadFailure::new(failure.code, failure.message))
+        });
+
+        match report {
+            Ok(report) => {
+                rows.push(CompareRow {
+                    package: name.clone(),
+                    created_at: snapshot::format_timestamp(parsed.unix_seconds),
+                    fingerprint8: parsed.fingerprint8,
+                    added: Some(report.totals.added),
+                    modified: Some(report.totals.modified),
+                    deleted: Some(report.totals.deleted),
+                    unchanged: Some(report.totals.unchanged),
+                    deleted_paths: report
+                        .plan
+                        .deleted
+                        .iter()
+                        .map(|item| item.path.clone())
+                        .collect(),
+                    error: None,
+                });
+                compared.push((name.clone(), target));
+            }
+            Err(error) => rows.push(failed_row(name, error)),
+        }
+    }
+
+    let pair = match (compared.first(), compared.get(1)) {
+        (Some((left, left_root)), Some((right, right_root))) => {
+            match (
+                plan::read_manifest(left_root),
+                plan::read_manifest(right_root),
+            ) {
+                (Ok(left_manifest), Ok(right_manifest)) => {
+                    let diff = plan::diff_manifests(&left_manifest, &right_manifest);
+                    Some(ComparePair {
+                        left: left.clone(),
+                        right: right.clone(),
+                        added: diff.added,
+                        modified: diff.modified,
+                        removed: diff.removed,
+                    })
+                }
+                // 计划能出表就说明 manifest 读得出来；真读不出来也只是不给包间差异。
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+
+    // 按名字倒序：与历史列表、包名时间序同一套顺序。
+    rows.sort_by(|left, right| right.package.cmp(&left.package));
+
+    Ok(CompareReport { rows, pair })
+}
+
+/// WebDAV 模式的对比：HTTPS 门槛 → 对比。
+///
+/// 门槛放在最前：非 HTTPS 的远端连一个 `PROPFIND` 都不该发。
+pub fn compare_from_webdav(
+    store: &dyn PackageStore,
+    endpoint: &str,
+    app_data: &Path,
+    agent_dir: &Path,
+    requested: &[String],
+) -> Result<CompareReport, DownloadFailure> {
+    if !credentials::is_secure_url(endpoint) {
+        return Err(DownloadFailure::new(
+            "remote_insecure",
+            "WebDAV 地址必须是 HTTPS（本机回环地址例外），否则拒绝取候选包做对比",
+        ));
+    }
+
+    compare_packages(store, app_data, agent_dir, requested)
+}
+
+/// 失败行：本行的计数与路径都不成立，只留错误码与说明。
+fn failed_row(name: &str, error: DownloadFailure) -> CompareRow {
+    // 名字正常来自列举；够不到列举时（包刚被删）只能按解析结果尽力显示。
+    let parsed = package::parse_name(name);
+    CompareRow {
+        package: name.to_string(),
+        created_at: parsed
+            .as_ref()
+            .map(|parsed| snapshot::format_timestamp(parsed.unix_seconds))
+            .unwrap_or_default(),
+        fingerprint8: parsed.map(|parsed| parsed.fingerprint8).unwrap_or_default(),
+        added: None,
+        modified: None,
+        deleted: None,
+        unchanged: None,
+        deleted_paths: Vec::new(),
+        error: Some(error),
+    }
+}
+
+/// 对比用的解包目录：离开作用域就整棵删掉，常驻暂存一份不动。
+struct CompareStaging(PathBuf);
+
+impl Drop for CompareStaging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 /// 解出来的 manifest：给 UI 报创建时间与文件数，也顺带在进计划前挡掉不认识的格式版本。
@@ -547,6 +777,65 @@ mod tests {
         package::pack(&archive, &bytes, &source).unwrap();
 
         archive
+    }
+
+    fn owned(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// live 侧夹具：受管目录里的文件由测试自己摆。
+    fn write_live(agent_dir: &Path, files: &[(&str, &str)]) {
+        for (relative, content) in files {
+            let path = agent_dir.join(relative);
+            fs::create_dir_all(path.parent().expect("文件必须有父目录")).unwrap();
+            fs::write(&path, content).unwrap();
+        }
+    }
+
+    fn local_compare(
+        store_root: &Path,
+        app_data: &Path,
+        agent_dir: &Path,
+        names: &[&str],
+    ) -> Result<CompareReport, DownloadFailure> {
+        compare_packages(
+            &LocalStore::new(store_root.to_path_buf()),
+            app_data,
+            agent_dir,
+            &owned(names),
+        )
+    }
+
+    /// live 目录里每个文件的相对路径与修改时间：只读断言用。
+    fn live_listing(dir: &Path) -> Vec<(String, Option<std::time::SystemTime>)> {
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, Option<std::time::SystemTime>)>) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else {
+                    let relative = path
+                        .strip_prefix(root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.push((
+                        relative,
+                        fs::metadata(&path)
+                            .ok()
+                            .and_then(|meta| meta.modified().ok()),
+                    ));
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
     }
 
     fn staging_entries(app_data: &Path) -> Vec<String> {
@@ -891,6 +1180,22 @@ mod tests {
         fn cleanup(&self, endpoint: &str) -> Result<CleanupOutcome, DownloadFailure> {
             let client = WebdavClient::new(self.remote.clone(), BASE);
             cleanup_from_webdav(&WebdavStore::new(&client), endpoint)
+        }
+
+        fn compare(
+            &self,
+            endpoint: &str,
+            names: &[&str],
+        ) -> Result<CompareReport, DownloadFailure> {
+            let client = WebdavClient::new(self.remote.clone(), BASE);
+            let store = WebdavStore::new(&client);
+            compare_from_webdav(
+                &store,
+                endpoint,
+                &self.app_data(),
+                &self.agent(),
+                &owned(names),
+            )
         }
 
         fn state(&self) -> RemoteState {
@@ -1443,6 +1748,285 @@ pi:1.5.2
             settings
         );
         assert!(applied.backup_dir.starts_with(app_data.join("backups")));
+    }
+
+    #[test]
+    fn compare_rows_are_sorted_and_carry_counts_with_their_paths() {
+        let temp = TempDir::new("compare-rows");
+        let store_root = temp.path().join("cloud");
+        let app_data = temp.path().join("data");
+        let agent_dir = temp.path().join("agent");
+        let oldest = "20261122-105230-aaaaaaaa.zip";
+        let middle = "20261123-101010-bbbbbbbb.zip";
+        let newest = "20261124-111111-cccccccc.zip";
+        write_package(
+            &store_root,
+            oldest,
+            &[("settings.json", "{\"v\":2}"), ("mcp.json", "m")],
+        );
+        write_package(
+            &store_root,
+            middle,
+            &[
+                ("settings.json", "{\"v\":3}"),
+                ("mcp.json", "m"),
+                ("skills/new.md", "n"),
+            ],
+        );
+        write_package(&store_root, newest, &[("settings.json", "{\"v\":4}")]);
+        write_live(
+            &agent_dir,
+            &[
+                ("settings.json", "{\"v\":2}"),
+                ("mcp.json", "m"),
+                ("skills/old.md", "old"),
+            ],
+        );
+
+        let report = local_compare(
+            &store_root,
+            &app_data,
+            &agent_dir,
+            &[oldest, middle, newest],
+        )
+        .expect("对比应成功");
+
+        let names: Vec<&str> = report.rows.iter().map(|row| row.package.as_str()).collect();
+        assert_eq!(names, vec![newest, middle, oldest], "按包名倒序");
+        for row in &report.rows {
+            assert!(row.error.is_none(), "{row:?}");
+            assert_eq!(
+                row.deleted,
+                Some(row.deleted_paths.len()),
+                "「将删除」的计数与逐项路径必须一致"
+            );
+        }
+
+        let unchanged_row = &report.rows[2];
+        assert_eq!(
+            (
+                unchanged_row.added,
+                unchanged_row.modified,
+                unchanged_row.deleted,
+                unchanged_row.unchanged
+            ),
+            (Some(0), Some(0), Some(1), Some(2)),
+            "旧包与 live 只差 skills/old.md"
+        );
+        assert_eq!(unchanged_row.deleted_paths, vec!["skills/old.md"]);
+
+        let mixed = &report.rows[1];
+        assert_eq!(
+            (mixed.added, mixed.modified, mixed.deleted, mixed.unchanged),
+            (Some(1), Some(1), Some(1), Some(1))
+        );
+        assert_eq!(mixed.fingerprint8, "bbbbbbbb");
+        assert_eq!(mixed.created_at, "2026-11-23T10:10:10Z");
+
+        // 包间差异只看最先选中的两份，顺序与候选顺序一致。
+        let pair = report.pair.expect("候选有两份以上应有包间差异");
+        assert_eq!((pair.left.as_str(), pair.right.as_str()), (oldest, middle));
+    }
+
+    #[test]
+    fn compare_pairs_the_first_two_candidates() {
+        let temp = TempDir::new("compare-pair");
+        let store_root = temp.path().join("cloud");
+        let app_data = temp.path().join("data");
+        let agent_dir = temp.path().join("agent");
+        write_package(
+            &store_root,
+            PKG_OLD,
+            &[("settings.json", "{\"v\":1}"), ("AGENTS.md", "#")],
+        );
+        write_package(
+            &store_root,
+            PKG_NEW,
+            &[("settings.json", "{\"v\":2}"), ("skills/a.md", "a")],
+        );
+        write_live(&agent_dir, &[("settings.json", "{\"v\":1}")]);
+
+        let report = local_compare(&store_root, &app_data, &agent_dir, &[PKG_NEW, PKG_OLD])
+            .expect("对比应成功");
+        let pair = report.pair.expect("两份候选应有包间差异");
+
+        assert_eq!(
+            (pair.left.as_str(), pair.right.as_str()),
+            (PKG_NEW, PKG_OLD)
+        );
+        assert_eq!(
+            pair.added,
+            vec!["AGENTS.md".to_string()],
+            "右边有、左边没有"
+        );
+        assert_eq!(pair.modified, vec!["settings.json".to_string()]);
+        assert_eq!(pair.removed, vec!["skills/a.md".to_string()]);
+    }
+
+    #[test]
+    fn compare_lists_deletions_without_deleting_anything() {
+        let temp = TempDir::new("compare-delete");
+        let store_root = temp.path().join("cloud");
+        let app_data = temp.path().join("data");
+        let agent_dir = temp.path().join("agent");
+        write_package(&store_root, PKG_NEW, &[("settings.json", "{}")]);
+        // live 里多出两个受管文件：它们只能进删除候选，而且此时一根指头都不能动。
+        write_live(
+            &agent_dir,
+            &[
+                ("settings.json", "{}"),
+                ("skills/extra-one.md", "one"),
+                ("skills/extra-two.md", "two"),
+            ],
+        );
+
+        let report =
+            local_compare(&store_root, &app_data, &agent_dir, &[PKG_NEW]).expect("对比应成功");
+        let row = &report.rows[0];
+
+        assert_eq!(row.deleted, Some(2));
+        assert_eq!(
+            row.deleted_paths,
+            vec![
+                "skills/extra-one.md".to_string(),
+                "skills/extra-two.md".to_string()
+            ]
+        );
+        for path in &row.deleted_paths {
+            assert!(
+                agent_dir.join(path).exists(),
+                "live 文件不能被对比删掉：{path}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(agent_dir.join("skills/extra-one.md")).unwrap(),
+            "one"
+        );
+    }
+
+    #[test]
+    fn compare_leaves_the_resident_staging_alone() {
+        let temp = TempDir::new("compare-staging");
+        let store_root = temp.path().join("cloud");
+        let app_data = temp.path().join("data");
+        let agent_dir = temp.path().join("agent");
+        write_package(&store_root, PKG_OLD, &[("settings.json", "{\"v\":1}")]);
+        write_package(&store_root, PKG_NEW, &[("settings.json", "{\"v\":2}")]);
+        write_live(&agent_dir, &[("settings.json", "{\"v\":1}")]);
+
+        let store = LocalStore::new(store_root.clone());
+        stage_package(&store, &app_data, Some(PKG_NEW)).expect("先留一份常驻暂存");
+
+        local_compare(&store_root, &app_data, &agent_dir, &[PKG_OLD, PKG_NEW]).expect("对比应成功");
+
+        assert_eq!(
+            staging_entries(&app_data),
+            vec![PKG_NEW.to_string()],
+            "常驻暂存还在，对比目录已删"
+        );
+        assert!(!app_data
+            .join(STAGING_DIR_NAME)
+            .join(COMPARE_DIR_NAME)
+            .exists());
+    }
+
+    #[test]
+    fn compare_reports_a_broken_candidate_and_still_cleans_up() {
+        let temp = TempDir::new("compare-broken");
+        let store_root = temp.path().join("cloud");
+        let app_data = temp.path().join("data");
+        let agent_dir = temp.path().join("agent");
+        let broken = "20261123-101010-bbbbbbbb.zip";
+        write_package(&store_root, PKG_OLD, &[("settings.json", "{\"v\":1}")]);
+        write_package(&store_root, PKG_NEW, &[("settings.json", "{\"v\":2}")]);
+        // 名字合法、内容不是 zip：云盘没传完的残片就是这个样子。
+        fs::write(store_root.join(broken), b"not a zip at all").unwrap();
+        write_live(&agent_dir, &[("settings.json", "{\"v\":1}")]);
+
+        let report = local_compare(
+            &store_root,
+            &app_data,
+            &agent_dir,
+            &[PKG_OLD, broken, PKG_NEW],
+        )
+        .expect("单份坏包不把整张表判失败");
+
+        assert_eq!(report.rows.len(), 3);
+        let failed = report
+            .rows
+            .iter()
+            .find(|row| row.package == broken)
+            .expect("坏包应在表里");
+        let error = failed.error.as_ref().expect("坏包要带失败说明");
+        assert_eq!(error.code, "package_corrupt", "{}", error.message);
+        assert!(failed.deleted.is_none() && failed.deleted_paths.is_empty());
+        for row in report.rows.iter().filter(|row| row.package != broken) {
+            assert!(row.error.is_none(), "其它行照常：{row:?}");
+        }
+        assert!(!app_data
+            .join(STAGING_DIR_NAME)
+            .join(COMPARE_DIR_NAME)
+            .exists());
+    }
+
+    #[test]
+    fn compare_refuses_a_non_https_endpoint_without_sending_a_request() {
+        let fixture = Fixture::new("compare-insecure");
+        fixture.seed(PKG_NEW, &[("settings.json", "{}")]);
+
+        let failure = fixture
+            .compare("http://dav.example.com/dav", &[PKG_NEW])
+            .expect_err("非 HTTPS 必须拒绝");
+
+        assert_eq!(failure.code, "remote_insecure");
+        assert!(
+            fixture.remote.methods().is_empty(),
+            "门槛在最前：一个请求都不该发出"
+        );
+        assert!(staging_entries(&fixture.app_data()).is_empty());
+    }
+
+    #[test]
+    fn compare_is_read_only_for_live_and_remote_state() {
+        let fixture = Fixture::new("compare-read-only");
+        fixture.seed(PKG_OLD, &[("settings.json", "{\"v\":1}")]);
+        fixture.seed(
+            PKG_NEW,
+            &[("settings.json", "{\"v\":2}"), ("AGENTS.md", "#")],
+        );
+        let agent_dir = fixture.agent();
+        write_live(&agent_dir, &[("settings.json", "{\"v\":1}")]);
+        // 先跑一次真下载：本机状态文件本来就是它写的，对比不该再改它。
+        fixture.download(BASE, None).expect("先取一份包");
+
+        let live_before = live_listing(&agent_dir);
+        let state_path = fixture
+            .app_data()
+            .join(remote_state::REMOTE_STATE_FILE_NAME);
+        let state_before = fs::read(&state_path).expect("下载后应留下状态文件");
+        let remote_before = fixture.remote.file_names();
+        let requests_before = fixture.remote.methods().len();
+
+        fixture
+            .compare(BASE, &[PKG_NEW, PKG_OLD])
+            .expect("对比应成功");
+
+        assert_eq!(
+            live_listing(&agent_dir),
+            live_before,
+            "live 的文件与时间不能变"
+        );
+        assert_eq!(
+            fs::read(&state_path).expect("状态文件应还在"),
+            state_before,
+            "对比不写本机状态"
+        );
+        assert_eq!(fixture.remote.file_names(), remote_before, "对比不改远端");
+        assert_eq!(
+            fixture.remote.methods()[requests_before..].to_vec(),
+            vec!["PROPFIND", "GET", "GET"],
+            "只列举 + 取候选包"
+        );
     }
 
     #[test]

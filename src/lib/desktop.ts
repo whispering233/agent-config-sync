@@ -114,6 +114,52 @@ export function listSnapshotPackages(): Promise<PackageList> {
   return invoke<PackageList>('list_snapshot_packages');
 }
 
+/** 对比表的一行：一份候选包对当前配置的只读计划结果。 */
+export type CompareRow = {
+  /** 包名：`<UTC yyyymmdd-HHmmss>-<指纹前 8 位>.zip`。 */
+  package: string;
+  /** 包名时间戳换算成的 RFC 3339 UTC。 */
+  createdAt: string;
+  /** 包名里的指纹前 8 位。 */
+  fingerprint8: string;
+  /** 失败行为 null：下面的计数与路径都不成立。 */
+  added: number | null;
+  modified: number | null;
+  /** 「将删除」：当前配置里有、包里没有的受管文件数。 */
+  deleted: number | null;
+  unchanged: number | null;
+  /** 将被删掉的具体路径。 */
+  deletedPaths: string[];
+  error: { code: string; message: string } | null;
+};
+
+/** 两个候选包之间的文件级差异：`added` 是右边有左边没有。 */
+export type ComparePair = {
+  left: string;
+  right: string;
+  added: string[];
+  modified: string[];
+  removed: string[];
+};
+
+/** 与 Rust 侧 `CompareReport` 一一对应：`rows` 按包名倒序。 */
+export type CompareReport = {
+  rows: CompareRow[];
+  /** 候选少于两份时为 null。 */
+  pair: ComparePair | null;
+};
+
+/**
+ * 对比候选包与当前配置：只读，不改本机配置、不改云端、不写备份。
+ *
+ * 缺省不传名字就没得对比；每份包解到临时目录跑计划，结束后整体清掉。
+ */
+export function compareSnapshotPackages(
+  packages: string[],
+): Promise<CompareReport> {
+  return invoke<CompareReport>('compare_snapshot_packages', { packages });
+}
+
 /** 与 Rust 侧 `CleanupOutcome` 一一对应：清理上传残留的三桶结果。 */
 export type LeftoverCleanup = {
   /** 已删掉的项。 */
