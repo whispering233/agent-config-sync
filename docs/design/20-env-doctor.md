@@ -2,7 +2,7 @@
 
 ## 1. 原则
 
-- **只读**：环境检测自身不写任何文件、不改环境变量、不装任何东西。
+- **只读**：环境检测自身不写任何文件、不改环境变量、不装任何东西。技能盘点是独立显式动作，不并入环境检测：它会启动宿主 RPC，宿主可能在缺失时创建空 `auth.json`/`models-store.json`，UI 必须提示并报告。
 - **修复是独立动作**：每个建议都由用户单独点击触发，且先展示将执行的命令。
 - **区分"没装"与"装了但坏了"**：命令存在但 `--version` 失败，与命令不存在是两种状态。
 - **不修改 shell 启动文件**。环境变量只给命令或写入用户级环境（Windows），不改 `.zshrc`。
@@ -23,8 +23,9 @@
 | `pi.latest` | 仅点「检查更新」时执行 `npm view @earendil-works/pi-coding-agent version`；10 秒超时，最多 2 并发 | 可解析/未发布/未知 | 提示升级 |
 | `auth` | 对已配置的 provider 执行 `pi auth check --provider <id> --json` | `ready` / `not_ready` / `invalid` | 在终端执行 `pi auth login <provider>` |
 | `packages` | 读 `settings.json` 的 `packages` + 解析 `pi list` 文本；实装条目带版本号（读**宿主目录内**安装目录 `package.json` 的 `version` 字段，读不到或落在宿主目录之外则留空） | 声明与实装一致/缺包 | 一键重装 |
-| `skills.links` | 统计 `skills/` 下的链接类条目与断链（POSIX 符号链接；Windows 符号链接与 junction） | 有断链 | 提示重建 |
-| `conflicts` | 受管范围内匹配 `*-冲突*` / `*-NSConflict*` | 有冲突 | 打开冲突处理 |
+| `skills.links` | 递归统计 `<agent_dir>/skills` 与 `~/.agents/skills` 下的链接类条目与断链（POSIX 符号链接；Windows 符号链接与 junction） | 有断链 | 提示重建 |
+| `skills.list` | 独立命令，仅用户点“刷新技能”时执行：`pi --mode rpc --offline --no-session --no-extensions --no-approve` + `get_commands`，过滤 `source == "skill"`；按 `sourceInfo.path/scope/origin` 标注来源与是否随快照 | 可读/不可读；报告宿主创建的空文件 | 展示技能卡片，不自动修复 |
+| `conflicts` | 两个受管根内匹配 `*-冲突*` / `*-NSConflict*` | 有冲突 | 打开冲突处理 |
 | `snapshot` | 快照目录与 `manifest.json` 存在性、格式版本、哈希、创建时间 | 可用/不完整/不存在 | 重新上传或检查云盘 |
 | `json.parse` | 解析受管 JSON 文件（容忍 JSON5 注释） | 可解析 | 展示错误位置 |
 
@@ -40,6 +41,9 @@
 - **区分状态**：`found` / `not_found` / `broken`（存在但执行失败）/ `unknown`（超时或输出不可解析）。
 - **不打印密钥**：命令输出在落日志前统一过滤（`sk-`、`Bearer`、`token=` 等模式）。
 - **不并发狂扫**：同时最多 2 个子进程，避免在低配机器上拖慢宿主。版本查询也只在这个上限内并发。
+- **技能盘点复用宿主自身**：`skills.list` 走 `pi` RPC，不在 Rust 侧重写技能发现与 frontmatter 校验。命令 15 秒超时，不重试；stdin 关闭后宿主自行退出，超时按进程树终止。`--no-extensions` 会漏掉扩展运行时动态注册的技能，这类技能本来也不在快照内，UI 需注明。
+- **技能盘点的副作用**：只在用户显式点击后执行，不随页面加载自动跑。命令执行前后比较 `<agent_dir>/auth.json` 与 `<agent_dir>/models-store.json`，把本次新出现的文件放进 `createdFiles` 并在 UI 告警；已存在时内容不变。不删除宿主创建的空文件。
+- 如果 `auth.json` 原本不存在，RPC 会创建空 `{}`；后续导出会把它当作源机凭据状态纳入并标记 `plaintextSecrets`，应用端会覆盖目标 `auth.json`（覆盖前有备份）。首次点击的提示必须写明这一点，而不是只说“可能创建缓存文件”。
 - **最新版本缓存**：结果写入应用配置目录的 `versions-cache.json`，TTL 6 小时；「开始检查」只读缓存，只有「检查更新」才联网。刷新全部失败时保留旧缓存并提示；404/401 记为未发布/未知，不算失败。
 - **只查 npm 源**：`npm:包名` 才查询；git/URL/本地路径标「不适用」；带范围或非精确版本的来源标「未固定」，不拿远端 latest 冒充。
 - **不弹控制台**：GUI 进程起子进程时带 `CREATE_NO_WINDOW`；否则从 Explorer 启动后每次探测都会闪出终端窗口。
@@ -72,6 +76,38 @@
 ```
 
 `status`：`pass` / `warn` / `fail` / `unknown`。`action` 是建议动作的 id，不内嵌命令文本。
+
+### 技能盘点
+
+技能清单是独立命令，不并入 `run_check`，避免每次环境检测都启动宿主进程。输出是结构化列表，不是 `Check`：
+
+```json
+{
+  "skills": [
+    {
+      "name": "council-mode",
+      "description": "…",
+      "path": "/home/u/.agents/skills/council-mode/SKILL.md",
+      "root": "agents-skills",
+      "snapshot": true,
+      "source": "user"
+    }
+  ],
+  "createdFiles": [],
+  "warnings": []
+}
+```
+
+`createdFiles` 是本次 RPC 在 agent 目录新创建的文件（通常是 `auth.json`、`models-store.json`）；不是错误，但必须在 UI 明示。
+
+分类规则：
+
+- `<agent_dir>/skills` → `root: agent`，随快照。
+- `~/.agents/skills` → `root: agents-skills`，随快照。
+- `origin: package` → 包提供，不随快照，随包重装。
+- 其它宿主目录内路径或 `settings.skills` 外部路径 → 不随快照，展示原因。
+- 项目级技能不出现（命令以应用自己的中性目录为 cwd，不读项目配置）。
+- 盘点只列宿主实际加载的技能；frontmatter 无效或名称冲突被宿主跳过的 `SKILL.md` 不会出现，但导出仍会按文件收录。UI 需说明这个边界。
 
 ## 5. 宿主安装与升级
 

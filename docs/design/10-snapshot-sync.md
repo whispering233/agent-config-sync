@@ -38,13 +38,15 @@
 │   ├── extensions/
 │   ├── prompts/
 │   ├── themes/
-│   └── agents/
+│   ├── agents/
+│   └── external/
+│       └── agents-skills/     # ~/.agents/skills
 └── manifest.json              # 最后写入
 ```
 
 WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结构与本地模式一致（见 `40-webdav.md`）。
 
-快照目录本身不包含：`sessions/`、`npm/`、`install/`、缓存与状态文件；只包含宿主目录根级的 `auth.json`，子目录同名文件仍排除。
+快照目录本身不包含：`sessions/`、`npm/`、`install/`、缓存与状态文件；只包含 agent 根级的 `auth.json`，子目录同名文件（含 `~/.agents/skills` 内）仍排除。
 
 ## 3. 受管范围（白名单 / 排除）
 
@@ -57,6 +59,7 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
 | `AGENTS.md` / `SYSTEM.md` / `APPEND_SYSTEM.md` | 指令与系统提示 |
 | `keybindings.json` | 偏好，无密钥 |
 | `skills/` `extensions/` `prompts/` `themes/` `agents/` | 资源目录 |
+| `~/.agents/skills/` | 用户级 Agent Skills 目录；`pi` 本来就加载它。作为第二个受管根，快照内路径为 `snapshot/external/agents-skills/` |
 
 ### 排除
 
@@ -74,6 +77,15 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
 
 排除项以"名称/路径规则"匹配，不按大小判断。规则集中在一处定义，UI 可展示但不可编辑（避免用户把 `sessions/` 加进来）。
 
+### 多根规则
+
+- `agent` 根：`<agent_dir>`，始终纳入。
+- `agents-skills` 根：`<home>/.agents/skills`，仅当源机存在该目录时纳入；不存在则不声明，目标机完全不读、不写、不删。存在但为空也声明，目标机多出的技能会列为删除候选。存在但不可读或不是目录时导出失败；是断链时按不存在处理并告警。
+- 根的类型（真实目录/符号链接）不进入快照：根是链接时跟随读取内容，导出与应用各给一条告警；apply 不重建根链接。根链接不按“链接之下跳过”处理——它是根的边界，不是 manifest 条目；写入/删除会落到链接目标，UI 必须明示。
+- 项目级 `.pi/skills`、祖先 `.agents/skills` 与 `settings.json` 的 `skills` 指向的其它外部路径不纳管，只在技能盘点中展示。
+- 包内 `skills/` 不进快照；包体在 `npm/`，由目标机重装声明包恢复。
+- 两个根可能包含同一份技能：`<agent_dir>/skills` 下的链接如果指向 `~/.agents/skills`，快照会按现有“链接物化”规则各存一份，不去重。目标机保留 agent 链接并写入外部根，`pi` 按真实路径去重。
+
 ### 符号链接
 
 - 导出：**物化复制**目标内容，并在 manifest 的 `symlinks` 中记录 `{path, target}`。
@@ -87,8 +99,9 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
 
 ```json
 {
-  "formatVersion": 2,
+  "formatVersion": 3,
   "profileId": "default",
+  "managedRoots": ["agent", "agents-skills"],
   "createdAt": "2026-11-20T05:30:00Z",
   "fingerprint": "a1b2c3d4e5f6",
   "source": {
@@ -100,7 +113,8 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
   },
   "requirements": { "node": ">=22.19.0", "pi": ">=1.5.0" },
   "files": [
-    { "path": "snapshot/settings.json", "sha256": "…", "size": 1234, "kind": "json" }
+    { "path": "snapshot/settings.json", "sha256": "…", "size": 1234, "kind": "json" },
+    { "path": "snapshot/external/agents-skills/foo/SKILL.md", "sha256": "…", "size": 456, "kind": "markdown" }
   ],
   "symlinks": [{ "path": "snapshot/skills/antd", "target": "../../../.agents/skills/antd" }],
   "requiredPackages": [{ "source": "npm:pi-web-access", "enabled": true }],
@@ -108,20 +122,22 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
 }
 ```
 
+- `managedRoots`：本快照受管的根 id。`agent` 始终存在；`agents-skills` 仅在源机存在 `~/.agents/skills` 时出现。未知 id 视为格式不支持；缺字段或缺少 `agent` 视为损坏。
+- 快照不记录 home 绝对路径；`agents-skills` 在 apply 时解析为当前机器的 `<home>/.agents/skills`。目标根不存在时按快照创建；是文件、不可写或落在链接外的非法路径时失败。
 - `source.pi` / `source.node`：导出时按环境检测同一组探测取版本（能解析就规范成 `x.y.z`），探测不到记 `null`；只作来源记录，不参与指纹与冲突判定。
-- `fingerprint`：对 `formatVersion` 与所有 `{path, sha256}` 排序后取哈希，显示前 12 位。用途：两台机器肉眼核对"是不是同一份快照"。
+- `fingerprint`：对 `formatVersion`、排序后的 `managedRoots` 与所有 `{path, sha256}` 排序后取哈希，显示前 12 位。用途：两台机器肉眼核对"是不是同一份快照"；`managedRoots` 不同（例如一个声明了空的外部根、另一个没有）必须得到不同指纹。
 - manifest **最后写**：文件先落盘，manifest 落盘即代表快照完整。
-- 未知或过期的 `formatVersion` 一律拒绝读取，不尝试兼容；v1 快照需在源机升级后重新导出。
+- 未知或过期的 `formatVersion` 一律拒绝读取，不尝试兼容；v2 及更早快照需在源机升级后重新导出。v3 是当前唯一写入格式。
 - `plaintextSecrets: true` 表示快照包含 `auth.json` 或扫描到高危明文，导入端据此告警。
 
 ## 5. 导出（上传快照）
 
 ```text
 1. 预检
-   ├─ 快照根目录存在且可写；不在受管范围内（禁止快照目录嵌进 agent 目录）
+   ├─ 快照根目录存在且可写；不在受管范围内（禁止快照目录嵌进 agent 目录或 ~/.agents/skills）
    ├─ 宿主进程提示："Pi 正在运行，配置可能继续变化"（仅提示，不阻断）
    └─ 应用配置已记录 agent 目录
-2. 收集        按受管范围遍历；符号链接物化；断链跳过并记录
+2. 收集        按 `managedRoots` 遍历两个根；符号链接物化；断链跳过并记录
 3. 扫描        对全部文本文件做只读密钥扫描；命中只记录，不改写、不阻断
 4. 权限        快照目录 0700；根级 auth.json 强制 0600
 5. 写文件      先写临时目录，全部成功后再替换 snapshot/
@@ -146,9 +162,10 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
    ├─ 明文密钥扫描 → 命中：警告 + 允许继续
    ├─ 快照含 auth.json → 警告：会覆盖本机凭据
    └─ 目标目录可写
-3. 生成计划     新增 / 修改 / 删除（删除仅在受管范围内）
-4. 预览         展示每项差异与来源（diff 文本摘要 + 大小 + 时间）
+3. 生成计划     新增 / 修改 / 删除（删除仅在 manifest 声明的受管根内）
+4. 预览         展示每项差异与来源（diff 文本摘要 + 大小 + 时间 + 所属根）
    ├─ 删除项默认不勾选，需逐项确认
+   ├─ 外部根的删除只能逐项勾选；"全选"只作用于 agent 根
    └─ 展示 requiredPackages 待办
 5. 应用前复核   重算计划并按 fingerprint 比对；不一致 → `plan_stale`，整次拒绝
    备份         把将被覆盖/删除的文件与祖先链接复制到本机备份目录
@@ -167,6 +184,7 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
 
 - 不需要本机历史状态；因此**本机新加、尚未导出的受管文件也会出现在删除候选里**。这是有意的：必须让人看见。
 - 删除项默认不勾选；不勾选即保留。
+- `agents-skills` 根的删除候选只能逐项勾选；"全选"只选 `agent` 根。外部根条目在 UI 标注"共享目录，其它 agent 工具也可能使用"。
 - 受管范围之外的文件永不删除。
 
 ### 状态机
@@ -182,11 +200,12 @@ idle → reading → verifying → planning → previewing → backing-up → ap
 
 ```text
 <app-data>/backups/<UTC 时间戳>/
-├── files/<相对路径>       # 将被覆盖或删除的现有文件内容
+├── files/<虚拟路径>       # 将被覆盖或删除的现有文件内容；外部根用 external/agents-skills/...
 └── restore.json           # { version, createdAt, fingerprint, entries[] }
 ```
 
-- `entries`：`{ path, kind: file|symlink|dir, existed, mode, linkTarget }`。符号链接只记录目标，不复制内容；`existed: false` 表示该路径是应用新增的。`mode` 为 `null` 表示平台不提供权限位（Windows）或条目无需权限（链接、目录）。
+- `entries`：`{ path, root, kind: file|symlink|dir, existed, mode, linkTarget }`。`path` 是快照虚拟路径，`root` 是 `agent` 或 `agents-skills`；符号链接只记录目标，不复制内容；`existed: false` 表示该路径是应用新增的。`mode` 为 `null` 表示平台不提供权限位（Windows）或条目无需权限（链接、目录）。
+- `restore.json` 版本为 2；版本 1 的旧备份没有 `root`，按 `agent` 读取。
 - 位置在本机应用数据目录（**不放云盘**）；目录权限 `0700`。
 - 覆盖/删除前备份；被物化替换的祖先链接也会记录，便于回滚恢复链接。
 - 保留最近 10 份，超出清理最旧。
@@ -195,7 +214,7 @@ idle → reading → verifying → planning → previewing → backing-up → ap
 
 ## 8. 冲突文件
 
-- **已实现（只读）**：扫描受管范围内匹配 `*-冲突*` 与 `*-NSConflict*` 的文件，与对应原文件配对，输出行数、差异行数、首处差异行号；孤儿副本、二进制、超 1 MB、不可读单独标记。
+- **已实现（只读）**：扫描 manifest 声明的两个受管根内匹配 `*-冲突*` 与 `*-NSConflict*` 的文件，与对应原文件配对，输出行数、差异行数、首处差异行号；孤儿副本、二进制、超 1 MB、不可读单独标记。外部根条目带 `root: agents-skills` 标记。
 - **未实现**：处理动作与 UI（保留原文件 / 用冲突副本替换 / 暂不处理），见 `backlog.md`。
 - 原则：不自动合并，不自动删除。
 
@@ -203,7 +222,9 @@ idle → reading → verifying → planning → previewing → backing-up → ap
 
 | code | 含义 |
 | :--- | :--- |
-| `manifest_missing` / `manifest_corrupt` / `manifest_unsupported` | 快照缺失、无法解析或格式版本不支持 |
+| `manifest_missing` / `manifest_corrupt` / `manifest_unsupported` | 快照缺失、无法解析或格式版本/受管根 id 不支持 |
+| `external_root_invalid` / `external_root_unreadable` | `~/.agents/skills` 存在但不是目录 / 无法读取 |
+| `home_dir_missing` | manifest 声明了 `agents-skills`，但本机无法解析 home 目录 |
 | `hash_mismatch` | 快照文件与 manifest 不一致 |
 | `plan_stale` | 应用前重算的指纹与用户确认时不同 |
 | `delete_not_in_plan` | 请求删除的路径不在本次计划或受管范围内 |
@@ -230,5 +251,8 @@ idle → reading → verifying → planning → previewing → backing-up → ap
 - `auth.json` 整文件覆盖，不按 provider 合并；本机独有登录由覆盖前备份兜底。
 - 计划只读取快照声明的链接；快照没声明的链接整棵跳过，不读取目标，也不把目标内容列为删除候选。
 - 跨平台路径差异（扩展内绝对路径、MCP `cwd`）不做翻译，只在预览中提示。
+- 受管根的类型不进入快照：根是符号链接时只同步内容，不重建根链接；目标机保留自己的根布局。
+- 仅纳管用户级 `~/.agents/skills`；项目级目录与 `settings.skills` 的其它外部路径不纳管。
+- 包内技能不复制进快照；目标机需安装声明的包才能恢复。
 - 远端上传是"整份 manifest + 变更文件"，不做断点续传与限流退避。
 - 远端不被当前快照引用的旧文件不自动删除，也不会被下载端应用。
