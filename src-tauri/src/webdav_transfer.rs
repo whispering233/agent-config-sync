@@ -774,7 +774,7 @@ mod tests {
     use crate::snapshot::{
         fingerprint, ManifestFile, Requirements, SourceInfo, FORMAT_VERSION, PROFILE_ID,
     };
-    use crate::webdav::{DavError, DavRequest, DavResponse};
+    use crate::webdav::{DavError, DavRequest, DavResponse, ReqwestTransport};
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
@@ -1604,18 +1604,46 @@ mod tests {
         assert!(load_state(&app_data).expect("读状态").is_some());
     }
 
+    /// 真机测试的凭据：环境变量齐全就用环境变量，否则读 `DAV_CREDENTIALS_DIR` 下已保存的
+    /// `webdav.json`，两者都没有就明确跳过。
+    ///
+    /// 第二级是为让密码不进命令行、也不进任何输出：本机已保存的凭据直接拿来跑。
+    /// 缺凭据时跳过而不是 panic：真机条件不该把常规 `cargo test` 拖红。
+    fn interop_credentials() -> Option<(String, ReqwestTransport)> {
+        if let (Ok(url), Ok(user), Ok(pass)) = (
+            std::env::var("DAV_URL"),
+            std::env::var("DAV_USER"),
+            std::env::var("DAV_PASS"),
+        ) {
+            return Some((
+                url,
+                ReqwestTransport::new(&user, &pass).expect("构造 transport"),
+            ));
+        }
+
+        if let Ok(dir) = std::env::var("DAV_CREDENTIALS_DIR") {
+            let credentials = crate::credentials::load(Path::new(&dir))
+                .expect("读取凭据文件")
+                .expect("凭据目录下应有 webdav.json");
+            let transport = ReqwestTransport::new(&credentials.username, &credentials.password)
+                .expect("构造 transport");
+            return Some((credentials.url, transport));
+        }
+
+        println!("跳过真机测试：没有 DAV_URL/DAV_USER/DAV_PASS，也没有 DAV_CREDENTIALS_DIR");
+        None
+    }
+
     /// 真机互通检查：需要一个真实 WebDAV 服务器（本地 `webdav-server` 或坚果云均可）。
-    /// 手动跑：`DAV_URL=… DAV_USER=… DAV_PASS=… cargo test interop -- --ignored --nocapture`
+    /// 手动跑：`DAV_CREDENTIALS_DIR=… cargo test interop -- --ignored --nocapture`
     /// 它验证的是假 transport 覆盖不到的部分：Basic 认证、真实 XML、中文路径编码、条件写入。
     /// 注意：会覆盖该地址下 `PiAgentSync/` 的内容，只对测试账号跑。
     #[test]
-    #[ignore = "需要真实 WebDAV 服务器与凭据（DAV_URL / DAV_USER / DAV_PASS）"]
+    #[ignore = "需要真实 WebDAV 服务器与凭据"]
     fn interop_roundtrip_against_a_real_server() {
-        let url = std::env::var("DAV_URL").expect("需要 DAV_URL");
-        let user = std::env::var("DAV_USER").expect("需要 DAV_USER");
-        let pass = std::env::var("DAV_PASS").expect("需要 DAV_PASS");
-
-        let transport = crate::webdav::ReqwestTransport::new(&user, &pass).expect("构造 transport");
+        let Some((url, transport)) = interop_credentials() else {
+            return;
+        };
         let client = WebdavClient::new(transport, &url);
 
         let temp = TempDir::new("interop");
@@ -1705,13 +1733,11 @@ mod tests {
     /// 条件写诊断：看服务端到底给不给 ETag、认不认 If-Match。
     /// 只在一个临时文件上试，不碰 manifest，跑完删掉。
     #[test]
-    #[ignore = "需要真实 WebDAV 服务器与凭据（DAV_URL / DAV_USER / DAV_PASS）"]
+    #[ignore = "需要真实 WebDAV 服务器与凭据"]
     fn interop_probes_conditional_write() {
-        let url = std::env::var("DAV_URL").expect("需要 DAV_URL");
-        let user = std::env::var("DAV_USER").expect("需要 DAV_USER");
-        let pass = std::env::var("DAV_PASS").expect("需要 DAV_PASS");
-
-        let transport = crate::webdav::ReqwestTransport::new(&user, &pass).expect("构造 transport");
+        let Some((url, transport)) = interop_credentials() else {
+            return;
+        };
         let client = WebdavClient::new(transport, &url);
 
         client.mkcol("").expect("工作根应可创建或已存在");
@@ -1740,6 +1766,217 @@ mod tests {
         }
 
         client.delete("etag-probe.txt").expect("清理探针文件");
+    }
+
+    /// `PROPFIND` 只问会不会回元素，不问具体值，所以四个属性一次问全。
+    const MOVE_PROBE_PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getcontentlength/><d:getetag/><d:getlastmodified/></d:prop></d:propfind>"#;
+
+    /// `MOVE` 定案探测：上传定案是「`PUT` 临时名 → `MOVE` 正式名」，而 `MOVE` 与
+    /// `Overwrite: F` 的具体行为依赖服务商实现，只能真机验证。
+    ///
+    /// 只写 `.tmp-probe-*`，不碰任何已有文件；结束删净并 `PROPFIND` 复核。
+    /// 输出只有状态码、布尔值与长度：不带凭据，也不带 XML 原文。
+    #[test]
+    #[ignore = "需要真实 WebDAV 服务器与凭据"]
+    fn interop_probes_move_semantics() {
+        let Some((base, transport)) = interop_credentials() else {
+            return;
+        };
+
+        let root = format!("{}/PiAgentSync", base.trim_end_matches('/'));
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("读时钟")
+            .as_nanos();
+        let stamp_text = stamp.to_string();
+        let (name, moved, dup) = (
+            format!(".tmp-probe-{stamp}"),
+            format!(".tmp-probe-{stamp}-moved"),
+            format!(".tmp-probe-{stamp}-dup"),
+        );
+
+        // 只在这一处拼请求：探针要的是原始状态码，不是 `WebdavClient` 的解释结果。
+        let send = |method: &str,
+                    path: &str,
+                    headers: Vec<(String, String)>,
+                    body: Option<Vec<u8>>,
+                    timeout: std::time::Duration|
+         -> DavResponse {
+            let url = if path.is_empty() {
+                root.clone()
+            } else {
+                format!("{root}/{path}")
+            };
+            transport
+                .send(DavRequest {
+                    method: method.to_string(),
+                    url,
+                    headers,
+                    body,
+                    timeout,
+                })
+                .expect("传输失败")
+        };
+        let propfind_root = || {
+            send(
+                "PROPFIND",
+                "",
+                vec![
+                    ("Depth".to_string(), "1".to_string()),
+                    (
+                        "Content-Type".to_string(),
+                        "application/xml; charset=utf-8".to_string(),
+                    ),
+                ],
+                Some(MOVE_PROBE_PROPFIND_BODY.as_bytes().to_vec()),
+                crate::webdav::CONTROL_TIMEOUT,
+            )
+        };
+        let move_headers = |destination: &str| {
+            vec![
+                ("Overwrite".to_string(), "F".to_string()),
+                ("Destination".to_string(), format!("{root}/{destination}")),
+            ]
+        };
+
+        // 1. 工作根不存在就建；405/301/302 是「已存在」。
+        let status = send(
+            "MKCOL",
+            "",
+            Vec::new(),
+            None,
+            crate::webdav::CONTROL_TIMEOUT,
+        )
+        .status;
+        let root_ready = matches!(status, 200 | 201 | 204 | 301 | 302 | 405);
+        println!("1. MKCOL 工作根：{status}（可用或已存在：{root_ready}）");
+        assert!(root_ready, "工作根既没建出来也不是已存在：HTTP {status}");
+
+        // 2. 先 PUT 到临时名，正式名由下一步的 `MOVE` 产生。
+        let status = send(
+            "PUT",
+            &name,
+            Vec::new(),
+            Some(b"probe-one".to_vec()),
+            crate::webdav::TRANSFER_TIMEOUT,
+        )
+        .status;
+        println!(
+            "2. PUT 临时名：{status}（成功：{}）",
+            (200..300).contains(&status)
+        );
+        assert!(
+            (200..300).contains(&status),
+            "PUT 临时名失败：HTTP {status}"
+        );
+
+        // 3. MOVE 到正式名：`MOVE` 不可用时这一步失败，探测继续跑完并如实汇报。
+        let status = send(
+            "MOVE",
+            &name,
+            move_headers(&moved),
+            None,
+            crate::webdav::CONTROL_TIMEOUT,
+        )
+        .status;
+        let move_available = matches!(status, 201 | 204);
+        println!("3. MOVE → 正式名：{status}（可用：{move_available}）");
+        if !move_available {
+            println!("   ⚠ MOVE 不可用：403/405/501 等服务商限制，上传定案需重新决策");
+        }
+
+        // 4. 第二个临时文件：用于验证目标已存在时 `Overwrite: F` 是否真的生效。
+        let status = send(
+            "PUT",
+            &dup,
+            Vec::new(),
+            Some(b"probe-two".to_vec()),
+            crate::webdav::TRANSFER_TIMEOUT,
+        )
+        .status;
+        println!(
+            "4. PUT 第二个临时名：{status}（成功：{}）",
+            (200..300).contains(&status)
+        );
+
+        // 5. 目标是已存在的名字：期望 409 或 412。
+        let status = send(
+            "MOVE",
+            &dup,
+            move_headers(&moved),
+            None,
+            crate::webdav::CONTROL_TIMEOUT,
+        )
+        .status;
+        println!("5. MOVE → 已存在的名字（Overwrite: F）：{status}");
+        if !move_available {
+            println!("   （第 3 步已判 MOVE 不可用，本步状态码不可解释）");
+        } else if matches!(status, 201 | 204) {
+            println!("   ⚠ 服务端忽略了 Overwrite: F：已存在的目标被覆盖");
+        } else if !matches!(status, 409 | 412) {
+            println!("   ⚠ 预期之外的状态码（期望 409 或 412）");
+        } else {
+            println!("   Overwrite: F 生效：已存在的目标被拒");
+        }
+
+        // 6. ETag 响应头：只报有无与长度，值本身不打印。
+        let response = send(
+            "GET",
+            &moved,
+            Vec::new(),
+            None,
+            crate::webdav::TRANSFER_TIMEOUT,
+        );
+        let etag = response
+            .headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case("etag"))
+            .map(|(_, value)| value.clone());
+        println!(
+            "6. GET 正式名：{}；ETag 响应头：{}（长度 {}）",
+            response.status,
+            if etag.is_some() { "Some" } else { "None" },
+            etag.as_ref().map_or(0, String::len)
+        );
+
+        // 7. PROPFIND 是否回那两个后续要用的属性；只按元素名判断，不打印 XML。
+        let response = propfind_root();
+        let body = String::from_utf8_lossy(&response.body);
+        println!(
+            "7. PROPFIND Depth:1：{}；getetag 元素：{}；getlastmodified 元素：{}（响应 {} 字节）",
+            response.status,
+            body.contains("getetag"),
+            body.contains("getlastmodified"),
+            response.body.len()
+        );
+
+        // 8. 只删自己的三个探针名（`name` 可能已被 MOVE 走，404 不算失败），再列一次复核。
+        for probe in [&name, &moved, &dup] {
+            let status = send(
+                "DELETE",
+                probe,
+                Vec::new(),
+                None,
+                crate::webdav::CONTROL_TIMEOUT,
+            )
+            .status;
+            let gone = (200..300).contains(&status) || status == 404;
+            println!("8. DELETE 探针：{status}（已清理：{gone}）");
+        }
+
+        let response = propfind_root();
+        let body = String::from_utf8_lossy(&response.body);
+        let leftover = body.contains(&stamp_text);
+        println!(
+            "8. 清理复核 PROPFIND：{}；仍有本次探针：{leftover}",
+            response.status
+        );
+        assert!(
+            !leftover,
+            "清理后 PROPFIND 仍列出本次探针（HTTP {}）",
+            response.status
+        );
     }
 
     #[test]

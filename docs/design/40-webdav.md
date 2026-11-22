@@ -80,7 +80,7 @@
 | `PROPFIND` 单次最多列出 750 项 | 保留 20 份，远低于上限；不对列表做分页 |
 | 根目录下的集合 `DELETE` 返回 403 | 工作根固定为子目录 `PiAgentSync/`；删的是包文件不是目录 |
 
-**待真机复核（`40-webdav.md` 的前置验证项）**：`MOVE` 在坚果云上的实际行为、`GET`/`HEAD` 是否返回 ETag、`PROPFIND` 是否提供 `getlastmodified`。本设计**不依赖**后两项；若 `MOVE` 不可用，上传定案退回"直接 `PUT` 正式名 + 下载端哈希校验"，并接受"坏包会先进列表"的代价。
+**真机实测**（坚果云）：`MOVE` 可用，临时名 → 正式名回 201；`Overwrite: F` 生效，目标已存在时回 409 而不是覆盖；`GET` 返回 `ETag` 响应头；`PROPFIND` 提供 `getetag` 与 `getlastmodified`。第 5 节的 `MOVE` 定案成立。
 
 ## 5. 上传
 
