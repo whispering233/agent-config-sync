@@ -74,6 +74,28 @@ pub(crate) fn is_npm_install_path(entry: &str) -> bool {
         .any(|segment| segment.eq_ignore_ascii_case("node_modules"))
 }
 
+/// `path` 是否在 `dir` 之下（含相等）。按段比较，`skills` 不会误配 `skills-old`；
+/// Windows 文件系统不分大小写，宿主报的路径大小写可能与受管根不同，所以那里的段比较忽略大小写。
+pub(crate) fn path_starts_with(path: &Path, dir: &Path) -> bool {
+    path_starts_with_folding(path, dir, cfg!(windows))
+}
+
+/// 把「是否折叠大小写」抽成参数：两条分支都不依赖运行平台就能验证。
+fn path_starts_with_folding(path: &Path, dir: &Path, fold_case: bool) -> bool {
+    let mut path_parts = path.components();
+    dir.components().all(|dir_part| {
+        path_parts
+            .next()
+            .is_some_and(|path_part| match (fold_case, path_part == dir_part) {
+                (false, equal) => equal,
+                (true, _) => path_part
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&dir_part.as_os_str().to_string_lossy()),
+            })
+    })
+}
+
 /// 删掉链接本身，不跟进去。Unix 上任何链接都走 `remove_file`；
 /// Windows 上目录型链接（junction、目录符号链接）只能按目录删，否则报拒绝访问。
 #[cfg(not(windows))]
@@ -469,6 +491,38 @@ mod tests {
         assert!(!is_npm_install_path(
             "C:\\Users\\u\\.pi\\agent\\bin\\pi.cmd"
         ));
+    }
+
+    #[test]
+    fn path_prefix_compares_whole_segments() {
+        let root = Path::new("/home/u/.pi/agent/skills");
+
+        assert!(path_starts_with(
+            Path::new("/home/u/.pi/agent/skills/review/SKILL.md"),
+            root
+        ));
+        assert!(path_starts_with(root, root), "根本身也算在根内");
+        assert!(!path_starts_with(
+            Path::new("/home/u/.pi/agent/skills-old/review/SKILL.md"),
+            root
+        ));
+        assert!(!path_starts_with(Path::new("/home/u/.pi/agent"), root));
+    }
+
+    #[test]
+    fn path_prefix_only_ignores_case_when_asked() {
+        // 用 `/` 分隔：两条平台都把它当分隔符，段级比较本身跟平台无关。
+        let root = Path::new("/home/u/.pi/agent/skills");
+        let path = Path::new("/home/u/.pi/Agent/Skills/review/SKILL.md");
+
+        assert!(
+            path_starts_with_folding(path, root, true),
+            "Windows 文件系统不分大小写：宿主报的写法不同也要归到同一个根"
+        );
+        assert!(
+            !path_starts_with_folding(path, root, false),
+            "POSIX 按字节比，大小写不同就是不同目录"
+        );
     }
 
     #[test]

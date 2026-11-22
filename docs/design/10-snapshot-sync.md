@@ -218,8 +218,9 @@ idle → reading → verifying → planning → previewing → backing-up → ap
 
 ## 8. 冲突文件
 
-- **已实现（只读）**：扫描宿主目录（`agent` 根）内匹配 `*-冲突*` 与 `*-NSConflict*` 的文件，与对应原文件配对，输出行数、差异行数、首处差异行号；孤儿副本、二进制、超 1 MB、不可读单独标记。
-- **未实现**：当前只扫宿主目录。外部根（`~/.agents/skills`）的扫描与条目上的 `root: agents-skills` 标记随技能盘点接入（目标见 `20-env-doctor.md` 的 `conflicts` 一行）；处理动作与 UI（保留原文件 / 用冲突副本替换 / 暂不处理）见 `backlog.md`。
+- **已实现（只读）**：扫描两个受管根（`agent` 根与 `~/.agents/skills`）内匹配 `*-冲突*` 与 `*-NSConflict*` 的文件，与对应原文件配对，输出行数、差异行数、首处差异行号；孤儿副本、二进制、超 1 MB、不可读单独标记。
+- 条目带 `root`（`agent` / `agents-skills`），`original` 与 `conflict` 仍相对各自根；结果按 (root, 根内路径) 升序。外部根按与导出相同的范围判定（整棵纳入，根级与子目录的 `auth.json` 除外）；根不存在就跳过，是链接时按链接目标的实际内容扫描。
+- **未实现**：处理动作与 UI（保留原文件 / 用冲突副本替换 / 暂不处理）见 `backlog.md`。
 - 原则：不自动合并，不自动删除。
 
 ## 9. 失败码
