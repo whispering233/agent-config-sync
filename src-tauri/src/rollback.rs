@@ -449,7 +449,7 @@ fn run(app: &AppHandle, backup_id: &str, confirm: bool) -> Result<RestoreReport,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::apply::BACKUP_RETENTION;
+    use crate::config::DEFAULT_BACKUP_RETENTION;
     #[cfg(unix)]
     use crate::doctor::{CommandOutcome, CommandRunner};
     #[cfg(unix)]
@@ -1004,7 +1004,7 @@ mod tests {
     fn lists_newest_first_and_caps_the_result() {
         let temp = TempDir::new("listing");
         let data = app_data(&temp);
-        let total = BACKUP_RETENTION + 15;
+        let total = DEFAULT_BACKUP_RETENTION as usize + 15;
         for day in 1..=total {
             let id = format!("2026-01-{day:02}T00-00-00Z");
             craft_backup(
@@ -1064,13 +1064,16 @@ mod tests {
         );
 
         let applied = crate::apply::apply(
-            &agent,
-            &sync_root,
+            &crate::apply::ApplyContext {
+                agent_dir: &agent,
+                sync_root: &sync_root,
+                app_data_dir: &data,
+                backup_retention: DEFAULT_BACKUP_RETENTION as usize,
+                runner: &FakeRunner,
+                link_creator: &crate::apply::PlatformLinkCreator,
+            },
             &fingerprint,
             &["prompts/leftover.md".to_string()],
-            &data,
-            &FakeRunner,
-            &crate::apply::PlatformLinkCreator,
         )
         .expect("应用应成功");
         assert_eq!(

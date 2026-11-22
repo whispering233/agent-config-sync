@@ -1733,13 +1733,16 @@ pi:1.5.2
         assert!(!agent_dir.join("settings.json").exists(), "计划不写 live");
 
         let applied = crate::apply::apply(
-            &agent_dir,
-            &staged.staging_root,
+            &crate::apply::ApplyContext {
+                agent_dir: &agent_dir,
+                sync_root: &staged.staging_root,
+                app_data_dir: &app_data,
+                backup_retention: crate::config::DEFAULT_BACKUP_RETENTION as usize,
+                runner: &FakeRunner,
+                link_creator: &crate::apply::PlatformLinkCreator,
+            },
             &report.manifest_info.fingerprint,
             &[],
-            &app_data,
-            &FakeRunner,
-            &crate::apply::PlatformLinkCreator,
         )
         .expect("应用应成功");
         assert_eq!(applied.written, 1);

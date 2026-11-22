@@ -37,6 +37,7 @@ import { cn } from '../lib/utils';
 type SettingsForm = {
   syncRoot: string;
   agentDirOverride: string;
+  backupRetention: number;
   transport: Transport;
   autoSync: boolean;
   autoSyncIntervalMinutes: number;
@@ -53,6 +54,7 @@ type LoadState =
 const EMPTY_FORM: SettingsForm = {
   syncRoot: '',
   agentDirOverride: '',
+  backupRetention: 10,
   transport: 'local',
   autoSync: false,
   autoSyncIntervalMinutes: 30,
@@ -103,6 +105,7 @@ function formFromConfig(config: AppConfig): SettingsForm {
   return {
     syncRoot: config.syncRoot ?? '',
     agentDirOverride: config.agentDirOverride ?? '',
+    backupRetention: config.backupRetention,
     transport: config.transport,
     autoSync: config.autoSync,
     autoSyncIntervalMinutes: config.autoSyncIntervalMinutes,
@@ -121,7 +124,7 @@ function configFromForm(base: AppConfig, form: SettingsForm): AppConfig {
     version: base.version,
     syncRoot: trimToNull(form.syncRoot),
     agentDirOverride: trimToNull(form.agentDirOverride),
-    backupRetention: base.backupRetention,
+    backupRetention: form.backupRetention,
     transport: form.transport,
     autoSync: form.autoSync,
     autoSyncIntervalMinutes: form.autoSyncIntervalMinutes,
@@ -134,6 +137,7 @@ function isDirty(base: AppConfig, form: SettingsForm): boolean {
   return (
     trimToNull(form.syncRoot) !== (base.syncRoot ?? null) ||
     trimToNull(form.agentDirOverride) !== (base.agentDirOverride ?? null) ||
+    form.backupRetention !== base.backupRetention ||
     form.transport !== base.transport ||
     form.autoSync !== base.autoSync ||
     form.autoSyncIntervalMinutes !== base.autoSyncIntervalMinutes ||
@@ -429,6 +433,42 @@ export function SettingsPage() {
           </Card>
 
           {form.transport === 'webdav' && <WebdavCard />}
+
+          <Card className="p-lg">
+            <h2 className="text-sm font-semibold text-foreground">本机备份</h2>
+            <div className="mt-lg">
+              <Field
+                id="backup-retention"
+                label="备份保留数"
+                hint="允许 1–100。只管本机回滚点（应用或回滚前自动写一份），与远端快照包固定保留 20 份无关，后者不可配。"
+              >
+                <Input
+                  id="backup-retention"
+                  type="number"
+                  min={1}
+                  max={100}
+                  step={1}
+                  value={form.backupRetention}
+                  disabled={!isDesktop}
+                  onChange={(event) =>
+                    updateField('backupRetention', Number(event.target.value))
+                  }
+                  aria-invalid={findingsFor('backupRetention').some(
+                    (finding) => finding.level === 'error',
+                  )}
+                  aria-describedby={
+                    findingsFor('backupRetention').length > 0
+                      ? 'backup-retention-feedback'
+                      : undefined
+                  }
+                />
+                <FieldFeedback
+                  id="backup-retention-feedback"
+                  findings={findingsFor('backupRetention')}
+                />
+              </Field>
+            </div>
+          </Card>
 
           <AutoSyncCard
             form={form}
