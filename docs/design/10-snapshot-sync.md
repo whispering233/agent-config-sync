@@ -126,7 +126,7 @@ WebDAV 模式的同步根固定为 `<服务地址>/PiAgentSync/`，其内部结�
 
 - `managedRoots`：本快照受管的根 id。`agent` 始终存在；`agents-skills` 仅在源机存在 `~/.agents/skills` 时出现。未知 id 视为格式不支持；缺字段或缺少 `agent` 视为损坏。
 - 快照不记录 home 绝对路径；`agents-skills` 在 apply 时解析为当前机器的 `<home>/.agents/skills`。目标根不存在时按快照创建；是文件、不可写或落在链接外的非法路径时失败。
-- `source.pi` / `source.node`：导出时按环境检测同一组探测取版本（能解析就规范成 `x.y.z`），探测不到记 `null`；只作来源记录，不参与指纹与冲突判定。
+- `source.pi` / `source.node`：手动导出时按环境检测同一组探测取版本（能解析就规范成 `x.y.z`），探测不到记 `null`；自动上行不探测版本，记 `null`。只作来源记录，不参与指纹与冲突判定。
 - `fingerprint`：对 `formatVersion`、排序后的 `managedRoots` 与所有 `{path, sha256}` 排序后取哈希，显示前 12 位。用途：两台机器肉眼核对"是不是同一份快照"；`managedRoots` 不同（例如一个声明了空的外部根、另一个没有）必须得到不同指纹。
 - manifest **最后写**：文件先落盘，manifest 落盘即代表快照完整。
 - 未知或过期的 `formatVersion` 一律拒绝读取，不尝试兼容；v2 及更早快照需在源机升级后重新导出。v3 是当前唯一写入格式。

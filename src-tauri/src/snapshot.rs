@@ -1399,7 +1399,7 @@ mod tests {
         fs::create_dir_all(&inside).expect("创建嵌套同步目录");
 
         let failure = export_with(&agent, Some(&home), &inside, SourceVersions::default())
-            .expect_err("嵌套应被拒绍");
+            .expect_err("嵌套应被拒绝");
         assert_eq!(failure.code, "sync_root_overlaps_external_root");
     }
 

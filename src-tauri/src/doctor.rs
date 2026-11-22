@@ -1,8 +1,8 @@
-//! 只读环境医生：探测 node / npm / pi / 凭据 / 包 / 技能链接，输出分级报告。
+//! 环境检测：探测 node / npm / pi / 凭据 / 包 / 技能链接，输出分级报告。
 //!
 //! 规则来源：`docs/design/20-env-doctor.md`。核心逻辑不依赖 Tauri，
 //! shell 命令通过 [`CommandRunner`] 注入，单测用假命令替代真实进程。
-//! 全程只读：只读文件与环境，不写文件、不改环境变量、不安装任何东西。
+//! 本模块全程只读：只读文件与环境，不写文件、不改环境变量、不安装任何东西。
 
 use crate::config::{self, AGENT_DIR_ENV_VAR};
 use crate::platform::{self, HostOs, ProgramPath};
