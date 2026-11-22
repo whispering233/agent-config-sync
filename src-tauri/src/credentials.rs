@@ -185,17 +185,39 @@ pub fn validate(url: &str, username: &str) -> Result<(String, String), Credentia
 }
 
 fn is_http_url(url: &str) -> bool {
-    let rest = match url
+    host_of(url).is_some_and(|host| !host.contains(char::is_whitespace))
+}
+
+/// 执行时要求 HTTPS：非 HTTPS 只放行本机回环地址，明文不出网线。
+///
+/// 与保存时的地址校验分开：保存只提示，执行一律硬拒（`remote_insecure`），且不看
+/// 本次快照是否含 `auth.json`——非 HTTPS 的远端还可能被塞进任意包，而落地以快照为准。
+pub fn is_secure_url(url: &str) -> bool {
+    let url = url.trim();
+    if url.starts_with("https://") {
+        return true;
+    }
+
+    host_of(url).is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+    })
+}
+
+/// 从 `http(s)://` 地址取主机名：丢掉 userinfo、端口与 IPv6 的方括号。
+fn host_of(url: &str) -> Option<&str> {
+    let rest = url
         .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-    {
-        Some(rest) => rest,
-        None => return false,
-    };
+        .or_else(|| url.strip_prefix("https://"))?;
 
     // 主机名在第一个 `/`、`?`、`#` 之前；空主机名（如 `https:///dav`）不算可解析。
-    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    !host.is_empty() && !host.contains(char::is_whitespace)
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or_default();
+    let host = match host_port.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => host_port.split(':').next().unwrap_or_default(),
+    };
+
+    (!host.is_empty()).then_some(host)
 }
 
 /// 解析一次网络请求要用的凭据：空密码等于沿用已存值，与 [`upsert`] 的保存语义一致。
@@ -354,6 +376,33 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600, "凭据文件权限应为 0600");
+    }
+
+    #[test]
+    fn secure_url_accepts_https_and_loopback_only() {
+        for url in [
+            "https://dav.jianguoyun.com/dav",
+            "https://example.com",
+            "http://localhost/dav",
+            "http://LOCALHOST:8080/dav",
+            "http://127.0.0.1/dav",
+            "http://127.0.0.1:8080/dav",
+            "http://[::1]:8080/dav",
+            "http://user:pw@localhost/dav",
+        ] {
+            assert!(is_secure_url(url), "应放行：{url}");
+        }
+
+        for url in [
+            "http://dav.example.com/dav",
+            "http://192.168.1.10/dav",
+            "http://localhost.evil.com/dav",
+            "http://127.0.0.2/dav",
+            "dav.example.com/dav",
+            "",
+        ] {
+            assert!(!is_secure_url(url), "应拒绝：{url}");
+        }
     }
 
     #[test]

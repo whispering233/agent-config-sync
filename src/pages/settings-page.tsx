@@ -37,6 +37,7 @@ import { cn } from '../lib/utils';
 type SettingsForm = {
   syncRoot: string;
   agentDirOverride: string;
+  backupRetention: number;
   transport: Transport;
   autoSync: boolean;
   autoSyncIntervalMinutes: number;
@@ -53,6 +54,7 @@ type LoadState =
 const EMPTY_FORM: SettingsForm = {
   syncRoot: '',
   agentDirOverride: '',
+  backupRetention: 10,
   transport: 'local',
   autoSync: false,
   autoSyncIntervalMinutes: 30,
@@ -103,6 +105,7 @@ function formFromConfig(config: AppConfig): SettingsForm {
   return {
     syncRoot: config.syncRoot ?? '',
     agentDirOverride: config.agentDirOverride ?? '',
+    backupRetention: config.backupRetention,
     transport: config.transport,
     autoSync: config.autoSync,
     autoSyncIntervalMinutes: config.autoSyncIntervalMinutes,
@@ -121,7 +124,7 @@ function configFromForm(base: AppConfig, form: SettingsForm): AppConfig {
     version: base.version,
     syncRoot: trimToNull(form.syncRoot),
     agentDirOverride: trimToNull(form.agentDirOverride),
-    backupRetention: base.backupRetention,
+    backupRetention: form.backupRetention,
     transport: form.transport,
     autoSync: form.autoSync,
     autoSyncIntervalMinutes: form.autoSyncIntervalMinutes,
@@ -134,6 +137,7 @@ function isDirty(base: AppConfig, form: SettingsForm): boolean {
   return (
     trimToNull(form.syncRoot) !== (base.syncRoot ?? null) ||
     trimToNull(form.agentDirOverride) !== (base.agentDirOverride ?? null) ||
+    form.backupRetention !== base.backupRetention ||
     form.transport !== base.transport ||
     form.autoSync !== base.autoSync ||
     form.autoSyncIntervalMinutes !== base.autoSyncIntervalMinutes ||
@@ -430,6 +434,42 @@ export function SettingsPage() {
 
           {form.transport === 'webdav' && <WebdavCard />}
 
+          <Card className="p-lg">
+            <h2 className="text-sm font-semibold text-foreground">本机备份</h2>
+            <div className="mt-lg">
+              <Field
+                id="backup-retention"
+                label="备份保留数"
+                hint="允许 1–100。只管本机回滚点（应用或回滚前自动写一份），与远端快照包固定保留 20 份无关，后者不可配。"
+              >
+                <Input
+                  id="backup-retention"
+                  type="number"
+                  min={1}
+                  max={100}
+                  step={1}
+                  value={form.backupRetention}
+                  disabled={!isDesktop}
+                  onChange={(event) =>
+                    updateField('backupRetention', Number(event.target.value))
+                  }
+                  aria-invalid={findingsFor('backupRetention').some(
+                    (finding) => finding.level === 'error',
+                  )}
+                  aria-describedby={
+                    findingsFor('backupRetention').length > 0
+                      ? 'backup-retention-feedback'
+                      : undefined
+                  }
+                />
+                <FieldFeedback
+                  id="backup-retention-feedback"
+                  findings={findingsFor('backupRetention')}
+                />
+              </Field>
+            </div>
+          </Card>
+
           <AutoSyncCard
             form={form}
             onChange={updateField}
@@ -508,7 +548,7 @@ const autoSyncStateText: Record<AutoSyncStatus['state'], string> = {
   idle: '等待下次自动上行',
   running: '正在上传…',
   success: '已上传',
-  conflict: '云端有更新，已停止',
+  diverged: '已上传（云端有新快照）',
   failed: '失败',
   skipped: '本次跳过',
   paused: '已暂停',
@@ -902,6 +942,25 @@ function probeNote(probe: WebdavProbe): ProbeNote {
 }
 
 /**
+ * 明文 http 指向非本机地址：执行时会被以 `remote_insecure` 硬拒，保存时先给一条可见提示。
+ * 判定与后端 `credentials::is_secure_url` 同一套：HTTPS，或本机回环的 http。
+ */
+function isPlainHttpToRemote(url: string): boolean {
+  const trimmed = url.trim();
+  if (!trimmed.startsWith('http://')) {
+    return false;
+  }
+  // host 在第一个分隔符之前；丢掉 userinfo、端口与 IPv6 的方括号。
+  const authority = trimmed.slice('http://'.length).split(/[/?#]/)[0] ?? '';
+  const hostPort = authority.split('@').pop() ?? '';
+  const host = (
+    hostPort.startsWith('[') ? hostPort.split(']')[0].slice(1) : hostPort.split(':')[0]
+  ).toLowerCase();
+
+  return host !== 'localhost' && host !== '127.0.0.1' && host !== '::1';
+}
+
+/**
  * 凭据单独保存：它不参与配置校验，也不进快照。
  * 密码永远是空白输入框，只在输入非空时覆盖已保存的值。
  */
@@ -1029,7 +1088,7 @@ function WebdavCard() {
         <Field
           id="webdav-url"
           label="服务地址"
-          hint="只接受 http:// 或 https://；应用会在该地址下建 PiAgentSync/ 目录。"
+          hint="只接受 HTTPS；本机回环地址（localhost / 127.0.0.1 / ::1）可以用 http。应用会在该地址下建 PiAgentSync/ 目录。"
         >
           <div className="mt-sm flex gap-sm">
             <Input
@@ -1048,6 +1107,11 @@ function WebdavCard() {
               坚果云
             </Button>
           </div>
+          {isPlainHttpToRemote(form.url) && (
+            <p className="mt-xs text-sm text-warning">
+              非本机地址不能用 http：明文会把凭据与快照暴露在网络上，执行上传/下载时会直接拒绝。
+            </p>
+          )}
         </Field>
 
         <Field

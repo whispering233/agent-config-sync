@@ -48,7 +48,7 @@ pub enum InstallAction {
 pub enum InstallKind {
     /// 存在 `<agent_dir>/install/managed-install.json`。
     Managed,
-    /// 入口路径在 `node_modules` 下。
+    /// 入口在 `node_modules` 下，或是 npm 全局中间层（同目录有 `node_modules`）。
     Npm,
     /// 两者都不是：不猜命令，交给用户手动升级。
     Unknown,
@@ -320,7 +320,8 @@ pub(crate) fn install_package_argv(os: HostOs, source: &str) -> Result<Vec<Strin
 }
 
 /// 托管安装看标记文件，npm 全局安装看入口路径。
-fn install_kind(agent_dir: Option<&Path>, pi_path: &str) -> InstallKind {
+/// 环境检测也走这条：两处判断必须一致，否则会出现「检测说未知、安装页说 npm」。
+pub(crate) fn install_kind(agent_dir: Option<&Path>, pi_path: &str) -> InstallKind {
     let marker = agent_dir
         .map(|dir| dir.join(MANAGED_MARKER[0]).join(MANAGED_MARKER[1]))
         .filter(|path| path.exists());

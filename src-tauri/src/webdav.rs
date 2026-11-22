@@ -28,10 +28,10 @@ pub enum DavError {
     Quota,
     /// 网络、超时、其它 5xx。带上底层原因，便于用户自查 DNS/TLS/代理。
     Unreachable(String),
-    /// 412：条件请求（`If-Match` / `If-None-Match`）不成立。
+    /// 412：服务端拒绝了本次前置条件。
     ///
-    /// 单独一类是因为它不代表网络失败，而是远端在本次操作期间被改写过；
-    /// 上传据此报 `remote_changed` 并停下，不重试。
+    /// 包模型上线后传输侧不再发条件请求，所以这一支只会在服务端自行返回 412 时出现；
+    /// 单独列一类是为了不和网络失败或认证失败混成一句「其它错误」。
     PreconditionFailed,
     /// 其余状态与协议层错误。
     Other(String),
@@ -43,7 +43,7 @@ impl fmt::Display for DavError {
             Self::AuthFailed => write!(formatter, "认证失败（凭据无效或权限不足）"),
             Self::Quota => write!(formatter, "远端空间或流量不足"),
             Self::PreconditionFailed => {
-                write!(formatter, "远端在本次操作期间被改写（条件请求未通过）")
+                write!(formatter, "服务端拒绝了本次前置条件（412）")
             }
             Self::Unreachable(detail) | Self::Other(detail) => write!(formatter, "{detail}"),
         }
@@ -203,6 +203,13 @@ fn base64_encode(input: &[u8]) -> String {
     output
 }
 
+/// `MOVE` 的结局。目标已存在单独一类：它不是网络失败，调用方要能分辨。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameOutcome {
+    Renamed,
+    TargetExists,
+}
+
 /// 一条目录项。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DavEntry {
@@ -234,11 +241,6 @@ impl<T: DavTransport> WebdavClient<T> {
             control_timeout: CONTROL_TIMEOUT,
             transfer_timeout: TRANSFER_TIMEOUT,
         }
-    }
-
-    /// 工作根（含 `/PiAgentSync`），用于在传输前检查协议是否允许明文凭据。
-    pub fn root_url(&self) -> &str {
-        &self.root
     }
 
     /// 覆盖超时：生产用常量，单测要毫秒级。
@@ -338,6 +340,33 @@ impl<T: DavTransport> WebdavClient<T> {
         }
     }
 
+    /// `MOVE`：一次请求完成的原子改名，`PUT` 定案靠它。
+    ///
+    /// `Destination` 必须是绝对 URL，路径编码与其它动词一致。定案用 `Overwrite: F`：
+    /// 包名只增不改，目标已存在（409/412）说明另有机器刚推了同名包，因此单独返回
+    /// [`RenameOutcome::TargetExists`]，不混进网络失败。
+    pub fn rename(&self, from: &str, to: &str, overwrite: bool) -> Result<RenameOutcome, DavError> {
+        let response = self.transport.send(DavRequest {
+            method: "MOVE".to_string(),
+            url: self.url(from),
+            headers: vec![
+                ("Destination".to_string(), self.url(to)),
+                (
+                    "Overwrite".to_string(),
+                    if overwrite { "T" } else { "F" }.to_string(),
+                ),
+            ],
+            body: None,
+            timeout: self.control_timeout,
+        })?;
+
+        match response.status {
+            201 | 204 => Ok(RenameOutcome::Renamed),
+            409 | 412 => Ok(RenameOutcome::TargetExists),
+            status => Err(error_for(status, &response.body)),
+        }
+    }
+
     /// 下载文件：404 → `Ok(None)`；成功时连响应头的 ETag 一起返回。
     pub fn get(&self, rel: &str) -> Result<Option<(Vec<u8>, Option<String>)>, DavError> {
         let response = self.transport.send(DavRequest {
@@ -385,8 +414,8 @@ impl<T: DavTransport> WebdavClient<T> {
     }
 }
 
-/// 写权限测试用的临时文件名。落在工作根下，探测结束即删。
-const WRITE_TEST_FILE: &str = ".tmp-writetest";
+/// 写权限测试用的临时文件名由 `package` 统一管理（`PROBE_FILE_NAME`），这样探测失败
+/// 留下的残留也能被「清理上传残留」认出来。落在工作根下，探测结束即删。
 
 /// 一次连接探测的结论：地址、凭据、读权限、写权限是否都可用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,11 +447,11 @@ pub fn probe<T: DavTransport>(client: &WebdavClient<T>) -> Result<ProbeOutcome, 
         }
     };
 
-    client.put(WRITE_TEST_FILE, b"ok", &[])?;
+    client.put(crate::package::PROBE_FILE_NAME, b"ok", &[])?;
 
     Ok(ProbeOutcome {
         created,
-        leftover_write_test_file: client.delete(WRITE_TEST_FILE).is_err(),
+        leftover_write_test_file: client.delete(crate::package::PROBE_FILE_NAME).is_err(),
     })
 }
 
@@ -1124,6 +1153,58 @@ mod tests {
         assert_eq!(
             client.put("snapshot/manifest.json", b"{}", &[]),
             Err(DavError::PreconditionFailed)
+        );
+    }
+
+    #[test]
+    fn rename_sends_absolute_encoded_destination_with_overwrite() {
+        let (client, transport) = client(vec![Ok(response(201))]);
+
+        let outcome = client
+            .rename(".tmp-1-deadbeef", "快照 包.zip", false)
+            .unwrap();
+
+        assert_eq!(outcome, RenameOutcome::Renamed);
+        let request = transport.last();
+        assert_eq!(request.method, "MOVE");
+        assert_eq!(
+            request.url,
+            "https://dav.example.com/dav/PiAgentSync/.tmp-1-deadbeef"
+        );
+        assert_eq!(
+            header(&request, "Destination").as_deref(),
+            Some("https://dav.example.com/dav/PiAgentSync/%E5%BF%AB%E7%85%A7%20%E5%8C%85.zip")
+        );
+        assert_eq!(header(&request, "Overwrite").as_deref(), Some("F"));
+        assert_eq!(request.timeout, CONTROL_TIMEOUT);
+    }
+
+    #[test]
+    fn rename_accepts_204_and_overwrite() {
+        let (client, transport) = client(vec![Ok(response(204))]);
+
+        let outcome = client.rename("a", "b", true).unwrap();
+
+        assert_eq!(outcome, RenameOutcome::Renamed);
+        assert_eq!(header(&transport.last(), "Overwrite").as_deref(), Some("T"));
+    }
+
+    #[test]
+    fn rename_reports_existing_target_separately_from_network_failures() {
+        for status in [409, 412] {
+            let (client, _) = client(vec![Ok(response(status))]);
+
+            assert_eq!(
+                client.rename("a", "b", false),
+                Ok(RenameOutcome::TargetExists),
+                "状态 {status}"
+            );
+        }
+
+        let (client, _) = client(vec![Ok(response(500))]);
+        assert_eq!(
+            client.rename("a", "b", false),
+            Err(DavError::Unreachable("服务端返回 HTTP 500".to_string()))
         );
     }
 

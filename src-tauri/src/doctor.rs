@@ -5,6 +5,7 @@
 //! 本模块全程只读：只读文件与环境，不写文件、不改环境变量、不安装任何东西。
 
 use crate::config::{self, AGENT_DIR_ENV_VAR};
+use crate::installer::{self, InstallKind};
 use crate::platform::{self, HostOs, ProgramPath};
 use crate::scope::{self, RootId};
 use crate::versions::{self, LatestVersions};
@@ -895,23 +896,22 @@ fn pi_checks(section: &SectionData) -> (Vec<Check>, Option<String>, Option<Strin
 }
 
 fn install_kind_check(agent_dir: Option<&Path>, pi_path: Option<&str>) -> Check {
-    let managed_marker = agent_dir.map(|dir| dir.join("install").join("managed-install.json"));
+    let Some(path) = pi_path else {
+        return unknown("pi.install_kind", "找不到 pi，无法判断安装方式");
+    };
 
-    if let Some(marker) = managed_marker.as_ref().filter(|path| path.exists()) {
-        return pass(
+    match installer::install_kind(agent_dir, path) {
+        InstallKind::Managed => pass(
             "pi.install_kind",
             Some("托管安装".to_string()),
-            Some(format!("存在 {}", marker.display())),
-        );
-    }
-
-    match pi_path {
-        Some(path) if platform::is_npm_install_path(path) => pass(
+            Some(path.to_string()),
+        ),
+        InstallKind::Npm => pass(
             "pi.install_kind",
             Some("npm 全局安装".to_string()),
             Some(path.to_string()),
         ),
-        Some(path) => record(
+        InstallKind::Unknown => record(
             "pi.install_kind",
             CheckStatus::Warn,
             Some("未知".to_string()),
@@ -920,7 +920,6 @@ fn install_kind_check(agent_dir: Option<&Path>, pi_path: Option<&str>) -> Check 
             )),
             Some("host.upgrade"),
         ),
-        None => unknown("pi.install_kind", "找不到 pi，无法判断安装方式"),
     }
 }
 
@@ -2284,6 +2283,18 @@ mod tests {
             find(&report, "pi.install_kind").value.as_deref(),
             Some("npm 全局安装")
         );
+    }
+
+    #[test]
+    fn install_kind_accepts_windows_npm_shim() {
+        let dir = TempDir::new("npm-shim");
+        fs::create_dir_all(dir.path().join("node_modules")).expect("建目录");
+        let pi = dir.write("pi.cmd", "");
+
+        let check = install_kind_check(None, Some(&pi.display().to_string()));
+
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(check.value.as_deref(), Some("npm 全局安装"));
     }
 
     #[test]

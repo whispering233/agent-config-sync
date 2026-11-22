@@ -18,6 +18,9 @@ sha2 = "0.11"
 # WebDAV 必须是后台线程里的同步调用：阻塞客户端最贴合，默认 feature 已是 rustls +
 # 平台根证书 + 系统代理，不引 native-tls。
 reqwest = { version = "0.13", features = ["blocking"] }
+# 快照包容器。关掉默认 feature 是为了不拉 bzip2/lzma/zstd 那几套 C 依赖，只用 deflate；
+# 必须 >= 9：早期版本有 symlink 逃逸漏洞，不留可被降级的余地。
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

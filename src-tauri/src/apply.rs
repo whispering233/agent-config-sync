@@ -37,8 +37,6 @@ pub const RESTORE_FILE_NAME: &str = "restore.json";
 pub const RESTORE_VERSION: u32 = 2;
 /// 回滚能读的版本。旧备份不升级、不改写，只按缺省根读取。
 pub const SUPPORTED_RESTORE_VERSIONS: [u32; 2] = [1, RESTORE_VERSION];
-/// 保留最近几份备份。
-pub const BACKUP_RETENTION: usize = 10;
 /// 备份目录权限：只允许本用户读（Windows 没有权限位，建目录时不设）。
 const BACKUP_DIR_MODE: u32 = 0o700;
 /// 新增文件的权限；覆盖已有文件时沿用原 mode。
@@ -160,21 +158,41 @@ impl LinkCreator for PlatformLinkCreator {
     }
 }
 
+/// 一次应用要落到的位置、平台接缝与备份保留数。
+///
+/// 参数收进结构体，免得 [`apply`] 的签名长到看不清每一项是什么。
+#[derive(Clone, Copy)]
+pub struct ApplyContext<'a> {
+    pub agent_dir: &'a Path,
+    /// 解析 `agents-skills` 根用的 home；声明了该根却解析不到就整次失败。
+    pub home_dir: Option<&'a Path>,
+    pub sync_root: &'a Path,
+    pub app_data_dir: &'a Path,
+    /// 本机备份（回滚点）保留份数，来自 `AppConfig::backup_retention`。
+    pub backup_retention: usize,
+    pub runner: &'a dyn CommandRunner,
+    pub link_creator: &'a dyn LinkCreator,
+}
+
 /// core：应用快照。`delete_requests` 是用户逐项勾选确认的删除项（带所属根），
 /// 其余删除候选原样保留。
 ///
 /// 落地按 manifest 的 `managedRoots` 分根：每个写入、删除、链接、备份条目都用它的
 /// `root` 找到本机根目录。
 pub fn apply(
-    agent_dir: &Path,
-    home_dir: Option<&Path>,
-    sync_root: &Path,
+    context: &ApplyContext<'_>,
     expected_fingerprint: &str,
     delete_requests: &[DeleteRequest],
-    app_data_dir: &Path,
-    runner: &dyn CommandRunner,
-    link_creator: &dyn LinkCreator,
 ) -> Result<ApplyReport, ApplyFailure> {
+    let ApplyContext {
+        agent_dir,
+        home_dir,
+        sync_root,
+        app_data_dir,
+        backup_retention,
+        runner,
+        link_creator,
+    } = *context;
     // 计划可能已经过时：用户看的是旧计划，落地前必须按当前磁盘重算一次。
     let report = plan::plan_snapshot(agent_dir, home_dir, sync_root, runner, HostOs::current())
         .map_err(|failure| {
@@ -213,7 +231,7 @@ pub fn apply(
         &confirmed,
         &backup,
     )?;
-    prune(&app_data_dir.join(BACKUPS_DIR_NAME));
+    prune(&app_data_dir.join(BACKUPS_DIR_NAME), backup_retention);
 
     // 建链接失败就退回物化：Windows 默认权限下没有建链接权限（`ERROR_PRIVILEGE_NOT_HELD`）
     // 是常态，与「目标缺失」一样只告警、不中断。物化要把快照里该路径下的整棵子树写成真实文件：
@@ -662,13 +680,22 @@ fn create_backup_dir(app_data_dir: &Path) -> Result<Backup, ApplyFailure> {
     let created_at = utc_timestamp(now_seconds());
     let base = created_at.replace(':', "-");
 
-    // 同一秒内应用两次时加序号，避免两次备份混在一个目录里。
-    let mut id = base.clone();
-    let mut suffix = 1;
-    while root.join(&id).exists() {
-        id = format!("{base}-{suffix}");
-        suffix += 1;
-    }
+    // 同一秒内应用多次时加序号，避免两次备份混在一个目录里。序号只增不减：
+    // 旧备份被保留数裁剪掉后从最小空位重排，新备份在字典序上就排得更旧，会被当次裁剪删掉。
+    let suffix = fs::read_dir(&root)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| backup_suffix(&base, &entry.file_name().to_string_lossy()))
+                .max()
+                .map_or(0, |max| max + 1)
+        })
+        .unwrap_or(0);
+    let id = if suffix == 0 {
+        base.clone()
+    } else {
+        format!("{base}-{suffix}")
+    };
     let dir = root.join(&id);
 
     platform::create_dir_all_mode(&dir, BACKUP_DIR_MODE)
@@ -684,6 +711,14 @@ fn create_backup_dir(app_data_dir: &Path) -> Result<Backup, ApplyFailure> {
         dir,
         created_at,
     })
+}
+
+/// 备份目录名 `base` 或 `base-<序号>` 里的序号；别的名字不算同一秒的备份。
+fn backup_suffix(base: &str, name: &str) -> Option<usize> {
+    match name.strip_prefix(base)? {
+        "" => Some(0),
+        rest => rest.strip_prefix('-')?.parse().ok(),
+    }
 }
 
 /// 备份将被覆盖或删除的现有文件，写下 `restore.json`。
@@ -719,7 +754,11 @@ pub(crate) fn back_up_paths(
 ) -> Result<(String, PathBuf), ApplyFailure> {
     let backup = create_backup_dir(app_data_dir)?;
     write_backup_entries(roots, touched, fingerprint, &backup, true)?;
-    prune(&app_data_dir.join(BACKUPS_DIR_NAME));
+    // 回滚是 core 入口、不加载应用配置：还原前的那份备份按默认份数清理，不上抛配置依赖。
+    prune(
+        &app_data_dir.join(BACKUPS_DIR_NAME),
+        config::DEFAULT_BACKUP_RETENTION as usize,
+    );
 
     Ok((backup.id, backup.dir))
 }
@@ -921,8 +960,8 @@ fn record(
     })
 }
 
-/// 只保留最近 [`BACKUP_RETENTION`] 份；目录名是 UTC 时间戳，按名字排序即按时间排序。
-fn prune(backups: &Path) {
+/// 只保留最近 `keep` 份；目录名是 UTC 时间戳，按名字排序即按时间排序。
+fn prune(backups: &Path, keep: usize) {
     let mut ids: Vec<String> = match fs::read_dir(backups) {
         Ok(read_dir) => read_dir
             .filter_map(|item| item.ok())
@@ -933,7 +972,7 @@ fn prune(backups: &Path) {
         Err(_) => return,
     };
     ids.sort();
-    let excess = ids.len().saturating_sub(BACKUP_RETENTION);
+    let excess = ids.len().saturating_sub(keep);
     for id in ids.into_iter().take(excess) {
         let _ = fs::remove_dir_all(backups.join(id));
     }
@@ -1209,14 +1248,17 @@ fn run(
     })?;
 
     apply(
-        &agent_dir,
-        home_dir.as_deref(),
-        &sync_root,
+        &ApplyContext {
+            agent_dir: &agent_dir,
+            home_dir: home_dir.as_deref(),
+            sync_root: &sync_root,
+            app_data_dir: &app_data_dir,
+            backup_retention: config.backup_retention as usize,
+            runner: &ShellRunner::from_env(),
+            link_creator: &PlatformLinkCreator,
+        },
         expected_fingerprint,
         delete_requests,
-        &app_data_dir,
-        &ShellRunner::from_env(),
-        &PlatformLinkCreator,
     )
 }
 
@@ -1280,6 +1322,70 @@ mod tests {
         }
     }
 
+    // 上下文按值借用接缝，测试夹具给它们一个与用例同寿命的位置。
+    static FAKE_RUNNER: FakeRunner = FakeRunner;
+    static PLATFORM_LINK_CREATOR: PlatformLinkCreator = PlatformLinkCreator;
+
+    /// 默认应用上下文：假命令 + 真链接接缝 + 配置里的默认备份保留数。
+    fn context<'a>(agent: &'a Path, sync_root: &'a Path, data: &'a Path) -> ApplyContext<'a> {
+        apply_context(
+            agent,
+            sync_root,
+            data,
+            &PLATFORM_LINK_CREATOR,
+            config::DEFAULT_BACKUP_RETENTION as usize,
+        )
+    }
+
+    /// 与 [`context`] 同，但可以换链接接缝与备份保留数。
+    fn apply_context<'a>(
+        agent: &'a Path,
+        sync_root: &'a Path,
+        data: &'a Path,
+        link_creator: &'a dyn LinkCreator,
+        backup_retention: usize,
+    ) -> ApplyContext<'a> {
+        ApplyContext {
+            agent_dir: agent,
+            home_dir: None,
+            sync_root,
+            app_data_dir: data,
+            backup_retention,
+            runner: &FAKE_RUNNER,
+            link_creator,
+        }
+    }
+
+    /// 双根用例的上下文：`home_dir` 决定 `agents-skills` 根落到哪个目录。
+    fn context_with_home<'a>(
+        agent: &'a Path,
+        home: &'a Path,
+        sync_root: &'a Path,
+        data: &'a Path,
+    ) -> ApplyContext<'a> {
+        context_with_home_and_links(agent, home, sync_root, data, &PLATFORM_LINK_CREATOR)
+    }
+
+    /// 与 [`context_with_home`] 同，但可以换链接接缝：双根用例也要覆盖"链接建不成"。
+    fn context_with_home_and_links<'a>(
+        agent: &'a Path,
+        home: &'a Path,
+        sync_root: &'a Path,
+        data: &'a Path,
+        link_creator: &'a dyn LinkCreator,
+    ) -> ApplyContext<'a> {
+        ApplyContext {
+            home_dir: Some(home),
+            ..apply_context(
+                agent,
+                sync_root,
+                data,
+                link_creator,
+                config::DEFAULT_BACKUP_RETENTION as usize,
+            )
+        }
+    }
+
     fn write_file(path: &Path, content: &str) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("创建父目录");
@@ -1309,13 +1415,6 @@ mod tests {
         }
     }
 
-    /// 单根夹具的 home：存在但没有 `~/.agents/skills`，导出只声明 agent 根。
-    fn home_without_skills(temp: &TempDir) -> PathBuf {
-        let home = temp.path().join("home");
-        fs::create_dir_all(&home).expect("创建 home");
-        home
-    }
-
     /// 双根夹具：快照声明了 `~/.agents/skills`，目标机的外部根有一处被改、
     /// 还有一项快照里没有的技能（删除候选）。返回宿主目录、同步目录与目标机 home。
     fn external_root_fixture(temp: &TempDir) -> (PathBuf, PathBuf, PathBuf) {
@@ -1328,7 +1427,7 @@ mod tests {
             "# 共享技能\n",
         );
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export_with(
+        crate::snapshot::export_fixture_with(
             &agent,
             Some(&source_home),
             &sync_root,
@@ -1359,8 +1458,7 @@ mod tests {
         write_file(&agent.join("auth.json"), "{\"token\": \"sk-test\"}");
         write_file(&agent.join("sessions/old.json"), "{}");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &home_without_skills(&temp), &sync_root)
-            .expect("导出夹具快照");
+        crate::snapshot::export_fixture(&agent, &sync_root).expect("导出夹具快照");
         (agent, sync_root)
     }
 
@@ -1454,14 +1552,9 @@ mod tests {
 
         let expected = fingerprint(&agent, &sync_root);
         let report = apply(
-            &agent,
-            None,
-            &sync_root,
+            &context(&agent, &sync_root, &data),
             &expected,
             &[delete(RootId::Agent, "themes/old.json")],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
         )
         .expect("应用应成功");
 
@@ -1515,14 +1608,9 @@ mod tests {
 
         let expected = fingerprint_for(&agent, &target_home, &sync_root);
         let report = apply(
-            &agent,
-            Some(&target_home),
-            &sync_root,
+            &context_with_home(&agent, &target_home, &sync_root, &data),
             &expected,
             &[],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
         )
         .expect("应用应成功");
 
@@ -1571,14 +1659,9 @@ mod tests {
 
         // 计划外的路径照样整次拒绝。
         let failure = apply(
-            &agent,
-            Some(&target_home),
-            &sync_root,
+            &context_with_home(&agent, &target_home, &sync_root, &data),
             &expected,
             &[delete(RootId::AgentsSkills, "only-here/SKILL.md.bak")],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
         )
         .expect_err("不在计划里的删除项必须整次拒绝");
         assert_eq!(failure.code, "delete_not_in_plan", "{}", failure.message);
@@ -1595,14 +1678,9 @@ mod tests {
 
         let external_before = tree(&target_home.join(".agents/skills/only-here"));
         let report = apply(
-            &agent,
-            Some(&target_home),
-            &sync_root,
+            &context_with_home(&agent, &target_home, &sync_root, &data),
             &expected,
             &[delete(RootId::AgentsSkills, "only-here/SKILL.md")],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
         )
         .expect("逐项勾选的外部根删除应成功");
 
@@ -1648,7 +1726,7 @@ mod tests {
             "# 共享技能\n",
         );
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export_with(
+        crate::snapshot::export_fixture_with(
             &agent,
             Some(&source_home),
             &sync_root,
@@ -1666,14 +1744,9 @@ mod tests {
 
         // 用外部根去删 agent 根的候选：整次拒绝，一个字节都不动。
         let failure = apply(
-            &agent,
-            Some(&target_home),
-            &sync_root,
+            &context_with_home(&agent, &target_home, &sync_root, &data),
             &expected,
             &[delete(RootId::AgentsSkills, "skills/only-here/SKILL.md")],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
         )
         .expect_err("根对不上就不是本次计划的删除候选");
         assert_eq!(failure.code, "delete_not_in_plan");
@@ -1681,14 +1754,9 @@ mod tests {
         assert!(backup_ids(&data).is_empty());
 
         let report = apply(
-            &agent,
-            Some(&target_home),
-            &sync_root,
+            &context_with_home(&agent, &target_home, &sync_root, &data),
             &expected,
             &[delete(RootId::Agent, "skills/only-here/SKILL.md")],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
         )
         .expect("按 agent 根勾选后应成功");
 
@@ -1709,17 +1777,8 @@ mod tests {
         write_file(&agent.join("settings.json"), "{\"theme\": \"light\"}");
         let before = tree(&agent);
 
-        let failure = apply(
-            &agent,
-            None,
-            &sync_root,
-            "000000000000",
-            &[],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
-        )
-        .expect_err("指纹不符必须拒绝");
+        let failure = apply(&context(&agent, &sync_root, &data), "000000000000", &[])
+            .expect_err("指纹不符必须拒绝");
 
         assert_eq!(failure.code, "plan_stale");
         assert_eq!(failure.completed, 0);
@@ -1736,37 +1795,18 @@ mod tests {
         let expected = fingerprint(&agent, &sync_root);
 
         fs::remove_file(sync_root.join(crate::snapshot::MANIFEST_FILE_NAME)).expect("删 manifest");
-        let failure = apply(
-            &agent,
-            None,
-            &sync_root,
-            &expected,
-            &[],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
-        )
-        .expect_err("manifest 缺失必须拒绝");
+        let failure = apply(&context(&agent, &sync_root, &data), &expected, &[])
+            .expect_err("manifest 缺失必须拒绝");
         assert_eq!(failure.code, "manifest_invalid", "{}", failure.message);
 
         // 云盘只传了一半：manifest 还在，但文件内容不符。
-        crate::snapshot::export(&agent, &home_without_skills(&temp), &sync_root)
-            .expect("重新导出快照");
+        crate::snapshot::export_fixture(&agent, &sync_root).expect("重新导出快照");
         write_file(
             &sync_root.join("snapshot/settings.json"),
             "{\"theme\": \"half\"}",
         );
-        let failure = apply(
-            &agent,
-            None,
-            &sync_root,
-            &expected,
-            &[],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
-        )
-        .expect_err("哈希不符必须拒绝");
+        let failure = apply(&context(&agent, &sync_root, &data), &expected, &[])
+            .expect_err("哈希不符必须拒绝");
         assert_eq!(failure.code, "manifest_invalid", "{}", failure.message);
         assert!(
             failure.message.contains("hash_mismatch"),
@@ -1791,14 +1831,9 @@ mod tests {
             "/etc/passwd",
         ] {
             let failure = apply(
-                &agent,
-                None,
-                &sync_root,
+                &context(&agent, &sync_root, &data),
                 &expected,
                 &[delete(RootId::Agent, path)],
-                &data,
-                &FakeRunner::ok(),
-                &PlatformLinkCreator,
             )
             .expect_err("不在计划里的删除项必须整次拒绝");
             assert_eq!(failure.code, "delete_not_in_plan", "{path}");
@@ -1820,21 +1855,16 @@ mod tests {
         write_file(&agent.join("settings.json"), "{\"theme\": \"dark\"}");
         write_file(&temp.path().join("outside/keep.txt"), "留在这里\n");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &home_without_skills(&temp), &sync_root).expect("导出快照");
+        crate::snapshot::export_fixture(&agent, &sync_root).expect("导出快照");
         // 导出之后才出现的链接：快照里没有它，只能删链接本身。
         fs::create_dir_all(agent.join("skills")).expect("创建 skills");
         symlink(temp.path().join("outside"), agent.join("skills/extra")).expect("创建目录链接");
 
         let expected = fingerprint(&agent, &sync_root);
         let report = apply(
-            &agent,
-            None,
-            &sync_root,
+            &context(&agent, &sync_root, &data),
             &expected,
             &[delete(RootId::Agent, "skills/extra")],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
         )
         .expect("应用应成功");
 
@@ -1885,7 +1915,7 @@ mod tests {
         )
         .expect("创建符号链接");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &home_without_skills(&temp), &sync_root).expect("导出快照");
+        crate::snapshot::export_fixture(&agent, &sync_root).expect("导出快照");
 
         // 链接目标内容变了：计划里 SKILL.md 变成"修改"；settings.json 也改一下，
         // 让备份同时覆盖"修改文件 + 修改链接"两种情况。
@@ -1894,17 +1924,8 @@ mod tests {
         set_mode(&agent.join("settings.json"), 0o640);
         let expected = fingerprint(&agent, &sync_root);
 
-        let report = apply(
-            &agent,
-            None,
-            &sync_root,
-            &expected,
-            &[],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
-        )
-        .expect("应用应成功");
+        let report =
+            apply(&context(&agent, &sync_root, &data), &expected, &[]).expect("应用应成功");
 
         // 链接按 manifest 记录重建，外部目标保持原样。
         let metadata = fs::symlink_metadata(agent.join("skills/antd/SKILL.md")).expect("读信息");
@@ -1979,17 +2000,7 @@ mod tests {
 
         fs::remove_file(agent.join("auth.json")).expect("删除 live auth");
         let expected = fingerprint(&agent, &sync_root);
-        apply(
-            &agent,
-            None,
-            &sync_root,
-            &expected,
-            &[],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
-        )
-        .expect("应用应成功");
+        apply(&context(&agent, &sync_root, &data), &expected, &[]).expect("应用应成功");
         assert_eq!(mode_of(&agent.join("auth.json")), 0o600);
     }
 
@@ -2005,23 +2016,13 @@ mod tests {
         let data = app_data(&temp);
         write_file(&real.join("settings.json"), "{\"theme\": \"dark\"}");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&real, &home_without_skills(&temp), &sync_root)
-            .expect("导出夹具快照");
+        crate::snapshot::export_fixture(&real, &sync_root).expect("导出夹具快照");
         symlink(&real, &agent).expect("建根链接");
 
         write_file(&real.join("settings.json"), "{\"theme\": \"light\"}");
         let expected = fingerprint(&agent, &sync_root);
-        let report = apply(
-            &agent,
-            None,
-            &sync_root,
-            &expected,
-            &[],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
-        )
-        .expect("应用应成功");
+        let report =
+            apply(&context(&agent, &sync_root, &data), &expected, &[]).expect("应用应成功");
 
         assert_eq!(report.written, 1);
         // 根的类型不进快照：写入落到链接目标，根链接本身原样保留。
@@ -2043,17 +2044,8 @@ mod tests {
         fs::remove_file(agent.join("AGENTS.md")).expect("删除 live 文件");
         let expected = fingerprint(&agent, &sync_root);
 
-        let report = apply(
-            &agent,
-            None,
-            &sync_root,
-            &expected,
-            &[],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
-        )
-        .expect("应用应成功");
+        let report =
+            apply(&context(&agent, &sync_root, &data), &expected, &[]).expect("应用应成功");
         assert_eq!(report.written, 1);
 
         let restore = read_restore(&report.backup_dir);
@@ -2080,17 +2072,8 @@ mod tests {
 
         // 技能目录只读：临时文件创建失败。
         set_mode(&agent.join("skills/antd"), 0o500);
-        let failure = apply(
-            &agent,
-            None,
-            &sync_root,
-            &expected,
-            &[],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
-        )
-        .expect_err("写入失败必须停下");
+        let failure = apply(&context(&agent, &sync_root, &data), &expected, &[])
+            .expect_err("写入失败必须停下");
         set_mode(&agent.join("skills/antd"), 0o755);
 
         assert_eq!(failure.code, "apply_failed", "{}", failure.message);
@@ -2122,38 +2105,52 @@ mod tests {
     }
 
     #[test]
-    fn backups_beyond_retention_are_pruned_oldest_first() {
+    fn backups_keep_only_the_configured_newest_entries() {
         let temp = TempDir::new("retention");
         let (agent, sync_root) = fixture(&temp);
         let data = app_data(&temp);
-
-        let backups = data.join(BACKUPS_DIR_NAME);
-        let mut old = Vec::new();
-        for day in 1..=11 {
-            let id = format!("2000-01-{day:02}T00-00-00Z");
-            fs::create_dir_all(backups.join(&id)).expect("创建旧备份");
-            old.push(id);
-        }
-        assert_eq!(backup_ids(&data).len(), 11);
-
         let expected = fingerprint(&agent, &sync_root);
-        let report = apply(
-            &agent,
-            None,
-            &sync_root,
-            &expected,
-            &[],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
-        )
-        .expect("应用应成功");
 
-        let ids = backup_ids(&data);
-        assert_eq!(ids.len(), BACKUP_RETENTION);
-        assert!(!ids.contains(&old[0]), "最旧的两份被清理");
-        assert!(!ids.contains(&old[1]));
-        assert!(ids.contains(&report.backup_id), "新备份保留");
+        let mut created = Vec::new();
+        for _ in 0..5 {
+            let report = apply(
+                &apply_context(&agent, &sync_root, &data, &PLATFORM_LINK_CREATOR, 3),
+                &expected,
+                &[],
+            )
+            .expect("应用应成功");
+            created.push(report.backup_id);
+        }
+
+        // 备份目录名是时间戳（同秒时再加序号），字典序即时间序：倒序就是最新在前。
+        created.sort();
+        created.reverse();
+        let mut ids = backup_ids(&data);
+        ids.reverse();
+        assert_eq!(ids, created[..3], "保留配置里的 3 份，且是最新的 3 份");
+        assert!(!ids.contains(&created[3]), "第 4 新的已被清理");
+        assert!(!ids.contains(&created[4]), "最旧的已被清理");
+    }
+
+    #[test]
+    fn retention_of_one_keeps_only_the_newest_backup() {
+        let temp = TempDir::new("retention-one");
+        let (agent, sync_root) = fixture(&temp);
+        let data = app_data(&temp);
+        let expected = fingerprint(&agent, &sync_root);
+
+        let mut newest = String::new();
+        for _ in 0..3 {
+            newest = apply(
+                &apply_context(&agent, &sync_root, &data, &PLATFORM_LINK_CREATOR, 1),
+                &expected,
+                &[],
+            )
+            .expect("应用应成功")
+            .backup_id;
+        }
+
+        assert_eq!(backup_ids(&data), vec![newest], "保留数 1 只留最新一份");
     }
 
     /// 宿主目录里的 `skills` 是指向外部目录的链接；快照由该链接导出。
@@ -2167,8 +2164,7 @@ mod tests {
         fs::create_dir_all(&agent).expect("创建宿主目录");
         symlink("../outside/skills-live", agent.join("skills")).expect("创建目录链接");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &home_without_skills(&temp), &sync_root)
-            .expect("导出夹具快照");
+        crate::snapshot::export_fixture(&agent, &sync_root).expect("导出夹具快照");
         (agent, sync_root, external)
     }
 
@@ -2213,17 +2209,8 @@ mod tests {
         let expected = fingerprint(&agent, &sync_root);
         let external_before = tree(&external);
 
-        let report = apply(
-            &agent,
-            None,
-            &sync_root,
-            &expected,
-            &[],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
-        )
-        .expect("应用应成功");
+        let report =
+            apply(&context(&agent, &sync_root, &data), &expected, &[]).expect("应用应成功");
 
         assert_eq!(report.linked, 1);
         assert_eq!(report.written, 0, "链接之下的写入交给链接目标");
@@ -2269,17 +2256,8 @@ mod tests {
         fs::remove_dir_all(&external).expect("删除链接目标");
         let expected = fingerprint(&agent, &sync_root);
 
-        let report = apply(
-            &agent,
-            None,
-            &sync_root,
-            &expected,
-            &[],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
-        )
-        .expect("应用应成功");
+        let report =
+            apply(&context(&agent, &sync_root, &data), &expected, &[]).expect("应用应成功");
 
         assert_eq!(report.linked, 0, "目标不存在就不重建");
         assert_eq!(report.written, 1);
@@ -2342,8 +2320,7 @@ mod tests {
         fs::create_dir_all(&agent).expect("创建宿主目录");
         symlink("../outside/skills-live", agent.join("skills")).expect("创建目录链接");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &home_without_skills(&temp), &sync_root)
-            .expect("导出夹具快照");
+        crate::snapshot::export_fixture(&agent, &sync_root).expect("导出夹具快照");
         (agent, sync_root, external)
     }
 
@@ -2358,14 +2335,15 @@ mod tests {
         let expected = fingerprint(&agent, &sync_root);
         let external_before = tree(&external);
         let report = apply(
-            &agent,
-            None,
-            &sync_root,
+            &apply_context(
+                &agent,
+                &sync_root,
+                &data,
+                &RefusingLinks,
+                config::DEFAULT_BACKUP_RETENTION as usize,
+            ),
             &expected,
             &[],
-            &data,
-            &FakeRunner::ok(),
-            &RefusingLinks,
         )
         .expect("退回物化后应用应成功");
 
@@ -2418,14 +2396,15 @@ mod tests {
         let expected = fingerprint(&agent, &sync_root);
 
         let report = apply(
-            &agent,
-            None,
-            &sync_root,
+            &apply_context(
+                &agent,
+                &sync_root,
+                &data,
+                &RefusingLinks,
+                config::DEFAULT_BACKUP_RETENTION as usize,
+            ),
             &expected,
             &[],
-            &data,
-            &FakeRunner::ok(),
-            &RefusingLinks,
         )
         .expect("退回物化后应用应成功");
 
@@ -2460,14 +2439,15 @@ mod tests {
         let expected = fingerprint(&agent, &sync_root);
 
         let report = apply(
-            &agent,
-            None,
-            &sync_root,
+            &apply_context(
+                &agent,
+                &sync_root,
+                &data,
+                &RefusingLinks,
+                config::DEFAULT_BACKUP_RETENTION as usize,
+            ),
             &expected,
             &[delete(RootId::Agent, "skills/extra.md")],
-            &data,
-            &FakeRunner::ok(),
-            &RefusingLinks,
         )
         .expect("链接之下的删除跳过，应用仍成功");
 
@@ -2526,7 +2506,7 @@ mod tests {
             "# 共享技能\n",
         );
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export_with(
+        crate::snapshot::export_fixture_with(
             &agent,
             Some(&source_home),
             &sync_root,
@@ -2540,14 +2520,9 @@ mod tests {
 
         let expected = fingerprint_for(&agent, &target_home, &sync_root);
         let report = apply(
-            &agent,
-            Some(&target_home),
-            &sync_root,
+            &context_with_home(&agent, &target_home, &sync_root, &data),
             &expected,
             &[],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
         )
         .expect("应用应成功");
 
@@ -2588,7 +2563,7 @@ mod tests {
         // 绝对目标：源机与目标机是同一个临时目录里的两处布局，按同一条路径重建。
         symlink(&shared, source_home.join(".agents/skills/shared-link")).expect("建源机链接");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export_with(
+        crate::snapshot::export_fixture_with(
             &agent,
             Some(&source_home),
             &sync_root,
@@ -2617,14 +2592,9 @@ mod tests {
         let expected = fingerprint_for(&agent, &target_home, &sync_root);
 
         let report = apply(
-            &agent,
-            Some(&target_home),
-            &sync_root,
+            &context_with_home(&agent, &target_home, &sync_root, &data),
             &expected,
             &[delete(RootId::AgentsSkills, "shared-link/extra.md")],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
         )
         .expect("应用应成功");
 
@@ -2680,14 +2650,9 @@ mod tests {
         let expected = fingerprint_for(&agent, &target_home, &sync_root);
 
         let report = apply(
-            &agent,
-            Some(&target_home),
-            &sync_root,
+            &context_with_home_and_links(&agent, &target_home, &sync_root, &data, &RefusingLinks),
             &expected,
             &[delete(RootId::AgentsSkills, "shared-link/extra.md")],
-            &data,
-            &FakeRunner::ok(),
-            &RefusingLinks,
         )
         .expect("退回物化后应用应成功");
 
@@ -2755,8 +2720,7 @@ mod tests {
         )
         .expect("创建目录链接");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &home_without_skills(&temp), &sync_root)
-            .expect("导出夹具快照");
+        crate::snapshot::export_fixture(&agent, &sync_root).expect("导出夹具快照");
 
         // 链接没了，父目录又不可写：建链接失败之后连物化都落不下去。
         fs::remove_file(agent.join("agents/link-to-shared")).expect("删除夹具链接");
@@ -2764,14 +2728,15 @@ mod tests {
         let expected = fingerprint(&agent, &sync_root);
 
         let failure = apply(
-            &agent,
-            None,
-            &sync_root,
+            &apply_context(
+                &agent,
+                &sync_root,
+                &data,
+                &RefusingLinks,
+                config::DEFAULT_BACKUP_RETENTION as usize,
+            ),
             &expected,
             &[],
-            &data,
-            &FakeRunner::ok(),
-            &RefusingLinks,
         )
         .expect_err("物化失败必须停在原地");
         set_mode(&agent.join("agents"), 0o755);
@@ -2834,17 +2799,8 @@ mod tests {
         .expect("写 manifest");
 
         let expected = fingerprint(&agent, &sync_root);
-        let report = apply(
-            &agent,
-            None,
-            &sync_root,
-            &expected,
-            &[],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
-        )
-        .expect("应用应成功");
+        let report =
+            apply(&context(&agent, &sync_root, &data), &expected, &[]).expect("应用应成功");
 
         assert_eq!(report.linked, 0);
         assert_eq!(report.written, 0);
@@ -2876,14 +2832,9 @@ mod tests {
         let external_before = tree(&external);
 
         let report = apply(
-            &agent,
-            None,
-            &sync_root,
+            &context(&agent, &sync_root, &data),
             &expected,
             &[delete(RootId::Agent, "skills/extra.md")],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
         )
         .expect("链接之下的删除跳过，应用仍成功");
 
@@ -2930,14 +2881,9 @@ mod tests {
         let agent_before = tree(&agent);
 
         let failure = apply(
-            &agent,
-            None,
-            &sync_root,
+            &context(&agent, &sync_root, &data),
             &expected,
             &[delete(RootId::Agent, "skills/extra.md")],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
         )
         .expect_err("经符号链接删除必须整次拒绝");
 
@@ -2969,14 +2915,9 @@ mod tests {
         let expected = fingerprint(&agent, &sync_root);
 
         let report = apply(
-            &agent,
-            None,
-            &sync_root,
+            &context(&agent, &sync_root, &data),
             &expected,
             &[delete(RootId::Agent, "prompts/live-only.md")],
-            &data,
-            &FakeRunner::ok(),
-            &PlatformLinkCreator,
         )
         .expect("普通删除应成功");
 
