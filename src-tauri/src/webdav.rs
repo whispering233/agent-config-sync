@@ -203,6 +203,13 @@ fn base64_encode(input: &[u8]) -> String {
     output
 }
 
+/// `MOVE` 的结局。目标已存在单独一类：它不是网络失败，调用方要能分辨。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameOutcome {
+    Renamed,
+    TargetExists,
+}
+
 /// 一条目录项。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DavEntry {
@@ -335,6 +342,33 @@ impl<T: DavTransport> WebdavClient<T> {
             Ok(())
         } else {
             Err(error_for(response.status, &response.body))
+        }
+    }
+
+    /// `MOVE`：一次请求完成的原子改名，`PUT` 定案靠它。
+    ///
+    /// `Destination` 必须是绝对 URL，路径编码与其它动词一致。定案用 `Overwrite: F`：
+    /// 包名只增不改，目标已存在（409/412）说明另有机器刚推了同名包，因此单独返回
+    /// [`RenameOutcome::TargetExists`]，不混进网络失败。
+    pub fn rename(&self, from: &str, to: &str, overwrite: bool) -> Result<RenameOutcome, DavError> {
+        let response = self.transport.send(DavRequest {
+            method: "MOVE".to_string(),
+            url: self.url(from),
+            headers: vec![
+                ("Destination".to_string(), self.url(to)),
+                (
+                    "Overwrite".to_string(),
+                    if overwrite { "T" } else { "F" }.to_string(),
+                ),
+            ],
+            body: None,
+            timeout: self.control_timeout,
+        })?;
+
+        match response.status {
+            201 | 204 => Ok(RenameOutcome::Renamed),
+            409 | 412 => Ok(RenameOutcome::TargetExists),
+            status => Err(error_for(status, &response.body)),
         }
     }
 
@@ -1124,6 +1158,58 @@ mod tests {
         assert_eq!(
             client.put("snapshot/manifest.json", b"{}", &[]),
             Err(DavError::PreconditionFailed)
+        );
+    }
+
+    #[test]
+    fn rename_sends_absolute_encoded_destination_with_overwrite() {
+        let (client, transport) = client(vec![Ok(response(201))]);
+
+        let outcome = client
+            .rename(".tmp-1-deadbeef", "快照 包.zip", false)
+            .unwrap();
+
+        assert_eq!(outcome, RenameOutcome::Renamed);
+        let request = transport.last();
+        assert_eq!(request.method, "MOVE");
+        assert_eq!(
+            request.url,
+            "https://dav.example.com/dav/PiAgentSync/.tmp-1-deadbeef"
+        );
+        assert_eq!(
+            header(&request, "Destination").as_deref(),
+            Some("https://dav.example.com/dav/PiAgentSync/%E5%BF%AB%E7%85%A7%20%E5%8C%85.zip")
+        );
+        assert_eq!(header(&request, "Overwrite").as_deref(), Some("F"));
+        assert_eq!(request.timeout, CONTROL_TIMEOUT);
+    }
+
+    #[test]
+    fn rename_accepts_204_and_overwrite() {
+        let (client, transport) = client(vec![Ok(response(204))]);
+
+        let outcome = client.rename("a", "b", true).unwrap();
+
+        assert_eq!(outcome, RenameOutcome::Renamed);
+        assert_eq!(header(&transport.last(), "Overwrite").as_deref(), Some("T"));
+    }
+
+    #[test]
+    fn rename_reports_existing_target_separately_from_network_failures() {
+        for status in [409, 412] {
+            let (client, _) = client(vec![Ok(response(status))]);
+
+            assert_eq!(
+                client.rename("a", "b", false),
+                Ok(RenameOutcome::TargetExists),
+                "状态 {status}"
+            );
+        }
+
+        let (client, _) = client(vec![Ok(response(500))]);
+        assert_eq!(
+            client.rename("a", "b", false),
+            Err(DavError::Unreachable("服务端返回 HTTP 500".to_string()))
         );
     }
 

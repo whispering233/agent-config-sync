@@ -17,6 +17,7 @@ mod runtime;
 mod scope;
 mod secrets;
 mod snapshot;
+mod store;
 mod tray;
 mod versions;
 mod webdav;
