@@ -328,7 +328,7 @@ impl<T: DavTransport> PackageStore for WebdavStore<'_, T> {
         self.ensure_root()?;
         let temp = temp_name(name, now_nanos());
 
-        if let Err(error) = self.client.put(&temp, bytes, &[]) {
+        if let Err(error) = self.client.put(&temp, bytes) {
             let _ = self.client.delete(&temp);
             return Err(StoreError::from_dav(error));
         }

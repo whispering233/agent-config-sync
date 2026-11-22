@@ -83,5 +83,6 @@ npm run build
 
 - 版本号三处同步：`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`；`Cargo.lock` 与 `package-lock.json` 一并更新。
 - `CHANGELOG.md` 先落 `## [vX.Y.Z] - <日期>`；tag 必须是 `vX.Y.Z`。
+- 推送前确认当前 `gh` 账号是仓库属主（`gh auth status`，必要时 `gh auth switch`），否则 tag 推不上去或 Release 建到别人名下。
 - 先推 `main`，再推 tag；`release.yml` 建 Release，`desktop.yml` 构建 Linux/Windows 资产并上传。
 - 手动补包用 `workflow_dispatch`，目标 Release 必须已存在。

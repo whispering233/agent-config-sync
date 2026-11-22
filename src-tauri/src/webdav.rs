@@ -318,17 +318,12 @@ impl<T: DavTransport> WebdavClient<T> {
         }
     }
 
-    /// 上传文件。条件头（`If-Match` / `If-None-Match`）由调用方原样传入。
-    pub fn put(
-        &self,
-        rel: &str,
-        body: &[u8],
-        headers: &[(String, String)],
-    ) -> Result<(), DavError> {
+    /// 上传文件。包名唯一且只增不改，所以不带条件头。
+    pub fn put(&self, rel: &str, body: &[u8]) -> Result<(), DavError> {
         let response = self.transport.send(DavRequest {
             method: "PUT".to_string(),
             url: self.url(rel),
-            headers: headers.to_vec(),
+            headers: Vec::new(),
             body: Some(body.to_vec()),
             timeout: self.transfer_timeout,
         })?;
@@ -446,7 +441,7 @@ pub fn probe<T: DavTransport>(client: &WebdavClient<T>) -> Result<ProbeOutcome, 
         }
     };
 
-    client.put(crate::package::PROBE_FILE_NAME, b"ok", &[])?;
+    client.put(crate::package::PROBE_FILE_NAME, b"ok")?;
 
     Ok(ProbeOutcome {
         created,
@@ -1126,22 +1121,19 @@ mod tests {
     }
 
     #[test]
-    fn put_passes_body_and_condition_headers_through() {
+    fn put_sends_body_and_transfer_timeout() {
         let (client, transport) = client(vec![Ok(response(201))]);
-        let headers = vec![("If-Match".to_string(), "\"v1\"".to_string())];
 
-        client
-            .put("snapshot/manifest.json", b"{}", &headers)
-            .unwrap();
+        client.put("20261122-105230-deadbeef.zip", b"{}").unwrap();
 
         let request = transport.last();
         assert_eq!(request.method, "PUT");
         assert_eq!(
             request.url,
-            "https://dav.example.com/dav/PiAgentSync/snapshot/manifest.json"
+            "https://dav.example.com/dav/PiAgentSync/20261122-105230-deadbeef.zip"
         );
         assert_eq!(request.body.as_deref(), Some(&b"{}"[..]));
-        assert_eq!(header(&request, "If-Match").as_deref(), Some("\"v1\""));
+        assert!(request.headers.is_empty(), "上传不带条件头");
         assert_eq!(request.timeout, TRANSFER_TIMEOUT);
     }
 
@@ -1150,7 +1142,7 @@ mod tests {
         let (client, _) = client(vec![Ok(response(412))]);
 
         assert_eq!(
-            client.put("snapshot/manifest.json", b"{}", &[]),
+            client.put("snapshot/manifest.json", b"{}"),
             Err(DavError::PreconditionFailed)
         );
     }
@@ -1315,7 +1307,7 @@ mod tests {
         let transport = FakeTransport::new(vec![Ok(response(201))]);
         let client = WebdavClient::new(transport.clone(), BASE);
 
-        client.put("snapshot/配置 文件.json", b"x", &[]).unwrap();
+        client.put("snapshot/配置 文件.json", b"x").unwrap();
 
         assert_eq!(
             transport.last().url,

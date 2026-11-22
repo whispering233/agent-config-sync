@@ -1,4 +1,15 @@
+# Changelog
+
+格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
+版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+
 ## [Unreleased]
+
+## [v0.0.3] - 2026-11-22
+
+### Note
+
+- 快照格式升到 v3，且容器从目录换成单个 zip。0.0.2 及更早版本产出的快照（目录布局或 `formatVersion` ≤ 2）一律拒绝读取，升级后需在**源机**重新导出一份；旧残留只列在「无法识别的文件」里，不会被当成包。
 
 ### Changed
 
