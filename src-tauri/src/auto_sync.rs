@@ -220,10 +220,25 @@ fn run_once(app: &AppHandle, config: &AppConfig) {
     };
     let client = WebdavClient::new(transport, &credentials.url);
     let versions = snapshot::SourceVersions::default();
+    let home_dir = app.path().home_dir().ok();
     let outcome = if config.auto_sync_include_credentials {
-        webdav_transfer::upload(&client, &data_dir, &agent_dir, &versions, false)
+        webdav_transfer::upload(
+            &client,
+            &data_dir,
+            &agent_dir,
+            home_dir.as_deref(),
+            &versions,
+            false,
+        )
     } else {
-        webdav_transfer::upload_excluding_auth(&client, &data_dir, &agent_dir, &versions, false)
+        webdav_transfer::upload_excluding_auth(
+            &client,
+            &data_dir,
+            &agent_dir,
+            home_dir.as_deref(),
+            &versions,
+            false,
+        )
     };
 
     match outcome {

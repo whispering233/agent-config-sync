@@ -1,6 +1,9 @@
 //! 应用快照：先备份再落地，删除需逐项确认。
 //!
 //! 规则来源：`docs/design/10-snapshot-sync.md` 第 6、7 节。
+//! 落地按 manifest 的 `managedRoots` 分根进行：`agent` 根写 `<agent_dir>`，`agents-skills`
+//! 根写 `<home>/.agents/skills`。计划项、删除请求与备份条目都带 `root`，两个根里相同的
+//! 相对路径因此不会串。
 //! 顺序固定：重算计划 → 核对指纹与删除清单 → 备份 → 重建链接 → 写入/删除 → 清理旧备份。
 //! 符号链接优先按 manifest 的 `symlinks` 重建；目标不存在（含断链）或平台不允许建链接时
 //! 退回物化写入，后者要整棵子树写出：计划是按链接视角算的，只写新增/修改项会丢内容。
@@ -11,14 +14,14 @@ use crate::config;
 use crate::doctor::{CommandRunner, ShellRunner};
 use crate::plan;
 use crate::platform::{self, HostOs};
-use crate::scope;
-use crate::snapshot::{ManifestSymlink, MANIFEST_FILE_NAME, SNAPSHOT_DIR_NAME};
+use crate::scope::{self, ManagedRoots, RootId};
+use crate::snapshot::{self, ManifestSymlink, MANIFEST_FILE_NAME};
 use crate::webdav_transfer;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
@@ -29,7 +32,11 @@ pub const BACKUP_FILES_DIR_NAME: &str = "files";
 /// 备份说明文件名。
 pub const RESTORE_FILE_NAME: &str = "restore.json";
 /// `restore.json` 的格式版本。回滚按这个版本读取。
-pub const RESTORE_VERSION: u32 = 1;
+///
+/// 版本 2 给每个条目加了 `root`；版本 1 的旧备份没有这个字段，按 `agent` 根读取。
+pub const RESTORE_VERSION: u32 = 2;
+/// 回滚能读的版本。旧备份不升级、不改写，只按缺省根读取。
+pub const SUPPORTED_RESTORE_VERSIONS: [u32; 2] = [1, RESTORE_VERSION];
 /// 保留最近几份备份。
 pub const BACKUP_RETENTION: usize = 10;
 /// 备份目录权限：只允许本用户读（Windows 没有权限位，建目录时不设）。
@@ -94,17 +101,31 @@ pub enum RestoreKind {
     Dir,
 }
 
-/// 备份里的一条：原始路径、类型、原权限、链接目标。
+/// 备份里的一条：所属根、原始路径、类型、原权限、链接目标。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreEntry {
-    /// 相对宿主目录的路径，`/` 分隔。
+    /// 所属受管根。版本 1 的旧备份没有这个字段，按 `agent` 根读取。
+    #[serde(default)]
+    pub root: RootId,
+    /// 相对所属受管根的路径，`/` 分隔。
     pub path: String,
     pub kind: RestoreKind,
     /// 应用前该路径是否存在；新增文件为 false，此时没有内容备份。
     pub existed: bool,
     pub mode: Option<u32>,
     pub link_target: Option<String>,
+}
+
+/// 一条删除请求：所属受管根 + 根内相对路径。
+///
+/// 两个根可能有同一个相对路径（例如都叫 `settings.json`），裸路径分不清是哪一个，
+/// 所以从前端到后端必须成对传递。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteRequest {
+    pub root: RootId,
+    pub path: String,
 }
 
 /// 备份说明。回滚只读这个文件就能还原。
@@ -139,25 +160,29 @@ impl LinkCreator for PlatformLinkCreator {
     }
 }
 
-/// core：应用快照。`delete_paths` 是用户勾选确认的删除项，其余删除候选原样保留。
+/// core：应用快照。`delete_requests` 是用户逐项勾选确认的删除项（带所属根），
+/// 其余删除候选原样保留。
+///
+/// 落地按 manifest 的 `managedRoots` 分根：每个写入、删除、链接、备份条目都用它的
+/// `root` 找到本机根目录。
 pub fn apply(
     agent_dir: &Path,
+    home_dir: Option<&Path>,
     sync_root: &Path,
     expected_fingerprint: &str,
-    delete_paths: &[String],
+    delete_requests: &[DeleteRequest],
     app_data_dir: &Path,
     runner: &dyn CommandRunner,
     link_creator: &dyn LinkCreator,
 ) -> Result<ApplyReport, ApplyFailure> {
     // 计划可能已经过时：用户看的是旧计划，落地前必须按当前磁盘重算一次。
-    let report = plan::plan_snapshot(agent_dir, sync_root, runner, HostOs::current()).map_err(
-        |failure| {
+    let report = plan::plan_snapshot(agent_dir, home_dir, sync_root, runner, HostOs::current())
+        .map_err(|failure| {
             ApplyFailure::new(
                 "manifest_invalid",
                 format!("快照校验未通过（{}）：{}", failure.code, failure.message),
             )
-        },
-    )?;
+        })?;
     if report.manifest_info.fingerprint != expected_fingerprint {
         return Err(ApplyFailure::new(
             "plan_stale",
@@ -167,23 +192,22 @@ pub fn apply(
             ),
         ));
     }
-    let mut warnings: Vec<String> = Vec::new();
+    let recorded = read_manifest_records(sync_root)?;
+    // 根的解析与计划同源：声明了哪个根就只落哪个根，解析不到 home 就停。
+    let roots = plan::resolve_roots(agent_dir, home_dir, &recorded.managed_roots)
+        .map_err(|failure| ApplyFailure::new(failure.code, failure.message))?;
+    let mut warnings: Vec<String> = root_link_warnings(&roots);
 
-    let confirmed = confirm_deletes(agent_dir, &report.plan, delete_paths)?;
+    let confirmed = confirm_deletes(&roots, &report.plan, delete_requests)?;
     // 导出时链接被物化成内容，落地时优先按 manifest 的记录重建。
-    let recorded_links = manifest_links(sync_root)?;
-    let candidates = rebuildable_links(agent_dir, &recorded_links, &mut warnings);
-    let planned: Vec<&str> = candidates
-        .iter()
-        .map(|link| link.relative.as_str())
-        .collect();
+    let candidates = rebuildable_links(&roots, &recorded.symlinks, &mut warnings);
     // 删除会跟随祖先目录里的符号链接落到外部位置；将被重建的链接不算，其余必须在建备份前整次拒绝。
-    reject_delete_through_symlink(agent_dir, &confirmed, &planned)?;
+    reject_delete_through_symlink(&roots, &confirmed, &candidates)?;
     let skipped = report.plan.deleted.len() - confirmed.len();
 
     let backup = create_backup_dir(app_data_dir)?;
     write_backup(
-        agent_dir,
+        &roots,
         &report.plan,
         &report.manifest_info.fingerprint,
         &confirmed,
@@ -199,23 +223,27 @@ pub fn apply(
     let mut materialized: Vec<&RebuildLink> = Vec::new();
     let mut written = 0;
     for link in &candidates {
-        match rebuild_link(agent_dir, link, link_creator) {
+        let Some(root_dir) = roots.path(link.root) else {
+            return Err(root_undeclared(&backup, rebuilt.len() + written, link.root));
+        };
+        match rebuild_link(root_dir, link, link_creator) {
             Ok(()) => rebuilt.push(link),
             Err(link_error) => {
-                let files = materialize_snapshot_subtree(agent_dir, sync_root, &link.relative)
-                    .map_err(|error| {
-                        materialize_failed(
-                            &backup,
-                            rebuilt.len() + written,
-                            link,
-                            &link_error,
-                            &error,
-                        )
-                    })?;
+                let files =
+                    materialize_snapshot_subtree(root_dir, sync_root, link.root, &link.relative)
+                        .map_err(|error| {
+                            materialize_failed(
+                                &backup,
+                                rebuilt.len() + written,
+                                link,
+                                &link_error,
+                                &error,
+                            )
+                        })?;
                 written += files;
                 warnings.push(format!(
                     "{} 无法重建为链接（{link_error}），已把快照里该目录的整棵内容写成真实文件",
-                    link.relative
+                    link.root.describe(&link.relative)
                 ));
                 materialized.push(link);
             }
@@ -227,49 +255,82 @@ pub fn apply(
         // 链接之下的内容由链接目标提供；链接建不成时，那棵子树也已随物化整棵写出。
         if candidates
             .iter()
-            .any(|link| is_under(&item.path, &link.relative))
+            .any(|link| link.root == item.root && is_under(&item.path, &link.relative))
         {
             continue;
         }
-        write_snapshot_file(agent_dir, sync_root, &item.path)
-            .map_err(|error| fail(&backup, linked + written, &item.path, error))?;
+        let Some(root_dir) = roots.path(item.root) else {
+            return Err(root_undeclared(&backup, linked + written, item.root));
+        };
+        write_snapshot_file(root_dir, item.root, sync_root, &item.path)
+            .map_err(|error| fail(&backup, linked + written, item.root, &item.path, error))?;
         written += 1;
     }
 
     let mut deleted = 0;
+    let mut deleted_external = 0;
     let mut skipped_deletes = 0;
     let mut skipped_under_materialized = 0;
-    for relative in &confirmed {
+    for request in &confirmed {
+        let relative = request.path.as_str();
         // 删除一律以「候选链接」为准：计划是按链接视角算的，对着已经移走的位置执行会 ENOENT。
         if let Some(link) = candidates
             .iter()
-            .find(|link| is_under(relative, &link.relative))
+            .find(|link| link.root == request.root && is_under(relative, &link.relative))
         {
             skipped_deletes += 1;
             if materialized
                 .iter()
-                .any(|item| item.relative == link.relative)
+                .any(|item| item.root == link.root && item.relative == link.relative)
             {
                 skipped_under_materialized += 1;
+                // 链接换成物化目录时旧路径已经不在了：这条不是“保留着没删”，而是随目录替换从受管路径上消失。
+                // 原内容只在链接目标与本次备份里。
                 warnings.push(format!(
-                    "{relative} 落在 {} 之下，而该链接无法重建（内容已按快照物化），未删除",
+                    "{} 落在 {} 之下；该链接无法重建，已按快照整棵物化，它已随目录替换从受管路径上消失（链接目标里的原文件未动），原内容在本次备份中",
+                    request.root.describe(relative),
                     link.relative
                 ));
             } else {
                 warnings.push(format!(
-                    "{relative} 由链接 {} 的目标提供，未删除",
+                    "{} 由链接 {} 的目标提供，未删除",
+                    request.root.describe(relative),
                     link.relative
                 ));
             }
             continue;
         }
-        delete_target(agent_dir, relative)
-            .map_err(|error| fail(&backup, linked + written + deleted, relative, error))?;
+        let Some(root_dir) = roots.path(request.root) else {
+            return Err(root_undeclared(
+                &backup,
+                linked + written + deleted,
+                request.root,
+            ));
+        };
+        delete_target(root_dir, relative).map_err(|error| {
+            fail(
+                &backup,
+                linked + written + deleted,
+                request.root,
+                relative,
+                error,
+            )
+        })?;
         deleted += 1;
+        if request.root == RootId::AgentsSkills {
+            deleted_external += 1;
+        }
     }
     if skipped_under_materialized > 0 {
         warnings.push(format!(
-            "因链接无法重建，这 {skipped_under_materialized} 项删除已跳过"
+            "因链接无法重建，这 {skipped_under_materialized} 项勾选删除已随目录替换消失（不是单独删除），原内容在本次备份中"
+        ));
+    }
+    // 共享目录里的删除是这次应用影响面最大的一步：完了再说一句，让人知道别处可能受影响。
+    if deleted_external > 0 {
+        warnings.push(format!(
+            "已从共享目录 {} 删除 {deleted_external} 项：其它 agent 工具也可能使用这些技能；原内容已进入本次备份",
+            RootId::AgentsSkills.label()
         ));
     }
 
@@ -287,11 +348,32 @@ pub fn apply(
     })
 }
 
-fn fail(backup: &Backup, completed: usize, path: &str, error: io::Error) -> ApplyFailure {
+fn fail(
+    backup: &Backup,
+    completed: usize,
+    root: RootId,
+    path: &str,
+    error: io::Error,
+) -> ApplyFailure {
     ApplyFailure {
         code: "apply_failed",
         message: format!(
-            "落地 {path} 时失败：{error}；已立即停止，备份在 {}",
+            "落地 {} 时失败：{error}；已立即停止，备份在 {}",
+            root.describe(path),
+            backup.dir.display()
+        ),
+        completed,
+        backup_dir: Some(backup.dir.clone()),
+    }
+}
+
+/// 计划或链接记录里的根没在 manifest 里声明：manifest 自相矛盾，停在原地。
+fn root_undeclared(backup: &Backup, completed: usize, root: RootId) -> ApplyFailure {
+    ApplyFailure {
+        code: "apply_failed",
+        message: format!(
+            "快照没有声明 {} 根：拒绝落地它的条目；已立即停止，备份在 {}",
+            root.label(),
             backup.dir.display()
         ),
         completed,
@@ -311,7 +393,7 @@ fn materialize_failed(
         code: "apply_failed",
         message: format!(
             "{} 重建链接失败（{link_error}），改成写入快照内容也失败（{error}）；已立即停止，备份在 {}",
-            link.relative,
+            link.root.describe(&link.relative),
             backup.dir.display()
         ),
         completed,
@@ -319,107 +401,170 @@ fn materialize_failed(
     }
 }
 
-/// 删除清单校验：每一项都必须是重算计划里的删除候选，且落在受管范围内。
+/// 根的类型不进入快照：链接只跟随内容。导出侧已给过一条告警，落地这边再说一次，
+/// 因为写入与删除会落到链接目标而不是根路径本身。
+fn root_link_warnings(roots: &ManagedRoots) -> Vec<String> {
+    roots
+        .iter()
+        .filter(|root| platform::is_link_like(&root.path))
+        .map(|root| {
+            format!(
+                "{}（{}）是符号链接：只同步其内容，不记录根链接；写入与删除会落到链接目标",
+                root.id.label(),
+                root.path.display()
+            )
+        })
+        .collect()
+}
+
+/// 删除清单校验：每一项都必须是重算计划里的删除候选（根 + 路径都要对上）。
 /// 任何一项不合格就整次拒绝，不做部分执行。
 fn confirm_deletes(
-    agent_dir: &Path,
+    roots: &ManagedRoots,
     plan: &plan::Plan,
-    delete_paths: &[String],
-) -> Result<Vec<String>, ApplyFailure> {
-    let mut confirmed: Vec<String> = Vec::new();
-    for path in delete_paths {
-        // 计划里的删除候选只来自受管范围；`resolve_within` 再挡一次空路径、`..` 与绝对路径。
-        let in_plan = plan.deleted.iter().any(|item| &item.path == path);
-        if !in_plan || scope::resolve_within(agent_dir, Path::new(path)).is_err() {
-            return Err(ApplyFailure::new(
-                "delete_not_in_plan",
-                format!("{path} 不在本次计划的删除候选里，或不在受管范围内；整次应用已拒绝"),
-            ));
+    delete_requests: &[DeleteRequest],
+) -> Result<Vec<DeleteRequest>, ApplyFailure> {
+    let mut confirmed: Vec<DeleteRequest> = Vec::new();
+    for request in delete_requests {
+        if !plan
+            .deleted
+            .iter()
+            .any(|item| item.root == request.root && item.path == request.path)
+        {
+            return Err(delete_not_in_plan(request.root, &request.path));
         }
-        if !confirmed.contains(path) {
-            confirmed.push(path.clone());
+        // 计划里的删除候选只来自受管范围；`resolve_within` 再挡一次空路径、`..` 与绝对路径。
+        let root_dir = roots.path(request.root).ok_or_else(|| {
+            ApplyFailure::new(
+                "manifest_invalid",
+                format!(
+                    "快照没有声明 {} 根，却给出了它的删除候选；整次应用已拒绝",
+                    request.root.label()
+                ),
+            )
+        })?;
+        if scope::resolve_within(root_dir, Path::new(&request.path)).is_err() {
+            return Err(delete_not_in_plan(request.root, &request.path));
+        }
+        if !confirmed.contains(request) {
+            confirmed.push(request.clone());
         }
     }
     Ok(confirmed)
 }
 
+fn delete_not_in_plan(root: RootId, path: &str) -> ApplyFailure {
+    ApplyFailure::new(
+        "delete_not_in_plan",
+        format!(
+            "{} 不在本次计划的删除候选里，或不在受管范围内；整次应用已拒绝",
+            root.describe(path)
+        ),
+    )
+}
+
 /// 删除前置校验：待删路径的祖先目录（不含自身）是符号链接时整次拒绝。
-/// 将被重建的 manifest 链接（`rebuilt`）不算：它们会指回原目标，链接下的删除改由跳过处理。
+/// 将被重建的 manifest 链接不算：它们会指回原目标，链接下的删除改由跳过处理。
 /// 此时还没有建备份、没有写任何文件，用户手动处理链接后可以原样重跑。
 fn reject_delete_through_symlink(
-    agent_dir: &Path,
-    confirmed: &[String],
-    rebuilt: &[&str],
+    roots: &ManagedRoots,
+    confirmed: &[DeleteRequest],
+    rebuilt: &[RebuildLink],
 ) -> Result<(), ApplyFailure> {
-    for relative in confirmed {
-        let ancestor = symlink_ancestors(agent_dir, relative)
+    for request in confirmed {
+        let Some(root_dir) = roots.path(request.root) else {
+            continue;
+        };
+        let ancestor = symlink_ancestors(root_dir, &request.path)
             .into_iter()
-            .find(|ancestor| !rebuilt.contains(&ancestor.as_str()));
+            .find(|ancestor| {
+                !rebuilt
+                    .iter()
+                    .any(|link| link.root == request.root && link.relative == *ancestor)
+            });
         if let Some(ancestor) = ancestor {
             return Err(ApplyFailure::new(
                 "delete_through_symlink",
-                format!("{relative} 的路径经过符号链接 {ancestor}，拒绝删除；请先手动处理该目录"),
+                format!(
+                    "{} 的路径经过符号链接 {ancestor}，拒绝删除；请先手动处理该目录",
+                    request.root.describe(&request.path)
+                ),
             ));
         }
     }
     Ok(())
 }
 
-/// 一条待重建的链接：宿主目录内的相对路径与 manifest 记下的原目标。
+/// 一条待重建的链接：所属根、根内相对路径与 manifest 记下的原目标。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RebuildLink {
+    root: RootId,
     relative: String,
     target: String,
     /// 目标是目录还是文件；Windows 只有这两种链接，Unix 建链接不分类型。
     is_dir: bool,
 }
 
-/// manifest 里的 `symlinks`。导出端把链接物化成内容，同时把原目标记在这里。
+/// 落地时真正需要的 manifest 字段。完整校验已在计划阶段做过。
 #[derive(Debug, Deserialize)]
-struct ManifestLinks {
+#[serde(rename_all = "camelCase")]
+struct ManifestRecords {
+    #[serde(default)]
+    managed_roots: Vec<RootId>,
     #[serde(default)]
     symlinks: Vec<ManifestSymlink>,
 }
 
-/// 读 manifest 的链接记录。校验已在计划阶段做过，这里只取落地需要的部分。
-fn manifest_links(sync_root: &Path) -> Result<Vec<ManifestSymlink>, ApplyFailure> {
+fn read_manifest_records(sync_root: &Path) -> Result<ManifestRecords, ApplyFailure> {
     let path = sync_root.join(MANIFEST_FILE_NAME);
     let text = fs::read_to_string(&path).map_err(|error| {
         ApplyFailure::new(
             "manifest_invalid",
-            format!("读取 manifest 里的链接记录失败：{error}"),
+            format!("读取 manifest 里的受管根与链接记录失败：{error}"),
         )
     })?;
-    let manifest: ManifestLinks = serde_json::from_str(&text).map_err(|error| {
+    serde_json::from_str(&text).map_err(|error| {
         ApplyFailure::new(
             "manifest_invalid",
-            format!("manifest 里的链接记录无法解析：{error}"),
+            format!("manifest 里的受管根与链接记录无法解析：{error}"),
         )
-    })?;
-    Ok(manifest.symlinks)
+    })
 }
 
-/// 算出要重建的链接：路径在受管范围内且目标存在。
+/// 算出要重建的链接：所在根已声明、路径在受管范围内、目标存在。
 /// 目标不存在（含断链）就不重建，退回物化写入并记 warning。
 fn rebuildable_links(
-    agent_dir: &Path,
+    roots: &ManagedRoots,
     links: &[ManifestSymlink],
     warnings: &mut Vec<String>,
 ) -> Vec<RebuildLink> {
     let mut rebuilt: Vec<RebuildLink> = Vec::new();
     for link in links {
-        let relative = link_relative(&link.path);
-        let relative_path = Path::new(relative);
+        let Some((root, relative_path)) = snapshot::split_manifest_path(&link.path)
+            .filter(|(_, relative)| !relative.as_os_str().is_empty())
+        else {
+            warnings.push(format!("{} 不在快照目录之下，未重建链接", link.path));
+            continue;
+        };
+        let relative = slash(&relative_path);
+        let Some(root_dir) = roots.path(root) else {
+            warnings.push(format!(
+                "{} 所属的 {} 根不在本快照里，未重建链接",
+                relative,
+                root.label()
+            ));
+            continue;
+        };
         // auth.json 只以普通文件落地，不按 manifest 重建链接，避免把凭据指向范围外。
-        if relative_path == Path::new("auth.json") {
-            warnings.push(format!("{relative} 是凭据文件，未按链接重建"));
+        if is_credential(root, &relative) {
+            warnings.push(format!("{} 是凭据文件，未按链接重建", relative));
             continue;
         }
         // 被改过的 manifest 可能指向受管范围之外：不重建。
-        if !is_managed_link(relative_path)
-            || scope::resolve_within(agent_dir, relative_path).is_err()
+        if !is_managed_link(root, &relative_path)
+            || scope::resolve_within(root_dir, &relative_path).is_err()
         {
-            warnings.push(format!("{relative} 不在受管范围内，未重建链接"));
+            warnings.push(format!("{} 不在受管范围内，未重建链接", relative));
             continue;
         }
         let Some(parent) = relative_path.parent() else {
@@ -428,7 +573,7 @@ fn rebuildable_links(
         };
         // 链接目标相对链接所在目录解释；绝对目标直接决定位置。
         // Windows 建链接要按目标类型分开调，所以这里顺手记下目标是文件还是目录。
-        let target_metadata = match fs::metadata(agent_dir.join(parent).join(&link.target)) {
+        let target_metadata = match fs::metadata(root_dir.join(parent).join(&link.target)) {
             Ok(metadata) => metadata,
             Err(_) => {
                 warnings.push(format!(
@@ -438,17 +583,25 @@ fn rebuildable_links(
                 continue;
             }
         };
-        if rebuilt.iter().any(|item| item.relative == relative) {
+        if rebuilt
+            .iter()
+            .any(|item| item.root == root && item.relative == relative)
+        {
             continue;
         }
         rebuilt.push(RebuildLink {
-            relative: relative.to_string(),
+            root,
+            relative,
             target: link.target.clone(),
             is_dir: target_metadata.is_dir(),
         });
     }
-    // 外层链接先建，嵌套链接才能落到链接目标里。
-    rebuilt.sort_by(|left, right| left.relative.cmp(&right.relative));
+    // 外层链接先建，嵌套链接才能落到链接目标里；同根内按路径排序，外层自然在前。
+    rebuilt.sort_by(|left, right| {
+        left.root
+            .cmp(&right.root)
+            .then_with(|| left.relative.cmp(&right.relative))
+    });
     rebuilt
 }
 
@@ -456,11 +609,11 @@ fn rebuildable_links(
 /// 旧路径是真目录时整棵删除：里面的内容按约定由链接目标提供，不保留本地副本。
 /// 建链接失败时旧内容已经不在，调用方必须整棵物化快照内容补回。
 fn rebuild_link(
-    agent_dir: &Path,
+    root_dir: &Path,
     link: &RebuildLink,
     link_creator: &dyn LinkCreator,
 ) -> io::Result<()> {
-    let path = scope::resolve_within(agent_dir, Path::new(&link.relative)).map_err(to_io_error)?;
+    let path = scope::resolve_within(root_dir, Path::new(&link.relative)).map_err(to_io_error)?;
     if let Some(parent) = path.parent() {
         // 父目录可以本身就是链接：跟随它，不换成真实目录。
         fs::create_dir_all(parent)?;
@@ -476,13 +629,6 @@ fn rebuild_link(
     link_creator.create_link(&link.target, &path, link.is_dir)
 }
 
-/// manifest 里的路径形如 `snapshot/skills/antd`；落地时用相对宿主目录的路径。
-fn link_relative(path: &str) -> &str {
-    path.strip_prefix(SNAPSHOT_DIR_NAME)
-        .and_then(|rest| rest.strip_prefix('/'))
-        .unwrap_or(path)
-}
-
 /// `path` 是否就是 `ancestor` 或在它之下；按路径分段判，不把 `skills-extra` 当成 `skills` 的子项。
 fn is_under(path: &str, ancestor: &str) -> bool {
     path == ancestor
@@ -491,29 +637,23 @@ fn is_under(path: &str, ancestor: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// 链接路径必须在受管范围内：白名单与排除规则同计划，但链接本身可以是目录，
-/// 所以根级目录名也算在内。目的是不让被改过的 manifest 借链接删掉范围外文件。
-pub(crate) fn is_managed_link(relative: &Path) -> bool {
-    let names: Vec<&str> = relative
-        .components()
-        .map(|component| match component {
-            Component::Normal(name) => name.to_str(),
-            _ => None,
-        })
-        .collect::<Option<Vec<&str>>>()
-        .unwrap_or_default();
+/// 链接路径必须在所属根的受管范围内：规则与计划同源（[`scope::is_managed_relative`]），
+/// 目的是不让被改过的 manifest 借链接删掉范围外文件。
+pub(crate) fn is_managed_link(root: RootId, relative: &Path) -> bool {
+    scope::is_managed_relative(root, relative)
+}
 
-    if names.is_empty() || scope::is_excluded_relative(relative) {
-        return false;
-    }
-    if names.len() > 1 {
-        return scope::INCLUDED_ROOT_DIRS.contains(&names[0]);
-    }
-    scope::INCLUDED_ROOT_FILES.contains(&names[0])
-        || scope::INCLUDED_ROOT_DIRS.contains(&names[0])
-        || Path::new(names[0])
-            .extension()
-            .is_some_and(|extension| extension == "json")
+/// 凭据文件只认 `agent` 根的根级 `auth.json`：权限收紧到 0600，且不按链接重建。
+fn is_credential(root: RootId, relative: &str) -> bool {
+    root == RootId::Agent && relative == "auth.json"
+}
+
+/// 根内相对路径 → `/` 分隔的字符串，与计划项和备份条目里的写法一致。
+fn slash(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// 建备份目录：`<app_data>/backups/<UTC 时间戳>/files/`，权限 0700。
@@ -548,68 +688,78 @@ fn create_backup_dir(app_data_dir: &Path) -> Result<Backup, ApplyFailure> {
 
 /// 备份将被覆盖或删除的现有文件，写下 `restore.json`。
 fn write_backup(
-    agent_dir: &Path,
+    roots: &ManagedRoots,
     plan: &plan::Plan,
     fingerprint: &str,
-    confirmed: &[String],
+    confirmed: &[DeleteRequest],
     backup: &Backup,
 ) -> Result<(), ApplyFailure> {
-    let mut touched: Vec<&str> = plan
+    let mut touched: Vec<(RootId, &str)> = plan
         .added
         .iter()
         .chain(&plan.modified)
-        .map(|item| item.path.as_str())
+        .map(|item| (item.root, item.path.as_str()))
         .collect();
-    touched.extend(confirmed.iter().map(String::as_str));
+    touched.extend(
+        confirmed
+            .iter()
+            .map(|request| (request.root, request.path.as_str())),
+    );
 
-    write_backup_entries(agent_dir, &touched, fingerprint, backup)
+    write_backup_entries(roots, &touched, fingerprint, backup, false)
 }
 
 /// 回滚前再备份一次：把即将被改动或删除的路径按同一格式写进新备份目录。
 /// 返回备份目录名与位置；`fingerprint` 由调用方给（回滚时记被还原备份的指纹）。
 pub(crate) fn back_up_paths(
-    agent_dir: &Path,
+    roots: &ManagedRoots,
     app_data_dir: &Path,
-    relatives: &[&str],
+    touched: &[(RootId, &str)],
     fingerprint: &str,
 ) -> Result<(String, PathBuf), ApplyFailure> {
     let backup = create_backup_dir(app_data_dir)?;
-    let files_dir = backup.dir.join(BACKUP_FILES_DIR_NAME);
-    let mut entries = symlink_ancestors_of(agent_dir, relatives)
-        .iter()
-        .map(|relative| record(agent_dir, relative, &files_dir, true))
-        .collect::<Result<Vec<RestoreEntry>, ApplyFailure>>()?;
-    entries.extend(
-        relatives
-            .iter()
-            .map(|relative| record(agent_dir, relative, &files_dir, true))
-            .collect::<Result<Vec<RestoreEntry>, ApplyFailure>>()?,
-    );
-    write_manifest(&backup, fingerprint, entries)?;
+    write_backup_entries(roots, touched, fingerprint, &backup, true)?;
     prune(&app_data_dir.join(BACKUPS_DIR_NAME));
 
     Ok((backup.id, backup.dir))
 }
 
+/// `allow_dir` 为 true 时允许目录条目：回滚前的安全备份不能因为某个路径此刻是目录就整次失败。
 fn write_backup_entries(
-    agent_dir: &Path,
-    touched: &[&str],
+    roots: &ManagedRoots,
+    touched: &[(RootId, &str)],
     fingerprint: &str,
     backup: &Backup,
+    allow_dir: bool,
 ) -> Result<(), ApplyFailure> {
     let files_dir = backup.dir.join(BACKUP_FILES_DIR_NAME);
+    let mut entries = Vec::new();
     // 写入时 `ensure_dir` 会把祖先链接换成真实目录，链接本身只能在写入前记下来；
     // 这些条目放在文件条目之前，回滚才能先恢复链接再往里放文件。
-    let mut entries = symlink_ancestors_of(agent_dir, touched)
-        .iter()
-        .map(|relative| record(agent_dir, relative, &files_dir, false))
-        .collect::<Result<Vec<RestoreEntry>, ApplyFailure>>()?;
-    entries.extend(
-        touched
+    for root in roots.iter() {
+        let relatives: Vec<&str> = touched
             .iter()
-            .map(|relative| record(agent_dir, relative, &files_dir, false))
-            .collect::<Result<Vec<RestoreEntry>, ApplyFailure>>()?,
-    );
+            .filter(|(id, _)| *id == root.id)
+            .map(|(_, relative)| *relative)
+            .collect();
+        if relatives.is_empty() {
+            continue;
+        }
+        for ancestor in symlink_ancestors_of(&root.path, &relatives) {
+            entries.push(record(
+                root.id, &root.path, &ancestor, &files_dir, allow_dir,
+            )?);
+        }
+    }
+    for (root, relative) in touched {
+        let Some(root_dir) = roots.path(*root) else {
+            return Err(ApplyFailure::new(
+                "backup_failed",
+                format!("快照没有声明 {} 根，无法备份它的条目", root.label()),
+            ));
+        };
+        entries.push(record(*root, root_dir, relative, &files_dir, allow_dir)?);
+    }
 
     write_manifest(backup, fingerprint, entries)
 }
@@ -644,8 +794,8 @@ fn symlink_ancestors_of(agent_dir: &Path, relatives: &[&str]) -> Vec<String> {
 }
 
 /// `relative` 的祖先目录里实际是符号链接的那些（不含自身），由外到内。
-pub(crate) fn symlink_ancestors(agent_dir: &Path, relative: &str) -> Vec<String> {
-    let mut current = agent_dir.to_path_buf();
+pub(crate) fn symlink_ancestors(root_dir: &Path, relative: &str) -> Vec<String> {
+    let mut current = root_dir.to_path_buf();
     let mut ancestor = String::new();
     let mut found = Vec::new();
     let mut components = Path::new(relative).components().peekable();
@@ -668,19 +818,24 @@ pub(crate) fn symlink_ancestors(agent_dir: &Path, relative: &str) -> Vec<String>
 /// 备份单个路径：文件复制内容，符号链接只记目标，新增文件只记 `existed: false`。
 /// `allow_dir` 只给回滚前的备份用：此刻是目录就记成目录条目，不挡回滚。
 fn record(
-    agent_dir: &Path,
+    root: RootId,
+    root_dir: &Path,
     relative: &str,
     files_dir: &Path,
     allow_dir: bool,
 ) -> Result<RestoreEntry, ApplyFailure> {
-    let live = scope::resolve_within(agent_dir, Path::new(relative)).map_err(|error| {
-        ApplyFailure::new("backup_failed", format!("无法定位 {relative}：{error}"))
+    let live = scope::resolve_within(root_dir, Path::new(relative)).map_err(|error| {
+        ApplyFailure::new(
+            "backup_failed",
+            format!("无法定位 {}：{error}", root.describe(relative)),
+        )
     })?;
 
     let metadata = match fs::symlink_metadata(&live) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(RestoreEntry {
+                root,
                 path: relative.to_string(),
                 kind: RestoreKind::File,
                 existed: false,
@@ -691,7 +846,7 @@ fn record(
         Err(error) => {
             return Err(ApplyFailure::new(
                 "backup_failed",
-                format!("读取 {relative} 的信息失败：{error}"),
+                format!("读取 {} 的信息失败：{error}", root.describe(relative)),
             ))
         }
     };
@@ -701,7 +856,7 @@ fn record(
         let target = fs::read_link(&live).map_err(|error| {
             ApplyFailure::new(
                 "backup_failed",
-                format!("读取 {relative} 的链接目标失败：{error}"),
+                format!("读取 {} 的链接目标失败：{error}", root.describe(relative)),
             )
         })?;
         Some(target.to_string_lossy().into_owned())
@@ -714,11 +869,15 @@ fn record(
         if !allow_dir {
             return Err(ApplyFailure::new(
                 "backup_failed",
-                format!("{relative} 现在是目录，无法作为文件应用；请重新检查后再应用"),
+                format!(
+                    "{} 现在是目录，无法作为文件应用；请重新检查后再应用",
+                    root.describe(relative)
+                ),
             ));
         }
         // 目录内容不会被回滚动到，回滚遇到目录也拒绝，所以只记条目。
         return Ok(RestoreEntry {
+            root,
             path: relative.to_string(),
             kind: RestoreKind::Dir,
             existed: true,
@@ -733,18 +892,23 @@ fn record(
     };
 
     if link_target.is_none() {
-        let destination = files_dir.join(relative);
+        // 备份内容按虚拟路径放：外部根落在 `external/agents-skills/...`，与快照布局一致。
+        let destination = files_dir.join(snapshot::virtual_path(root, Path::new(relative)));
         if let Some(parent) = destination.parent() {
             platform::create_dir_all_mode(parent, BACKUP_DIR_MODE).map_err(|error| {
                 ApplyFailure::new("backup_failed", format!("创建备份子目录失败：{error}"))
             })?;
         }
         fs::copy(&live, &destination).map_err(|error| {
-            ApplyFailure::new("backup_failed", format!("备份 {relative} 失败：{error}"))
+            ApplyFailure::new(
+                "backup_failed",
+                format!("备份 {} 失败：{error}", root.describe(relative)),
+            )
         })?;
     }
 
     Ok(RestoreEntry {
+        root,
         path: relative.to_string(),
         kind: if link_target.is_some() {
             RestoreKind::Symlink
@@ -775,51 +939,69 @@ fn prune(backups: &Path) {
     }
 }
 
-/// 写入一个快照文件：`<sync_root>/snapshot/<相对路径>` 落到宿主目录的同名位置。
-fn write_snapshot_file(agent_dir: &Path, sync_root: &Path, relative: &str) -> io::Result<()> {
-    let source = scope::resolve_within(&sync_root.join(SNAPSHOT_DIR_NAME), Path::new(relative))
-        .map_err(to_io_error)?;
-    let target = scope::resolve_within(agent_dir, Path::new(relative)).map_err(to_io_error)?;
-    write_file_content(&source, &target)
+/// 写入一个快照文件：`<sync_root>/snapshot/<虚拟路径>` 落到所属根目录的同名位置。
+fn write_snapshot_file(
+    root_dir: &Path,
+    root: RootId,
+    sync_root: &Path,
+    relative: &str,
+) -> io::Result<()> {
+    let source = snapshot_source(sync_root, root, relative)?;
+    let target = scope::resolve_within(root_dir, Path::new(relative)).map_err(to_io_error)?;
+    write_file_content(&source, &target, root_dir, is_credential(root, relative))
+}
+
+/// 快照目录里某个（根, 根内相对路径）的文件位置。
+fn snapshot_source(sync_root: &Path, root: RootId, relative: &str) -> io::Result<PathBuf> {
+    let manifest_path = snapshot::manifest_path(root, Path::new(relative));
+    scope::resolve_within(sync_root, Path::new(&manifest_path)).map_err(to_io_error)
 }
 
 /// 把快照里某个链接路径下的整棵子树写成真实文件，返回写出的文件数。
 /// 链接建不成时旧内容已经被清掉，只补计划里的新增/修改项会漏掉与快照一致的内容，所以整棵写出。
 fn materialize_snapshot_subtree(
-    agent_dir: &Path,
+    root_dir: &Path,
     sync_root: &Path,
+    root: RootId,
     relative: &str,
 ) -> io::Result<usize> {
-    let source = scope::resolve_within(&sync_root.join(SNAPSHOT_DIR_NAME), Path::new(relative))
-        .map_err(to_io_error)?;
-    let target = scope::resolve_within(agent_dir, Path::new(relative)).map_err(to_io_error)?;
-    materialize_subtree(&source, &target)
+    let source = snapshot_source(sync_root, root, relative)?;
+    let target = scope::resolve_within(root_dir, Path::new(relative)).map_err(to_io_error)?;
+    materialize_subtree(&source, &target, root_dir)
 }
 
 /// 递归物化：目录就地建出来（空目录也照样落地），普通文件逐个按快照内容写。
 /// 回滚重建链接失败时也走这里，源换成链接目标。
-pub(crate) fn materialize_subtree(source: &Path, target: &Path) -> io::Result<usize> {
+/// 写出的都是链接子树里的普通内容：`auth.json` 的凭据特例不适用于这些位置。
+/// `root` 是 `target` 所属的受管根：根本身是链接时跟随它，不换成真实目录。
+pub(crate) fn materialize_subtree(source: &Path, target: &Path, root: &Path) -> io::Result<usize> {
     if fs::metadata(source)?.is_dir() {
-        ensure_dir(target)?;
+        ensure_dir(root, target)?;
         let mut written = 0;
         for item in fs::read_dir(source)? {
             let item = item?;
-            written += materialize_subtree(&item.path(), &target.join(item.file_name()))?;
+            written += materialize_subtree(&item.path(), &target.join(item.file_name()), root)?;
         }
         Ok(written)
     } else {
-        write_file_content(source, target)?;
+        write_file_content(source, target, root, false)?;
         Ok(1)
     }
 }
 
 /// 先写同目录临时文件再替换，权限沿用原 mode。
-fn write_file_content(source: &Path, target: &Path) -> io::Result<()> {
+/// `root` 是 `target` 所属的受管根，交给 [`ensure_dir`] 决定根链接是跟随还是替换。
+/// `credential` 为 true 表示这是 `agent` 根级 `auth.json`：不论新建还是覆盖都收紧到 0600。
+fn write_file_content(
+    source: &Path,
+    target: &Path,
+    root: &Path,
+    credential: bool,
+) -> io::Result<()> {
     let bytes = fs::read(source)?;
-    // auth.json 不论新建还是覆盖都收紧到 0600；其他文件沿用原 mode，新增用 0644。
+    // 其他文件沿用原 mode，新增用 0644。
     // Windows 上 `set_mode` 不生效，保护来自用户目录的继承 ACL。
-    let is_auth = target.file_name().is_some_and(|name| name == "auth.json");
-    let mode = if is_auth {
+    let mode = if credential {
         AUTH_FILE_MODE
     } else {
         match fs::symlink_metadata(target) {
@@ -830,7 +1012,7 @@ fn write_file_content(source: &Path, target: &Path) -> io::Result<()> {
         }
     };
     if let Some(parent) = target.parent() {
-        ensure_dir(parent)?;
+        ensure_dir(root, parent)?;
     }
 
     // 目标是链接（或目录）时先删掉再写真实文件，绝不写穿链接。
@@ -866,19 +1048,25 @@ fn write_file_content(source: &Path, target: &Path) -> io::Result<()> {
     written
 }
 
-/// 逐级建目录；遇到链接先删链接再建真目录，绝不写穿链接。
-fn ensure_dir(dir: &Path) -> io::Result<()> {
+/// 逐级建目录；根之下的链接先删链接再建真目录，绝不写穿链接。
+///
+/// `root` 自己（及其上级）是链接时跟随它：根的类型不进快照，落地不重建根链接，
+/// 写入与删除都落到链接目标。把它换成真实目录会让目标机莫名其妙多出一份副本。
+fn ensure_dir(root: &Path, dir: &Path) -> io::Result<()> {
     let mut current = PathBuf::new();
     for component in dir.components() {
         current.push(component);
         // 链接必须先判：Windows 的目录型链接同时带目录属性，当成目录就是写穿。
-        if platform::is_link_like(&current) {
+        // 根自己不算：它下面才是受管内容，根本身按上面的规则跟随。
+        if current != root && current.starts_with(root) && platform::is_link_like(&current) {
             platform::remove_link(&current)?;
             fs::create_dir(&current)?;
             continue;
         }
         match fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.is_dir() => {}
+            // 根（或根的上级）是链接：跟着它走，内容照样落在链接目标里。
+            Ok(_) if platform::is_link_like(&current) => {}
             Ok(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
@@ -893,15 +1081,15 @@ fn ensure_dir(dir: &Path) -> io::Result<()> {
 }
 
 /// 删除一个已确认的条目：只删链接本身，不跟随链接；目录才整棵删除。
-fn delete_target(agent_dir: &Path, relative: &str) -> io::Result<()> {
+fn delete_target(root_dir: &Path, relative: &str) -> io::Result<()> {
     // 上级组件是符号链接时，删除会落到链接指向的外部目录，一律不动。
     // 正常流程已在 [`reject_delete_through_symlink`] 挡住，这里挡住校验之后才出现的链接。
-    if let Some(ancestor) = symlink_ancestors(agent_dir, relative).into_iter().next() {
+    if let Some(ancestor) = symlink_ancestors(root_dir, relative).into_iter().next() {
         return Err(io::Error::other(format!(
             "{relative} 的路径经过符号链接 {ancestor}，删除会落到链接指向的外部位置，已拒绝"
         )));
     }
-    let target = scope::resolve_within(agent_dir, Path::new(relative)).map_err(to_io_error)?;
+    let target = scope::resolve_within(root_dir, Path::new(relative)).map_err(to_io_error)?;
 
     // 链接只删链接本身：Windows 的目录型链接按目录删会连目标内容一起删。
     match fs::symlink_metadata(&target)? {
@@ -966,11 +1154,11 @@ fn utc_timestamp(unix_seconds: u64) -> String {
 pub async fn apply_snapshot(
     app: AppHandle,
     expected_fingerprint: String,
-    delete_paths: Vec<String>,
+    delete_requests: Vec<DeleteRequest>,
     root: Option<String>,
 ) -> Result<ApplyReport, ApplyFailure> {
     tauri::async_runtime::spawn_blocking(move || {
-        run(&app, &expected_fingerprint, &delete_paths, root)
+        run(&app, &expected_fingerprint, &delete_requests, root)
     })
     .await
     .map_err(|error| ApplyFailure::new("apply_failed", format!("应用失败：{error}")))?
@@ -979,7 +1167,7 @@ pub async fn apply_snapshot(
 fn run(
     app: &AppHandle,
     expected_fingerprint: &str,
-    delete_paths: &[String],
+    delete_requests: &[DeleteRequest],
     root: Option<String>,
 ) -> Result<ApplyReport, ApplyFailure> {
     let _guard = crate::runtime::lock_operation();
@@ -1022,9 +1210,10 @@ fn run(
 
     apply(
         &agent_dir,
+        home_dir.as_deref(),
         &sync_root,
         expected_fingerprint,
-        delete_paths,
+        delete_requests,
         &app_data_dir,
         &ShellRunner::from_env(),
         &PlatformLinkCreator,
@@ -1112,6 +1301,53 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("设置夹具权限");
     }
 
+    /// 删除请求：根 + 根内相对路径。两个根的同名路径因此不会串。
+    fn delete(root: RootId, path: &str) -> DeleteRequest {
+        DeleteRequest {
+            root,
+            path: path.to_string(),
+        }
+    }
+
+    /// 单根夹具的 home：存在但没有 `~/.agents/skills`，导出只声明 agent 根。
+    fn home_without_skills(temp: &TempDir) -> PathBuf {
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).expect("创建 home");
+        home
+    }
+
+    /// 双根夹具：快照声明了 `~/.agents/skills`，目标机的外部根有一处被改、
+    /// 还有一项快照里没有的技能（删除候选）。返回宿主目录、同步目录与目标机 home。
+    fn external_root_fixture(temp: &TempDir) -> (PathBuf, PathBuf, PathBuf) {
+        let agent = temp.path().join("agent");
+        let source_home = temp.path().join("source-home");
+        let sync_root = temp.path().join("cloud");
+        write_file(&agent.join("settings.json"), "{\"theme\": \"dark\"}");
+        write_file(
+            &source_home.join(".agents/skills/shared/SKILL.md"),
+            "# 共享技能\n",
+        );
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+        crate::snapshot::export_with(
+            &agent,
+            Some(&source_home),
+            &sync_root,
+            crate::snapshot::SourceVersions::default(),
+        )
+        .expect("导出夹具快照");
+
+        let target_home = temp.path().join("target-home");
+        write_file(
+            &target_home.join(".agents/skills/shared/SKILL.md"),
+            "# 共享技能（本机改过）\n",
+        );
+        write_file(
+            &target_home.join(".agents/skills/only-here/SKILL.md"),
+            "# 只在目标机\n",
+        );
+        (agent, sync_root, target_home)
+    }
+
     /// 宿主目录 + 已导出的快照：先保证"无差异"是基线。
     fn fixture(temp: &TempDir) -> (PathBuf, PathBuf) {
         let agent = temp.path().join("agent");
@@ -1123,7 +1359,8 @@ mod tests {
         write_file(&agent.join("auth.json"), "{\"token\": \"sk-test\"}");
         write_file(&agent.join("sessions/old.json"), "{}");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &sync_root).expect("导出夹具快照");
+        crate::snapshot::export(&agent, &home_without_skills(&temp), &sync_root)
+            .expect("导出夹具快照");
         (agent, sync_root)
     }
 
@@ -1134,10 +1371,24 @@ mod tests {
     }
 
     fn fingerprint(agent: &Path, sync_root: &Path) -> String {
-        plan::plan_snapshot(agent, sync_root, &FakeRunner::ok(), HostOs::Posix)
+        plan::plan_snapshot(agent, None, sync_root, &FakeRunner::ok(), HostOs::Posix)
             .expect("生成夹具计划")
             .manifest_info
             .fingerprint
+    }
+
+    /// 双根夹具的指纹：目标机的 home 参与外部根解析，必须同一个 home。
+    fn fingerprint_for(agent: &Path, home: &Path, sync_root: &Path) -> String {
+        plan::plan_snapshot(
+            agent,
+            Some(home),
+            sync_root,
+            &FakeRunner::ok(),
+            HostOs::Posix,
+        )
+        .expect("生成夹具计划")
+        .manifest_info
+        .fingerprint
     }
 
     /// 整棵子树的路径与内容，用于证明"没有写任何文件"。
@@ -1204,9 +1455,10 @@ mod tests {
         let expected = fingerprint(&agent, &sync_root);
         let report = apply(
             &agent,
+            None,
             &sync_root,
             &expected,
-            &["themes/old.json".to_string()],
+            &[delete(RootId::Agent, "themes/old.json")],
             &data,
             &FakeRunner::ok(),
             &PlatformLinkCreator,
@@ -1256,6 +1508,199 @@ mod tests {
     }
 
     #[test]
+    fn external_root_is_written_to_the_shared_directory() {
+        let temp = TempDir::new("apply-external");
+        let data = app_data(&temp);
+        let (agent, sync_root, target_home) = external_root_fixture(&temp);
+
+        let expected = fingerprint_for(&agent, &target_home, &sync_root);
+        let report = apply(
+            &agent,
+            Some(&target_home),
+            &sync_root,
+            &expected,
+            &[],
+            &data,
+            &FakeRunner::ok(),
+            &PlatformLinkCreator,
+        )
+        .expect("应用应成功");
+
+        // 外部根条目落到 `<home>/.agents/skills`，不往 agent 根写。
+        assert_eq!(report.written, 1, "只修改了外部根里的那个技能");
+        assert_eq!(report.deleted, 0, "未勾选的删除候选保留");
+        assert_eq!(report.skipped, 1);
+        assert_eq!(
+            fs::read_to_string(target_home.join(".agents/skills/shared/SKILL.md"))
+                .expect("读外部技能"),
+            "# 共享技能\n",
+            "外部根按快照落地"
+        );
+        assert!(target_home
+            .join(".agents/skills/only-here/SKILL.md")
+            .is_file());
+        assert!(!agent.join("shared/SKILL.md").exists(), "不得写到 agent 根");
+
+        // 备份按虚拟路径存，条目标明所属根。
+        assert_eq!(
+            fs::read_to_string(
+                report
+                    .backup_dir
+                    .join("files/external/agents-skills/shared/SKILL.md")
+            )
+            .expect("读备份内容"),
+            "# 共享技能（本机改过）\n"
+        );
+        let restore = read_restore(&report.backup_dir);
+        assert_eq!(restore.version, RESTORE_VERSION);
+        let backed_up = restore
+            .entries
+            .iter()
+            .find(|entry| entry.root == RootId::AgentsSkills && entry.path == "shared/SKILL.md")
+            .unwrap_or_else(|| panic!("备份缺少外部根条目：{:?}", restore.entries));
+        assert!(backed_up.existed);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
+
+    #[test]
+    fn external_root_deletes_land_only_when_confirmed_with_that_root() {
+        let temp = TempDir::new("apply-external-delete");
+        let data = app_data(&temp);
+        let (agent, sync_root, target_home) = external_root_fixture(&temp);
+        let expected = fingerprint_for(&agent, &target_home, &sync_root);
+
+        // 计划外的路径照样整次拒绝。
+        let failure = apply(
+            &agent,
+            Some(&target_home),
+            &sync_root,
+            &expected,
+            &[delete(RootId::AgentsSkills, "only-here/SKILL.md.bak")],
+            &data,
+            &FakeRunner::ok(),
+            &PlatformLinkCreator,
+        )
+        .expect_err("不在计划里的删除项必须整次拒绝");
+        assert_eq!(failure.code, "delete_not_in_plan", "{}", failure.message);
+        assert!(
+            failure.message.contains("~/.agents/skills"),
+            "{}",
+            failure.message
+        );
+        assert!(backup_ids(&data).is_empty());
+
+        // 同一个相对路径存在于 agent 根、不在外部根时，拿外部根的请求也不得删 agent 根的文件。
+        write_file(&agent.join("only-here.md"), "共享路径\n");
+        write_file(&agent.join("sessions/old.json"), "{}");
+
+        let external_before = tree(&target_home.join(".agents/skills/only-here"));
+        let report = apply(
+            &agent,
+            Some(&target_home),
+            &sync_root,
+            &expected,
+            &[delete(RootId::AgentsSkills, "only-here/SKILL.md")],
+            &data,
+            &FakeRunner::ok(),
+            &PlatformLinkCreator,
+        )
+        .expect("逐项勾选的外部根删除应成功");
+
+        assert_eq!(report.deleted, 1);
+        assert_ne!(
+            tree(&target_home.join(".agents/skills/only-here")),
+            external_before
+        );
+        assert!(
+            !target_home
+                .join(".agents/skills/only-here/SKILL.md")
+                .exists(),
+            "勾选后外部根的文件被删"
+        );
+        // 删除进备份：回滚能把它拿回来。
+        assert_eq!(
+            fs::read_to_string(
+                report
+                    .backup_dir
+                    .join("files/external/agents-skills/only-here/SKILL.md")
+            )
+            .expect("读备份内容"),
+            "# 只在目标机\n"
+        );
+        let warnings = report.warnings.join("\n");
+        assert!(
+            warnings.contains("共享目录") && warnings.contains("删除 1 项"),
+            "外部根删除后要有汇总告警：{warnings}"
+        );
+    }
+
+    #[test]
+    fn delete_request_with_the_other_root_does_not_cross_roots() {
+        let temp = TempDir::new("apply-cross-root-delete");
+        let data = app_data(&temp);
+        // 两个根里都有同名相对路径 `only-here/SKILL.md`，但只有 agent 根里那一条是删除候选。
+        let agent = temp.path().join("agent");
+        let source_home = temp.path().join("source-home");
+        let sync_root = temp.path().join("cloud");
+        write_file(&agent.join("settings.json"), "{}");
+        write_file(
+            &source_home.join(".agents/skills/shared/SKILL.md"),
+            "# 共享技能\n",
+        );
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+        crate::snapshot::export_with(
+            &agent,
+            Some(&source_home),
+            &sync_root,
+            crate::snapshot::SourceVersions::default(),
+        )
+        .expect("导出夹具快照");
+
+        let target_home = temp.path().join("target-home");
+        write_file(
+            &target_home.join(".agents/skills/shared/SKILL.md"),
+            "# 共享技能\n",
+        );
+        write_file(&agent.join("skills/only-here/SKILL.md"), "# 只在宿主目录\n");
+        let expected = fingerprint_for(&agent, &target_home, &sync_root);
+
+        // 用外部根去删 agent 根的候选：整次拒绝，一个字节都不动。
+        let failure = apply(
+            &agent,
+            Some(&target_home),
+            &sync_root,
+            &expected,
+            &[delete(RootId::AgentsSkills, "skills/only-here/SKILL.md")],
+            &data,
+            &FakeRunner::ok(),
+            &PlatformLinkCreator,
+        )
+        .expect_err("根对不上就不是本次计划的删除候选");
+        assert_eq!(failure.code, "delete_not_in_plan");
+        assert!(agent.join("skills/only-here/SKILL.md").is_file());
+        assert!(backup_ids(&data).is_empty());
+
+        let report = apply(
+            &agent,
+            Some(&target_home),
+            &sync_root,
+            &expected,
+            &[delete(RootId::Agent, "skills/only-here/SKILL.md")],
+            &data,
+            &FakeRunner::ok(),
+            &PlatformLinkCreator,
+        )
+        .expect("按 agent 根勾选后应成功");
+
+        assert_eq!(report.deleted, 1);
+        assert!(!agent.join("skills/only-here/SKILL.md").exists());
+        assert!(
+            target_home.join(".agents/skills/shared/SKILL.md").is_file(),
+            "外部根不得受影响"
+        );
+    }
+
+    #[test]
     fn stale_fingerprint_is_rejected_before_writing() {
         let temp = TempDir::new("stale");
         let (agent, sync_root) = fixture(&temp);
@@ -1266,6 +1711,7 @@ mod tests {
 
         let failure = apply(
             &agent,
+            None,
             &sync_root,
             "000000000000",
             &[],
@@ -1292,6 +1738,7 @@ mod tests {
         fs::remove_file(sync_root.join(crate::snapshot::MANIFEST_FILE_NAME)).expect("删 manifest");
         let failure = apply(
             &agent,
+            None,
             &sync_root,
             &expected,
             &[],
@@ -1303,13 +1750,15 @@ mod tests {
         assert_eq!(failure.code, "manifest_invalid", "{}", failure.message);
 
         // 云盘只传了一半：manifest 还在，但文件内容不符。
-        crate::snapshot::export(&agent, &sync_root).expect("重新导出快照");
+        crate::snapshot::export(&agent, &home_without_skills(&temp), &sync_root)
+            .expect("重新导出快照");
         write_file(
             &sync_root.join("snapshot/settings.json"),
             "{\"theme\": \"half\"}",
         );
         let failure = apply(
             &agent,
+            None,
             &sync_root,
             &expected,
             &[],
@@ -1343,9 +1792,10 @@ mod tests {
         ] {
             let failure = apply(
                 &agent,
+                None,
                 &sync_root,
                 &expected,
-                &[path.to_string()],
+                &[delete(RootId::Agent, path)],
                 &data,
                 &FakeRunner::ok(),
                 &PlatformLinkCreator,
@@ -1370,7 +1820,7 @@ mod tests {
         write_file(&agent.join("settings.json"), "{\"theme\": \"dark\"}");
         write_file(&temp.path().join("outside/keep.txt"), "留在这里\n");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &sync_root).expect("导出快照");
+        crate::snapshot::export(&agent, &home_without_skills(&temp), &sync_root).expect("导出快照");
         // 导出之后才出现的链接：快照里没有它，只能删链接本身。
         fs::create_dir_all(agent.join("skills")).expect("创建 skills");
         symlink(temp.path().join("outside"), agent.join("skills/extra")).expect("创建目录链接");
@@ -1378,9 +1828,10 @@ mod tests {
         let expected = fingerprint(&agent, &sync_root);
         let report = apply(
             &agent,
+            None,
             &sync_root,
             &expected,
-            &["skills/extra".to_string()],
+            &[delete(RootId::Agent, "skills/extra")],
             &data,
             &FakeRunner::ok(),
             &PlatformLinkCreator,
@@ -1398,8 +1849,8 @@ mod tests {
             "链接目标不受影响"
         );
 
-        let restore =
-            crate::rollback::restore(&agent, &data, &report.backup_id, true).expect("回滚应成功");
+        let restore = crate::rollback::restore(&agent, None, &data, &report.backup_id, true)
+            .expect("回滚应成功");
         assert!(restore.warnings.is_empty(), "{:?}", restore.warnings);
         assert!(
             fs::symlink_metadata(agent.join("skills/extra"))
@@ -1434,7 +1885,7 @@ mod tests {
         )
         .expect("创建符号链接");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &sync_root).expect("导出快照");
+        crate::snapshot::export(&agent, &home_without_skills(&temp), &sync_root).expect("导出快照");
 
         // 链接目标内容变了：计划里 SKILL.md 变成"修改"；settings.json 也改一下，
         // 让备份同时覆盖"修改文件 + 修改链接"两种情况。
@@ -1445,6 +1896,7 @@ mod tests {
 
         let report = apply(
             &agent,
+            None,
             &sync_root,
             &expected,
             &[],
@@ -1529,6 +1981,7 @@ mod tests {
         let expected = fingerprint(&agent, &sync_root);
         apply(
             &agent,
+            None,
             &sync_root,
             &expected,
             &[],
@@ -1538,6 +1991,47 @@ mod tests {
         )
         .expect("应用应成功");
         assert_eq!(mode_of(&agent.join("auth.json")), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_agent_root_is_written_through_with_a_warning() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new("root-link");
+        let real = temp.path().join("real-agent");
+        let agent = temp.path().join("agent");
+        let sync_root = temp.path().join("cloud");
+        let data = app_data(&temp);
+        write_file(&real.join("settings.json"), "{\"theme\": \"dark\"}");
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+        crate::snapshot::export(&real, &home_without_skills(&temp), &sync_root)
+            .expect("导出夹具快照");
+        symlink(&real, &agent).expect("建根链接");
+
+        write_file(&real.join("settings.json"), "{\"theme\": \"light\"}");
+        let expected = fingerprint(&agent, &sync_root);
+        let report = apply(
+            &agent,
+            None,
+            &sync_root,
+            &expected,
+            &[],
+            &data,
+            &FakeRunner::ok(),
+            &PlatformLinkCreator,
+        )
+        .expect("应用应成功");
+
+        assert_eq!(report.written, 1);
+        // 根的类型不进快照：写入落到链接目标，根链接本身原样保留。
+        assert!(platform::is_link_like(&agent));
+        assert_eq!(
+            fs::read_to_string(real.join("settings.json")).expect("读链接目标"),
+            "{\"theme\": \"dark\"}"
+        );
+        let warnings = report.warnings.join("\n");
+        assert!(warnings.contains("符号链接"), "{warnings}");
     }
 
     #[test]
@@ -1551,6 +2045,7 @@ mod tests {
 
         let report = apply(
             &agent,
+            None,
             &sync_root,
             &expected,
             &[],
@@ -1587,6 +2082,7 @@ mod tests {
         set_mode(&agent.join("skills/antd"), 0o500);
         let failure = apply(
             &agent,
+            None,
             &sync_root,
             &expected,
             &[],
@@ -1643,6 +2139,7 @@ mod tests {
         let expected = fingerprint(&agent, &sync_root);
         let report = apply(
             &agent,
+            None,
             &sync_root,
             &expected,
             &[],
@@ -1670,7 +2167,8 @@ mod tests {
         fs::create_dir_all(&agent).expect("创建宿主目录");
         symlink("../outside/skills-live", agent.join("skills")).expect("创建目录链接");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &sync_root).expect("导出夹具快照");
+        crate::snapshot::export(&agent, &home_without_skills(&temp), &sync_root)
+            .expect("导出夹具快照");
         (agent, sync_root, external)
     }
 
@@ -1717,6 +2215,7 @@ mod tests {
 
         let report = apply(
             &agent,
+            None,
             &sync_root,
             &expected,
             &[],
@@ -1772,6 +2271,7 @@ mod tests {
 
         let report = apply(
             &agent,
+            None,
             &sync_root,
             &expected,
             &[],
@@ -1842,7 +2342,8 @@ mod tests {
         fs::create_dir_all(&agent).expect("创建宿主目录");
         symlink("../outside/skills-live", agent.join("skills")).expect("创建目录链接");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &sync_root).expect("导出夹具快照");
+        crate::snapshot::export(&agent, &home_without_skills(&temp), &sync_root)
+            .expect("导出夹具快照");
         (agent, sync_root, external)
     }
 
@@ -1858,6 +2359,7 @@ mod tests {
         let external_before = tree(&external);
         let report = apply(
             &agent,
+            None,
             &sync_root,
             &expected,
             &[],
@@ -1917,6 +2419,7 @@ mod tests {
 
         let report = apply(
             &agent,
+            None,
             &sync_root,
             &expected,
             &[],
@@ -1945,7 +2448,7 @@ mod tests {
         );
     }
 
-    /// 已勾选的删除落在建不成的链接下：跳过并说明原因，整次应用不算失败。
+    /// 已勾选的删除落在建不成的链接下：跳过删除本身并说明它已随目录替换消失。
     #[cfg(unix)]
     #[test]
     fn deletes_under_materialized_link_are_skipped_with_warning() {
@@ -1958,9 +2461,10 @@ mod tests {
 
         let report = apply(
             &agent,
+            None,
             &sync_root,
             &expected,
-            &["skills/extra.md".to_string()],
+            &[delete(RootId::Agent, "skills/extra.md")],
             &data,
             &FakeRunner::ok(),
             &RefusingLinks,
@@ -1969,22 +2473,24 @@ mod tests {
 
         assert_eq!(report.linked, 0);
         assert_eq!(report.written, 1, "快照里的 keep.md 写回");
-        assert_eq!(report.deleted, 0);
+        assert_eq!(report.deleted, 0, "没执行删除：链接目标里的原文件还在");
         assert_eq!(report.skipped_deletes, 1);
         assert_eq!(report.skipped, 0, "勾选的删除项不算“未勾选保留”");
         assert!(
             report
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("skills/extra.md")),
-            "{:?}",
+                .any(|warning| warning.contains("skills/extra.md")
+                    && warning.contains("已随目录替换从受管路径上消失")
+                    && warning.contains("原内容在本次备份中")),
+            "告警要说清楚它已经不在了，而不是“未删除”：{:?}",
             report.warnings
         );
         assert!(
             report
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("因链接无法重建，这 1 项删除已跳过")),
+                .any(|warning| warning.contains("这 1 项勾选删除已随目录替换消失")),
             "{:?}",
             report.warnings
         );
@@ -1994,6 +2500,242 @@ mod tests {
             "物化只写快照内容，不再带着删除候选"
         );
         assert!(external.join("extra.md").is_file(), "链接目标不得被删");
+        // 告警说“原内容在本次备份中”，那就得真的在那儿。
+        assert_eq!(
+            fs::read_to_string(report.backup_dir.join("files/skills/extra.md"))
+                .expect("读备份内容"),
+            "不要删\n"
+        );
+    }
+
+    /// 外部根自己是指向别处的链接：根的类型不进快照，写入落到链接目标，根链接原样保留。
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_external_root_is_written_through_with_a_warning() {
+        let temp = TempDir::new("external-root-link");
+        let agent = temp.path().join("agent");
+        let sync_root = temp.path().join("cloud");
+        let source_home = temp.path().join("source-home");
+        let data = app_data(&temp);
+        let shared = temp.path().join("outside/shared-skills");
+
+        write_file(&agent.join("settings.json"), "{}");
+        write_file(&shared.join("shared/SKILL.md"), "# 本机旧内容\n");
+        write_file(
+            &source_home.join(".agents/skills/shared/SKILL.md"),
+            "# 共享技能\n",
+        );
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+        crate::snapshot::export_with(
+            &agent,
+            Some(&source_home),
+            &sync_root,
+            crate::snapshot::SourceVersions::default(),
+        )
+        .expect("导出夹具快照");
+
+        let target_home = temp.path().join("target-home");
+        fs::create_dir_all(target_home.join(".agents")).expect("创建目标机 .agents");
+        symlink(&shared, target_home.join(".agents/skills")).expect("把目标机外部根做成链接");
+
+        let expected = fingerprint_for(&agent, &target_home, &sync_root);
+        let report = apply(
+            &agent,
+            Some(&target_home),
+            &sync_root,
+            &expected,
+            &[],
+            &data,
+            &FakeRunner::ok(),
+            &PlatformLinkCreator,
+        )
+        .expect("应用应成功");
+
+        assert_eq!(report.written, 1, "只修改了外部根里的那个技能");
+        assert_eq!(report.deleted, 0);
+        // 根的类型不进快照：写入落到链接目标，根链接本身原样保留。
+        let root_dir = target_home.join(".agents/skills");
+        assert!(
+            platform::is_link_like(&root_dir),
+            "根链接不能被换成真实目录"
+        );
+        assert_eq!(fs::read_link(&root_dir).expect("读根链接目标"), shared);
+        assert_eq!(
+            fs::read_to_string(shared.join("shared/SKILL.md")).expect("读链接目标里的技能"),
+            "# 共享技能\n"
+        );
+        // 只有外部根是链接，告警必须指着它，而不是扚主目录。
+        let warnings = report.warnings.join("\n");
+        assert!(
+            warnings.contains("~/.agents/skills") && warnings.contains("符号链接"),
+            "{warnings}"
+        );
+    }
+
+    /// 目标机的外部根：`.agents/skills` 是真目录，里面的技能是指向外部目录的链接。
+    /// 快照由源机的同名链接导出，manifest 因此同时记下文件与链接。
+    #[cfg(unix)]
+    fn external_root_link_fixture(temp: &TempDir) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let agent = temp.path().join("agent");
+        let sync_root = temp.path().join("cloud");
+        let source_home = temp.path().join("source-home");
+        let shared = temp.path().join("outside/shared-live");
+
+        write_file(&agent.join("settings.json"), "{}");
+        write_file(&shared.join("SKILL.md"), "# 共享技能\n");
+        write_file(&shared.join("notes.md"), "说明\n");
+        fs::create_dir_all(source_home.join(".agents/skills")).expect("创建源机外部根");
+        // 绝对目标：源机与目标机是同一个临时目录里的两处布局，按同一条路径重建。
+        symlink(&shared, source_home.join(".agents/skills/shared-link")).expect("建源机链接");
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+        crate::snapshot::export_with(
+            &agent,
+            Some(&source_home),
+            &sync_root,
+            crate::snapshot::SourceVersions::default(),
+        )
+        .expect("导出夹具快照");
+
+        let target_home = temp.path().join("target-home");
+        fs::create_dir_all(target_home.join(".agents/skills")).expect("创建目标机外部根");
+        symlink(&shared, target_home.join(".agents/skills/shared-link")).expect("建目标机链接");
+        (agent, sync_root, target_home, shared)
+    }
+
+    /// 外部根里的条目是链接：manifest 记过就按记录重建，链接之下的写入与删除都只能跳过。
+    #[cfg(unix)]
+    #[test]
+    fn external_root_entry_link_is_rebuilt_and_hides_its_contents() {
+        let temp = TempDir::new("external-entry-link");
+        let data = app_data(&temp);
+        let (agent, sync_root, target_home, shared) = external_root_link_fixture(&temp);
+        let root_dir = target_home.join(".agents/skills");
+
+        // 链接目标在目标机上被改过，还多了一个快照里没有的文件。
+        write_file(&shared.join("SKILL.md"), "# 共享技能（本机改过）\n");
+        write_file(&shared.join("extra.md"), "只在目标机\n");
+        let expected = fingerprint_for(&agent, &target_home, &sync_root);
+
+        let report = apply(
+            &agent,
+            Some(&target_home),
+            &sync_root,
+            &expected,
+            &[delete(RootId::AgentsSkills, "shared-link/extra.md")],
+            &data,
+            &FakeRunner::ok(),
+            &PlatformLinkCreator,
+        )
+        .expect("应用应成功");
+
+        assert_eq!(report.linked, 1, "按 manifest 记录重建外部根的链接");
+        assert_eq!(report.written, 0, "链接之下的写入交给链接目标");
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.skipped_deletes, 1, "链接之下的删除只跳过并说明");
+        assert_eq!(report.skipped, 0);
+        assert_eq!(
+            fs::read_link(root_dir.join("shared-link")).expect("读链接目标"),
+            shared
+        );
+        assert_eq!(
+            fs::read_to_string(shared.join("SKILL.md")).expect("读链接目标"),
+            "# 共享技能（本机改过）\n"
+        );
+        assert!(shared.join("extra.md").is_file(), "链接目标不得被删");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("由链接 shared-link 的目标提供")),
+            "{:?}",
+            report.warnings
+        );
+
+        // 备份按外部根的虚拟路径记链接本身与待删条目，回滚才能反做。
+        let restore = read_restore(&report.backup_dir);
+        let link = restore
+            .entries
+            .iter()
+            .find(|entry| entry.root == RootId::AgentsSkills && entry.path == "shared-link")
+            .unwrap_or_else(|| panic!("备份缺少外部根的链接条目：{:?}", restore.entries));
+        assert_eq!(link.kind, RestoreKind::Symlink);
+        assert_eq!(
+            link.link_target.as_deref(),
+            Some(shared.to_string_lossy().as_ref())
+        );
+    }
+
+    /// 外部根的链接建不成：从快照 `snapshot/external/agents-skills/…` 整棵物化，
+    /// 落地内容是快照里的版本，不是链接目标里的本机改动。
+    #[cfg(unix)]
+    #[test]
+    fn external_root_entry_link_falls_back_to_the_external_snapshot_prefix() {
+        let temp = TempDir::new("external-entry-link-refused");
+        let data = app_data(&temp);
+        let (agent, sync_root, target_home, shared) = external_root_link_fixture(&temp);
+        let root_dir = target_home.join(".agents/skills");
+
+        write_file(&shared.join("SKILL.md"), "# 共享技能（本机改过）\n");
+        write_file(&shared.join("extra.md"), "只在目标机\n");
+        let expected = fingerprint_for(&agent, &target_home, &sync_root);
+
+        let report = apply(
+            &agent,
+            Some(&target_home),
+            &sync_root,
+            &expected,
+            &[delete(RootId::AgentsSkills, "shared-link/extra.md")],
+            &data,
+            &FakeRunner::ok(),
+            &RefusingLinks,
+        )
+        .expect("退回物化后应用应成功");
+
+        assert_eq!(report.linked, 0, "一条链接也没建成");
+        assert_eq!(report.written, 2, "快照里那棵子树的 2 个文件都写回");
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.skipped_deletes, 1);
+        let metadata = fs::symlink_metadata(root_dir.join("shared-link")).expect("读条目信息");
+        assert!(!metadata.file_type().is_symlink(), "退回物化");
+        assert!(metadata.is_dir());
+        assert_eq!(
+            fs::read_to_string(root_dir.join("shared-link/SKILL.md")).expect("读物化后的技能"),
+            "# 共享技能\n",
+            "内容来自 snapshot/external/agents-skills/，不是链接目标"
+        );
+        assert_eq!(
+            fs::read_to_string(root_dir.join("shared-link/notes.md")).expect("读物化后的文件"),
+            "说明\n"
+        );
+        assert!(
+            !root_dir.join("shared-link/extra.md").exists(),
+            "链接目标里多出来的内容不跟着物化"
+        );
+        // 链接目标本身不动，勾选的删除项还在那儿。
+        assert_eq!(
+            fs::read_to_string(shared.join("SKILL.md")).expect("读链接目标"),
+            "# 共享技能（本机改过）\n"
+        );
+        assert!(shared.join("extra.md").is_file(), "链接目标不得被删");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("shared-link/extra.md")
+                    && warning.contains("已随目录替换从受管路径上消失")),
+            "{:?}",
+            report.warnings
+        );
+        // 它在受管路径上没了，原内容在两处：链接目标，以及本次备份。
+        assert_eq!(
+            fs::read_to_string(
+                report
+                    .backup_dir
+                    .join("files/external/agents-skills/shared-link/extra.md")
+            )
+            .expect("读备份内容"),
+            "只在目标机\n"
+        );
     }
 
     /// 建链接失败、物化也失败：整次应用失败，两条原因都带上，备份可回滚。
@@ -2013,7 +2755,8 @@ mod tests {
         )
         .expect("创建目录链接");
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        crate::snapshot::export(&agent, &sync_root).expect("导出夹具快照");
+        crate::snapshot::export(&agent, &home_without_skills(&temp), &sync_root)
+            .expect("导出夹具快照");
 
         // 链接没了，父目录又不可写：建链接失败之后连物化都落不下去。
         fs::remove_file(agent.join("agents/link-to-shared")).expect("删除夹具链接");
@@ -2022,6 +2765,7 @@ mod tests {
 
         let failure = apply(
             &agent,
+            None,
             &sync_root,
             &expected,
             &[],
@@ -2092,6 +2836,7 @@ mod tests {
         let expected = fingerprint(&agent, &sync_root);
         let report = apply(
             &agent,
+            None,
             &sync_root,
             &expected,
             &[],
@@ -2132,9 +2877,10 @@ mod tests {
 
         let report = apply(
             &agent,
+            None,
             &sync_root,
             &expected,
-            &["skills/extra.md".to_string()],
+            &[delete(RootId::Agent, "skills/extra.md")],
             &data,
             &FakeRunner::ok(),
             &PlatformLinkCreator,
@@ -2185,9 +2931,10 @@ mod tests {
 
         let failure = apply(
             &agent,
+            None,
             &sync_root,
             &expected,
-            &["skills/extra.md".to_string()],
+            &[delete(RootId::Agent, "skills/extra.md")],
             &data,
             &FakeRunner::ok(),
             &PlatformLinkCreator,
@@ -2223,9 +2970,10 @@ mod tests {
 
         let report = apply(
             &agent,
+            None,
             &sync_root,
             &expected,
-            &["prompts/live-only.md".to_string()],
+            &[delete(RootId::Agent, "prompts/live-only.md")],
             &data,
             &FakeRunner::ok(),
             &PlatformLinkCreator,

@@ -342,6 +342,7 @@ pub async fn upload_snapshot(app: AppHandle, overwrite: bool) -> Result<UploadVi
             &WebdavClient::new(transport, &credentials.url),
             &dir,
             &agent_dir,
+            home_dir.as_deref(),
             &versions,
             overwrite,
         )

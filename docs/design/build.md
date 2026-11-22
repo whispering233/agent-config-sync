@@ -41,8 +41,8 @@ npm run tauri -- build --bundles deb,appimage
 
 ```text
 src-tauri/target/release/bundle/
-├── deb/Agent Config Sync_0.0.2_amd64.deb          （约 3.1 MB）
-└── appimage/Agent Config Sync_0.0.2_amd64.AppImage（约 83 MB）
+├── deb/Agent Config Sync_0.0.3_amd64.deb          （约 3.1 MB）
+└── appimage/Agent Config Sync_0.0.3_amd64.AppImage（约 83 MB）
 ```
 
 release 配置：`strip = true`、`lto = "thin"`（`src-tauri/Cargo.toml`）。二进制已去符号。
@@ -94,7 +94,7 @@ npm run tauri -- build --bundles nsis
 
 ```bash
 # 1. deb 依赖声明（应含 libwebkit2gtk-4.1-0）
-dpkg-deb -I "src-tauri/target/release/bundle/deb/Agent Config Sync_0.0.2_amd64.deb" | grep Depends
+dpkg-deb -I "src-tauri/target/release/bundle/deb/Agent Config Sync_0.0.3_amd64.deb" | grep Depends
 
 # 2. 已去符号（应显示 stripped / no symbols）
 file src-tauri/target/release/agent-config-sync

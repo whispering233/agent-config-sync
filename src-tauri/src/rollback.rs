@@ -8,11 +8,13 @@
 
 use crate::apply::{
     self, RestoreEntry, RestoreKind, RestoreManifest, BACKUPS_DIR_NAME, BACKUP_FILES_DIR_NAME,
-    RESTORE_FILE_NAME, RESTORE_VERSION,
+    RESTORE_FILE_NAME, SUPPORTED_RESTORE_VERSIONS,
 };
 use crate::config;
+use crate::plan;
 use crate::platform;
-use crate::scope;
+use crate::scope::{self, ManagedRoots, RootId};
+use crate::snapshot;
 use serde::Serialize;
 use std::fs;
 use std::io;
@@ -61,7 +63,7 @@ pub struct RestoreReport {
 }
 
 /// 回滚失败。失败码：`not_confirmed` / `backup_missing` / `backup_invalid` /
-/// `path_out_of_bounds` / `backup_failed` / `restore_failed`。
+/// `path_out_of_bounds` / `home_dir_missing` / `backup_failed` / `restore_failed`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreFailure {
@@ -125,13 +127,15 @@ pub fn read_backups(app_data_dir: &Path) -> BackupList {
 }
 
 /// 读一份备份的 `restore.json`。版本不认识也算损坏：宁可跳过，不按旧格式猜。
+///
+/// 版本 1 的旧备份没有 `root`，反序列化时按 `agent` 根补齐；它们在磁盘上保持原样。
 fn read_manifest(backup_dir: &Path) -> Result<RestoreManifest, String> {
     let path = backup_dir.join(RESTORE_FILE_NAME);
     let text =
         fs::read_to_string(&path).map_err(|error| format!("restore.json 读不出来：{error}"))?;
     let manifest: RestoreManifest =
         serde_json::from_str(&text).map_err(|error| format!("restore.json 无法解析：{error}"))?;
-    if manifest.version != RESTORE_VERSION {
+    if !SUPPORTED_RESTORE_VERSIONS.contains(&manifest.version) {
         return Err(format!("restore.json 版本 {} 不认识", manifest.version));
     }
     Ok(manifest)
@@ -140,12 +144,14 @@ fn read_manifest(backup_dir: &Path) -> Result<RestoreManifest, String> {
 /// core：按备份还原。`confirm` 必须为 true；还原前先把当前状态再备份一次。
 pub fn restore(
     agent_dir: &Path,
+    home_dir: Option<&Path>,
     app_data_dir: &Path,
     backup_id: &str,
     confirm: bool,
 ) -> Result<RestoreReport, RestoreFailure> {
     restore_with(
         agent_dir,
+        home_dir,
         app_data_dir,
         backup_id,
         confirm,
@@ -157,6 +163,7 @@ pub fn restore(
 /// 「平台不允许建链接」这条常规路径（Windows 默认权限），靠改权限碰运气不合适。
 fn restore_with(
     agent_dir: &Path,
+    home_dir: Option<&Path>,
     app_data_dir: &Path,
     backup_id: &str,
     confirm: bool,
@@ -190,23 +197,36 @@ fn restore_with(
         )
     })?;
 
+    // 备份里出现的根都要能解析：声明了外部根但本机解析不到 home 时不能猜位置。
+    let mut declared: Vec<RootId> = vec![RootId::Agent];
+    for entry in &manifest.entries {
+        if !declared.contains(&entry.root) {
+            declared.push(entry.root);
+        }
+    }
+    let roots = plan::resolve_roots(agent_dir, home_dir, &declared)
+        .map_err(|failure| RestoreFailure::new(failure.code, failure.message))?;
+
     // 先整份校验：任何一条越出受管范围就整次拒绝，一个字都不写。
     for entry in &manifest.entries {
-        if !in_scope(agent_dir, &entry.path) {
+        if !in_scope(&roots, entry) {
             return Err(RestoreFailure::new(
                 "path_out_of_bounds",
-                format!("{} 不在受管范围内，整次回滚已拒绝", entry.path),
+                format!(
+                    "{} 不在受管范围内，整次回滚已拒绝",
+                    entry.root.describe(&entry.path)
+                ),
             ));
         }
     }
 
-    let touched: Vec<&str> = manifest
+    let touched: Vec<(RootId, &str)> = manifest
         .entries
         .iter()
-        .map(|entry| entry.path.as_str())
+        .map(|entry| (entry.root, entry.path.as_str()))
         .collect();
     let (safety_backup_id, _) =
-        apply::back_up_paths(agent_dir, app_data_dir, &touched, &manifest.fingerprint).map_err(
+        apply::back_up_paths(&roots, app_data_dir, &touched, &manifest.fingerprint).map_err(
             |failure| {
                 RestoreFailure::new(
                     "backup_failed",
@@ -219,17 +239,27 @@ fn restore_with(
     let mut removed = 0;
     let mut warnings: Vec<String> = Vec::new();
     for entry in &manifest.entries {
+        let root_dir = roots.path(entry.root).ok_or_else(|| RestoreFailure {
+            code: "backup_invalid",
+            message: format!(
+                "备份里的 {} 所属的 {} 根无法解析，整次回滚已停止",
+                entry.path,
+                entry.root.label()
+            ),
+            completed: restored + removed,
+            safety_backup_id: Some(safety_backup_id.clone()),
+        })?;
         let outcome = if entry.existed {
-            restore_entry(agent_dir, &backup_dir, entry, &mut warnings, link_creator)
+            restore_entry(root_dir, &backup_dir, entry, &mut warnings, link_creator)
         } else {
-            remove_added(agent_dir, entry)
+            remove_added(root_dir, entry)
         };
         if let Err(error) = outcome {
             return Err(RestoreFailure {
                 code: "restore_failed",
                 message: format!(
                     "还原 {} 时失败：{error}；已立即停止，还原前的备份是 {safety_backup_id}",
-                    entry.path
+                    entry.root.describe(&entry.path)
                 ),
                 completed: restored + removed,
                 safety_backup_id: Some(safety_backup_id),
@@ -252,21 +282,23 @@ fn restore_with(
     })
 }
 
-/// 路径既要在宿主目录之内，也要落在受管范围内（`auth.json` 这类永不碰）。
-fn in_scope(agent_dir: &Path, relative: &str) -> bool {
-    let path = Path::new(relative);
-    scope::resolve_within(agent_dir, path).is_ok() && apply::is_managed_link(path)
+/// 路径既要在所属根目录之内，也要落在该根的受管范围内（`auth.json` 这类永不碰）。
+fn in_scope(roots: &ManagedRoots, entry: &RestoreEntry) -> bool {
+    let path = Path::new(&entry.path);
+    roots.path(entry.root).is_some_and(|root_dir| {
+        scope::resolve_within(root_dir, path).is_ok() && apply::is_managed_link(entry.root, path)
+    })
 }
 
 /// 按记录反做一条：链接重建、文件写回内容与权限、目录补齐。
 fn restore_entry(
-    agent_dir: &Path,
+    root_dir: &Path,
     backup_dir: &Path,
     entry: &RestoreEntry,
     warnings: &mut Vec<String>,
     link_creator: &dyn apply::LinkCreator,
 ) -> io::Result<()> {
-    let target = resolve(agent_dir, &entry.path)?;
+    let target = resolve(root_dir, &entry.path)?;
     match entry.kind {
         RestoreKind::Symlink => {
             let link_target = entry
@@ -285,11 +317,13 @@ fn restore_entry(
                 // 默认权限的 Windows 建不了链接：目标还在，按它的内容物化，内容不丢。
                 // 与 apply 建不成链接时的回退一致，只是把链接换成真实文件并告警。
                 Err(link_error) => {
-                    apply::materialize_subtree(&resolved, &target).map_err(|fallback| {
-                        io::Error::other(format!(
-                            "重建链接失败（{link_error}），按链接目标物化也失败（{fallback}）"
-                        ))
-                    })?;
+                    apply::materialize_subtree(&resolved, &target, root_dir).map_err(
+                        |fallback| {
+                            io::Error::other(format!(
+                                "重建链接失败（{link_error}），按链接目标物化也失败（{fallback}）"
+                            ))
+                        },
+                    )?;
                     warnings.push(format!(
                         "{} 无法重建为链接（{link_error}），已按链接目标物化",
                         entry.path
@@ -300,7 +334,9 @@ fn restore_entry(
         }
         RestoreKind::Dir => ensure_dir(&target),
         RestoreKind::File => {
-            let source = resolve(&backup_dir.join(BACKUP_FILES_DIR_NAME), &entry.path)?;
+            // 备份内容按虚拟路径存放：外部根在 `files/external/agents-skills/...`。
+            let virtual_path = snapshot::virtual_path(entry.root, Path::new(&entry.path));
+            let source = resolve(&backup_dir.join(BACKUP_FILES_DIR_NAME), &virtual_path)?;
             let bytes = fs::read(&source).map_err(|error| {
                 io::Error::other(format!("备份里没有 {} 的内容：{error}", entry.path))
             })?;
@@ -331,8 +367,8 @@ fn restore_entry(
 }
 
 /// 删除应用新增的路径：只删文件或链接本身，目录一律拒绝，不递归删。
-fn remove_added(agent_dir: &Path, entry: &RestoreEntry) -> io::Result<()> {
-    if let Some(ancestor) = apply::symlink_ancestors(agent_dir, &entry.path)
+fn remove_added(root_dir: &Path, entry: &RestoreEntry) -> io::Result<()> {
+    if let Some(ancestor) = apply::symlink_ancestors(root_dir, &entry.path)
         .into_iter()
         .next()
     {
@@ -340,7 +376,7 @@ fn remove_added(agent_dir: &Path, entry: &RestoreEntry) -> io::Result<()> {
             "路径经过符号链接 {ancestor}，删除会落到链接指向的外部位置，已拒绝"
         )));
     }
-    let target = resolve(agent_dir, &entry.path)?;
+    let target = resolve(root_dir, &entry.path)?;
     // 链接先判：Windows 的目录型链接同时带目录属性，当成目录就会被误拒。
     if platform::is_link_like(&target) {
         return platform::remove_link(&target);
@@ -443,21 +479,24 @@ fn run(app: &AppHandle, backup_id: &str, confirm: bool) -> Result<RestoreReport,
         RestoreFailure::new("agent_dir_missing", "无法确定宿主目录，请先在设置页填写")
     })?;
 
-    restore(&agent_dir, &app_data_dir, backup_id, confirm)
+    restore(
+        &agent_dir,
+        home_dir.as_deref(),
+        &app_data_dir,
+        backup_id,
+        confirm,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::apply::BACKUP_RETENTION;
-    #[cfg(unix)]
+    use crate::apply::{BACKUP_RETENTION, RESTORE_VERSION};
     use crate::doctor::{CommandOutcome, CommandRunner};
-    #[cfg(unix)]
     use crate::platform::HostOs;
     #[cfg(unix)]
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::atomic::{AtomicU32, Ordering};
-    #[cfg(unix)]
     use std::time::Duration;
 
     /// 临时目录夹具：Drop 时清理。测试全程不碰真实 HOME。
@@ -489,10 +528,8 @@ mod tests {
     }
 
     /// 固定版本的假命令：计划里的版本探测不起真实进程。
-    #[cfg(unix)]
     struct FakeRunner;
 
-    #[cfg(unix)]
     impl CommandRunner for FakeRunner {
         fn run(
             &self,
@@ -549,6 +586,7 @@ mod tests {
 
     fn file_entry(path: &str, existed: bool, mode: u32) -> RestoreEntry {
         RestoreEntry {
+            root: RootId::Agent,
             path: path.to_string(),
             kind: RestoreKind::File,
             existed,
@@ -617,8 +655,15 @@ mod tests {
         entry.link_target = Some(temp.path().join("outside").display().to_string());
         craft_backup(&data, "2026-01-01T00-00-00Z", &manifest(vec![entry]));
 
-        let report = restore_with(&agent, &data, "2026-01-01T00-00-00Z", true, &NoLinkCreator)
-            .expect("建不成链接时应按目标物化");
+        let report = restore_with(
+            &agent,
+            None,
+            &data,
+            "2026-01-01T00-00-00Z",
+            true,
+            &NoLinkCreator,
+        )
+        .expect("建不成链接时应按目标物化");
 
         assert_eq!(report.restored, 1);
         assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
@@ -644,7 +689,7 @@ mod tests {
         );
         craft_content(&data, id, "settings.json", "backup");
 
-        let failure = restore(&agent, &data, id, false).expect_err("未确认必须拒绝");
+        let failure = restore(&agent, None, &data, id, false).expect_err("未确认必须拒绝");
 
         assert_eq!(failure.code, "not_confirmed");
         assert_eq!(failure.safety_backup_id, None);
@@ -669,6 +714,7 @@ mod tests {
             &data,
             id,
             &manifest(vec![RestoreEntry {
+                root: RootId::Agent,
                 path: "settings.json".to_string(),
                 kind: RestoreKind::File,
                 existed: true,
@@ -678,7 +724,7 @@ mod tests {
         );
         craft_content(&data, id, "settings.json", "backup");
 
-        let report = restore(&agent, &data, id, true).expect("mode 缺失也应还原成功");
+        let report = restore(&agent, None, &data, id, true).expect("mode 缺失也应还原成功");
 
         assert_eq!(report.restored, 1);
         assert_eq!(
@@ -706,7 +752,7 @@ mod tests {
         );
         craft_content(&data, id, "settings.json", "backup");
 
-        let report = restore(&agent, &data, id, true).expect("回滚应成功");
+        let report = restore(&agent, None, &data, id, true).expect("回滚应成功");
 
         assert_eq!(report.backup_id, id);
         assert_eq!(report.restored, 1);
@@ -734,7 +780,7 @@ mod tests {
         );
         craft_content(&data, id, "auth.json", "{\"openai\": {}}");
 
-        restore(&agent, &data, id, true).expect("auth.json 应能回滚");
+        restore(&agent, None, &data, id, true).expect("auth.json 应能回滚");
         assert_eq!(
             fs::read_to_string(agent.join("auth.json")).expect("读 auth"),
             "{\"openai\": {}}"
@@ -758,7 +804,7 @@ mod tests {
         );
         craft_content(&data, id, "settings.json", "backup");
 
-        let report = restore(&agent, &data, id, true).expect("回滚应成功");
+        let report = restore(&agent, None, &data, id, true).expect("回滚应成功");
 
         assert_eq!(backup_ids(&data).len(), 2, "回滚前应再备份一次");
         let safety_dir = data.join(BACKUPS_DIR_NAME).join(&report.safety_backup_id);
@@ -791,7 +837,7 @@ mod tests {
             &manifest(vec![file_entry("skills/antd/SKILL.md", false, 0o644)]),
         );
 
-        let report = restore(&agent, &data, id, true).expect("回滚应成功");
+        let report = restore(&agent, None, &data, id, true).expect("回滚应成功");
 
         assert_eq!(report.restored, 0);
         assert_eq!(report.removed, 1);
@@ -814,7 +860,7 @@ mod tests {
             &manifest(vec![file_entry("skills/antd", false, 0o644)]),
         );
 
-        let failure = restore(&agent, &data, id, true).expect_err("目录不能当作新增文件删");
+        let failure = restore(&agent, None, &data, id, true).expect_err("目录不能当作新增文件删");
 
         assert_eq!(failure.code, "restore_failed", "{}", failure.message);
         assert_eq!(failure.completed, 0);
@@ -845,7 +891,7 @@ mod tests {
         craft_content(&data, id, "settings.json", "backup");
         craft_content(&data, id, "skills/antd", "文件内容");
 
-        let failure = restore(&agent, &data, id, true).expect_err("第二条必须失败");
+        let failure = restore(&agent, None, &data, id, true).expect_err("第二条必须失败");
 
         assert_eq!(failure.code, "restore_failed", "{}", failure.message);
         assert_eq!(failure.completed, 1, "第一条已完成");
@@ -880,6 +926,7 @@ mod tests {
             &data,
             id,
             &manifest(vec![RestoreEntry {
+                root: RootId::Agent,
                 path: "prompts/linked.md".to_string(),
                 kind: RestoreKind::Symlink,
                 existed: true,
@@ -888,7 +935,7 @@ mod tests {
             }]),
         );
 
-        let report = restore(&agent, &data, id, true).expect("回滚应成功");
+        let report = restore(&agent, None, &data, id, true).expect("回滚应成功");
 
         assert_eq!(report.restored, 1);
         let live = agent.join("prompts/linked.md");
@@ -921,6 +968,7 @@ mod tests {
             &data,
             id,
             &manifest(vec![RestoreEntry {
+                root: RootId::Agent,
                 path: "skills".to_string(),
                 kind: RestoreKind::Dir,
                 existed: true,
@@ -929,7 +977,7 @@ mod tests {
             }]),
         );
 
-        let report = restore(&agent, &data, id, true).expect("回滚应成功");
+        let report = restore(&agent, None, &data, id, true).expect("回滚应成功");
 
         assert_eq!(report.restored, 1);
         assert!(agent.join("skills").is_dir(), "目录条目应补建");
@@ -958,7 +1006,7 @@ mod tests {
         ] {
             // 内容不必存在：越界路径在整份校验时就该被拒，根本读不到备份内容。
             craft_backup(&data, id, &manifest(vec![file_entry(path, true, 0o644)]));
-            let failure = restore(&agent, &data, id, true)
+            let failure = restore(&agent, None, &data, id, true)
                 .err()
                 .unwrap_or_else(|| panic!("{path} 必须被拒绝"));
             assert_eq!(
@@ -1030,34 +1078,65 @@ mod tests {
         assert!(list.warnings.is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn apply_then_restore_returns_to_the_previous_state() {
+    fn apply_then_restore_rewinds_both_roots() {
         let temp = TempDir::new("apply-restore");
         let agent = temp.path().join("agent");
         let sync_root = temp.path().join("cloud");
+        let source_home = temp.path().join("source-home");
         let data = app_data(&temp);
         write_file(&agent.join("settings.json"), "{\"theme\": \"dark\"}");
         write_file(&agent.join("AGENTS.md"), "# 指令\n");
         write_file(&agent.join("skills/antd/SKILL.md"), "# 技能\n");
         write_file(&agent.join("auth.json"), "{\"token\": \"sk-test\"}");
+        write_file(
+            &source_home.join(".agents/skills/shared/SKILL.md"),
+            "# 共享技能\n",
+        );
         fs::create_dir_all(&sync_root).expect("建同步目录");
-        crate::snapshot::export(&agent, &sync_root).expect("导出夹具快照");
-        let fingerprint =
-            crate::plan::plan_snapshot(&agent, &sync_root, &FakeRunner, HostOs::Posix)
-                .expect("生成夹具计划")
-                .manifest_info
-                .fingerprint;
+        crate::snapshot::export_with(
+            &agent,
+            Some(&source_home),
+            &sync_root,
+            crate::snapshot::SourceVersions::default(),
+        )
+        .expect("导出夹具快照");
 
-        // 改动本机：改内容与权限、删一个受管文件、留一个待删文件。
+        // 目标机的 home 与源机不同：外部根必须从它解析。
+        let target_home = temp.path().join("target-home");
+        write_file(
+            &target_home.join(".agents/skills/shared/SKILL.md"),
+            "# 共享技能（本机改过）\n",
+        );
+        write_file(
+            &target_home.join(".agents/skills/only-here/SKILL.md"),
+            "# 只在目标机\n",
+        );
+        let fingerprint = crate::plan::plan_snapshot(
+            &agent,
+            Some(&target_home),
+            &sync_root,
+            &FakeRunner,
+            HostOs::Posix,
+        )
+        .expect("生成夹具计划")
+        .manifest_info
+        .fingerprint;
+
+        // 改动本机：改内容、删一个受管文件、留一个待删文件。
         write_file(&agent.join("settings.json"), "{\"theme\": \"light\"}");
-        set_mode(&agent.join("settings.json"), 0o640);
         fs::remove_file(agent.join("skills/antd/SKILL.md")).expect("删 live 技能");
         write_file(&agent.join("prompts/leftover.md"), "留下");
-        let expected = crate::plan::plan_snapshot(&agent, &sync_root, &FakeRunner, HostOs::Posix)
-            .expect("重算计划")
-            .manifest_info
-            .fingerprint;
+        let expected = crate::plan::plan_snapshot(
+            &agent,
+            Some(&target_home),
+            &sync_root,
+            &FakeRunner,
+            HostOs::Posix,
+        )
+        .expect("重算计划")
+        .manifest_info
+        .fingerprint;
         assert_eq!(
             expected, fingerprint,
             "改的是受管范围内的内容，指纹只看快照"
@@ -1065,9 +1144,13 @@ mod tests {
 
         let applied = crate::apply::apply(
             &agent,
+            Some(&target_home),
             &sync_root,
             &fingerprint,
-            &["prompts/leftover.md".to_string()],
+            &[crate::apply::DeleteRequest {
+                root: RootId::Agent,
+                path: "prompts/leftover.md".to_string(),
+            }],
             &data,
             &FakeRunner,
             &crate::apply::PlatformLinkCreator,
@@ -1082,10 +1165,20 @@ mod tests {
             "快照文件已落地"
         );
         assert!(!agent.join("prompts/leftover.md").exists());
+        assert_eq!(
+            fs::read_to_string(target_home.join(".agents/skills/shared/SKILL.md"))
+                .expect("读外部技能"),
+            "# 共享技能\n",
+            "外部根也按快照落地"
+        );
 
-        let report = restore(&agent, &data, &applied.backup_id, true).expect("回滚应成功");
+        let report = restore(&agent, Some(&target_home), &data, &applied.backup_id, true)
+            .expect("回滚应成功");
 
-        assert_eq!(report.restored, 2, "settings.json 与 leftover.md 写回");
+        assert_eq!(
+            report.restored, 3,
+            "settings.json、leftover.md 与外部技能写回"
+        );
         assert_eq!(report.removed, 1, "应用新增的 SKILL.md 被删");
         assert_eq!(
             fs::read_to_string(agent.join("prompts/leftover.md")).expect("读 leftover"),
@@ -1097,15 +1190,68 @@ mod tests {
             "{\"theme\": \"light\"}",
             "回滚后内容与回滚前一致"
         );
-        assert_eq!(mode_of(&agent.join("settings.json")), 0o640, "权限也一致");
         assert!(
             !agent.join("skills/antd/SKILL.md").exists(),
             "应用新增的文件被删"
         );
         assert_eq!(
+            fs::read_to_string(target_home.join(".agents/skills/shared/SKILL.md"))
+                .expect("读外部技能"),
+            "# 共享技能（本机改过）\n",
+            "外部根恢复到应用前的样子"
+        );
+        assert!(
+            target_home
+                .join(".agents/skills/only-here/SKILL.md")
+                .is_file(),
+            "未勾选的外部根删除候选保留"
+        );
+        assert_eq!(
             fs::read_to_string(agent.join("auth.json")).expect("读 auth.json"),
             "{\"token\": \"sk-test\"}",
             "范围外文件从未被碰"
+        );
+    }
+
+    /// 版本 1 的旧备份没有 `root` 字段：回滚按 agent 根读，不报“不认识”。
+    #[test]
+    fn version_one_backup_without_root_restores_the_agent_root() {
+        let temp = TempDir::new("v1-backup");
+        let agent = temp.path().join("agent");
+        let data = app_data(&temp);
+        write_file(&agent.join("settings.json"), "live");
+        write_file(&agent.join("skills/antd/SKILL.md"), "# 应用新增\n");
+        let id = "2025-12-01T00-00-00Z";
+        let dir = data.join(BACKUPS_DIR_NAME).join(id);
+        write_file(
+            &dir.join(BACKUP_FILES_DIR_NAME).join("settings.json"),
+            "backup",
+        );
+        write_file(
+            &dir.join(RESTORE_FILE_NAME),
+            &format!(
+                "{{\n  \"version\": 1,\n  \"createdAt\": \"{}Z\",\n  \"fingerprint\": \"0123456789ab\",\n  \"entries\": [\n    {{ \"path\": \"settings.json\", \"kind\": \"file\", \"existed\": true, \"mode\": null, \"linkTarget\": null }},\n    {{ \"path\": \"skills/antd/SKILL.md\", \"kind\": \"file\", \"existed\": false, \"mode\": null, \"linkTarget\": null }}\n  ]\n}}\n",
+                "2025-12-01T00:00:00"
+            ),
+        );
+
+        let report = restore(&agent, None, &data, id, true).expect("旧备份仍可回滚");
+
+        assert_eq!(report.restored, 1);
+        assert_eq!(report.removed, 1);
+        assert_eq!(
+            fs::read_to_string(agent.join("settings.json")).expect("读 settings"),
+            "backup"
+        );
+        assert!(!agent.join("skills/antd/SKILL.md").exists());
+        let ids: Vec<String> = read_backups(&data)
+            .backups
+            .into_iter()
+            .map(|item| item.id)
+            .collect();
+        assert!(
+            ids.contains(&id.to_string()),
+            "旧版本备份不能被列表当作损坏跳过：{ids:?}"
         );
     }
 
@@ -1116,11 +1262,12 @@ mod tests {
         let data = app_data(&temp);
         fs::create_dir_all(&agent).expect("建宿主目录");
 
-        let failure =
-            restore(&agent, &data, "2026-01-01T00-00-00Z", true).expect_err("不存在的备份必须拒绝");
+        let failure = restore(&agent, None, &data, "2026-01-01T00-00-00Z", true)
+            .expect_err("不存在的备份必须拒绝");
         assert_eq!(failure.code, "backup_missing");
 
-        let failure = restore(&agent, &data, "../agent", true).expect_err("越界目录名必须拒绝");
+        let failure =
+            restore(&agent, None, &data, "../agent", true).expect_err("越界目录名必须拒绝");
         assert_eq!(failure.code, "backup_missing");
         assert!(backup_ids(&data).is_empty(), "拒绝时不得建还原前备份");
     }
@@ -1143,7 +1290,7 @@ mod tests {
         );
         craft_content(&data, id, "prompts/linked.md", "快照内容");
 
-        restore(&agent, &data, id, true).expect("回滚应成功");
+        restore(&agent, None, &data, id, true).expect("回滚应成功");
 
         assert_eq!(
             fs::read_to_string(agent.join("shared/target.md")).expect("读链接目标"),

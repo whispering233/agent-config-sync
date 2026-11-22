@@ -10,7 +10,7 @@
 use crate::config::{self, AGENT_DIR_ENV_VAR};
 use crate::doctor::{self, ShellRunner};
 use crate::platform::{self, HostOs};
-use crate::scope;
+use crate::scope::{self, ManagedRoot, ManagedRoots, RootId};
 use crate::secrets::{self, SecretFinding, SecretLevel};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -26,7 +26,7 @@ pub const SNAPSHOT_DIR_NAME: &str = "snapshot";
 /// manifest 文件名。
 pub const MANIFEST_FILE_NAME: &str = "manifest.json";
 /// manifest 格式版本。不认识的值一律拒绝读取。
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 /// 快照目录权限：含明文凭据，只允许本用户进入。
 const SNAPSHOT_DIR_MODE: u32 = 0o700;
 /// 凭据文件权限。
@@ -43,6 +43,12 @@ const REQUIREMENT_PI: &str = ">=1.5.0";
 pub struct Manifest {
     pub format_version: u32,
     pub profile_id: String,
+    /// 本快照受管的根 id。`agent` 始终在，`agents-skills` 只在源机存在 `~/.agents/skills` 时出现。
+    ///
+    /// 缺字段按空处理：`remote-state.json` 存的是整份 manifest，旧版本（v2）没有这个字段，
+    /// 解析失败会让 WebDAV 上传/下载与定时上行全部停掉。快照本身依旧只按 `formatVersion` 拒绝旧格式。
+    #[serde(default)]
+    pub managed_roots: Vec<RootId>,
     pub created_at: String,
     pub fingerprint: String,
     pub source: SourceInfo,
@@ -107,12 +113,16 @@ fn is_false(value: &bool) -> bool {
 pub struct ExportReport {
     pub files: usize,
     pub fingerprint: String,
+    /// 本次写进 manifest 的受管根。
+    pub managed_roots: Vec<RootId>,
     pub required_packages: Vec<RequiredPackage>,
     /// 断链等被跳过的条目数。
     pub skipped: usize,
     /// 只读扫描结果：不阻断，也没有自动改写。
     pub warnings: Vec<SecretFinding>,
     pub plaintext_secrets: bool,
+    /// 根级别的告警：例如根是符号链接、外部根是断链。与密钥扫描分开。
+    pub root_warnings: Vec<String>,
     pub snapshot_dir: PathBuf,
     pub manifest_path: PathBuf,
 }
@@ -142,37 +152,53 @@ pub struct SourceVersions {
 }
 
 /// 导出快照（不记来源版本）。生产路径都用 [`export_with`] 带上探测结果，
-/// 这里留给单测：临时目录夹具不关心宿主版本。
+/// 这里留给单测：临时目录夹具不关心宿主版本，也没有外部根。
 #[cfg(test)]
-pub fn export(agent_dir: &Path, sync_root: &Path) -> Result<ExportReport, ExportFailure> {
-    export_with(agent_dir, sync_root, SourceVersions::default())
+pub fn export(
+    agent_dir: &Path,
+    home_dir: &Path,
+    sync_root: &Path,
+) -> Result<ExportReport, ExportFailure> {
+    export_with(
+        agent_dir,
+        Some(home_dir),
+        sync_root,
+        SourceVersions::default(),
+    )
 }
 
 /// 与 [`export`] 相同，额外把探测到的 node/pi 版本写进 `manifest.source`。
+/// `home_dir` 用来解析 `~/.agents/skills`：解析不到就报 `home_dir_missing`。
 pub fn export_with(
     agent_dir: &Path,
+    home_dir: Option<&Path>,
     sync_root: &Path,
     versions: SourceVersions,
 ) -> Result<ExportReport, ExportFailure> {
-    export_with_options(agent_dir, sync_root, versions, true)
+    export_with_options(agent_dir, home_dir, sync_root, versions, true)
 }
 
 /// 与 [`export_with`] 相同，但不复制根级 `auth.json`；自动上行默认用它。
 pub fn export_without_auth(
     agent_dir: &Path,
+    home_dir: Option<&Path>,
     sync_root: &Path,
     versions: SourceVersions,
 ) -> Result<ExportReport, ExportFailure> {
-    export_with_options(agent_dir, sync_root, versions, false)
+    export_with_options(agent_dir, home_dir, sync_root, versions, false)
 }
 
 fn export_with_options(
     agent_dir: &Path,
+    home_dir: Option<&Path>,
     sync_root: &Path,
     versions: SourceVersions,
     include_auth: bool,
 ) -> Result<ExportReport, ExportFailure> {
-    precheck(agent_dir, sync_root)?;
+    precheck_sync_root(sync_root)?;
+    let mut root_warnings: Vec<String> = Vec::new();
+    let roots = detect_roots(agent_dir, home_dir, &mut root_warnings)?;
+    precheck_roots(&roots, sync_root)?;
 
     let stamp = unique_stamp();
     let temp_dir = sync_root.join(format!("{SNAPSHOT_DIR_NAME}.tmp-{stamp}"));
@@ -186,15 +212,23 @@ fn export_with_options(
         })?;
     }
 
-    let materialized = if include_auth {
-        scope::materialize(agent_dir, &temp_dir)
-    } else {
-        scope::materialize_without_auth(agent_dir, &temp_dir)
+    // 每个根物化到它在快照里的位置：agent 根占快照根，外部根落在 `external/<id>/`。
+    let mut skipped = 0;
+    let mut symlinks: Vec<(RootId, PathBuf, PathBuf)> = Vec::new();
+    for root in roots.iter() {
+        let dest = snapshot_root_dir(&temp_dir, root.id);
+        let materialized = scope::materialize_root(root, &dest, include_auth).map_err(|error| {
+            let _ = fs::remove_dir_all(&temp_dir);
+            ExportFailure::new("export_failed", format!("复制受管文件失败：{error}"))
+        })?;
+        skipped += materialized.skipped.len();
+        symlinks.extend(
+            materialized
+                .symlinks
+                .into_iter()
+                .map(|(path, target)| (root.id, path, target)),
+        );
     }
-    .map_err(|error| {
-        let _ = fs::remove_dir_all(&temp_dir);
-        ExportFailure::new("export_failed", format!("复制受管文件失败：{error}"))
-    })?;
 
     // 快照目录含明文凭据：目录只给本用户，auth.json 再收紧到 0600。
     platform::set_mode(&temp_dir, SNAPSHOT_DIR_MODE).map_err(|error| {
@@ -230,7 +264,7 @@ fn export_with_options(
         .filter(|finding| finding.path != "snapshot/auth.json")
         .collect();
 
-    let collected = collect_snapshot_files(&temp_dir).map_err(|error| {
+    let collected = collect_snapshot_files(&roots, &temp_dir).map_err(|error| {
         let _ = fs::remove_dir_all(&temp_dir);
         ExportFailure::new("export_failed", format!("读取临时快照失败：{error}"))
     })?;
@@ -238,18 +272,20 @@ fn export_with_options(
     let files: Vec<ManifestFile> = collected
         .iter()
         .map(|file| ManifestFile {
-            path: manifest_path(SNAPSHOT_DIR_NAME, &file.relative),
+            path: manifest_path(file.root, &file.relative),
             sha256: file.sha256.clone(),
             size: file.size,
             kind: file.kind.to_string(),
         })
         .collect();
 
+    let managed_roots = roots.ids();
     let manifest = Manifest {
         format_version: FORMAT_VERSION,
         profile_id: PROFILE_ID.to_string(),
+        managed_roots: managed_roots.clone(),
         created_at: format_timestamp(now_seconds()),
-        fingerprint: fingerprint(FORMAT_VERSION, &files),
+        fingerprint: fingerprint(FORMAT_VERSION, &managed_roots, &files),
         source: SourceInfo {
             app: env!("CARGO_PKG_VERSION").to_string(),
             os: std::env::consts::OS.to_string(),
@@ -262,11 +298,10 @@ fn export_with_options(
             pi: REQUIREMENT_PI.to_string(),
         },
         files,
-        symlinks: materialized
-            .symlinks
-            .iter()
-            .map(|(path, target)| ManifestSymlink {
-                path: manifest_path(SNAPSHOT_DIR_NAME, path),
+        symlinks: symlinks
+            .into_iter()
+            .map(|(root, path, target)| ManifestSymlink {
+                path: manifest_path(root, &path),
                 target: target.to_string_lossy().into_owned(),
             })
             .collect(),
@@ -280,17 +315,111 @@ fn export_with_options(
     Ok(ExportReport {
         files: manifest.files.len(),
         fingerprint,
+        managed_roots,
         required_packages: manifest.required_packages,
-        skipped: materialized.skipped.len(),
+        skipped,
         warnings,
+        root_warnings,
         plaintext_secrets,
         snapshot_dir: sync_root.join(SNAPSHOT_DIR_NAME),
         manifest_path: sync_root.join(MANIFEST_FILE_NAME),
     })
 }
 
-/// 预检：目录存在、路径规范、同步根与宿主目录不互相嵌套。
-fn precheck(agent_dir: &Path, sync_root: &Path) -> Result<(), ExportFailure> {
+/// 源机的受管根。
+///
+/// `agent` 根始终声明，不可用就是错误；`agents-skills` 根只看源机有没有 `<home>/.agents/skills`：
+/// 不存在就不声明（目标机完全不读、不写、不删），存在（含空目录）就声明，不可读或不是目录则导出失败。
+fn detect_roots(
+    agent_dir: &Path,
+    home_dir: Option<&Path>,
+    warnings: &mut Vec<String>,
+) -> Result<ManagedRoots, ExportFailure> {
+    // 导出与应用都要用 home 解析 `~/.agents/skills`：解析不到就说不清该不该声明该根，
+    // 静默降级成 agent-only 会让另一台机器把外部技能当成不存在。
+    let home_dir = home_dir.ok_or_else(|| {
+        ExportFailure::new(
+            "home_dir_missing",
+            "无法确定 home 目录，无法判断是否需要声明 ~/.agents/skills；已停止导出",
+        )
+    })?;
+
+    // 根的类型不进入快照：链接只跟随内容，导出与应用各给一条告警。
+    if platform::is_link_like(agent_dir) {
+        warnings.push(format!(
+            "{} 是符号链接，只同步其内容，不记录根链接",
+            agent_dir.display()
+        ));
+    }
+
+    let mut roots = vec![ManagedRoot::agent(agent_dir)];
+    let root = ManagedRoot::agents_skills(home_dir);
+    if inspect_agents_skills(&root.path, warnings)? {
+        roots.push(root);
+    }
+    Ok(ManagedRoots::new(roots))
+}
+
+/// `Ok(true)` 声明该根，`Ok(false)` 不声明。
+///
+/// 根的类型（真目录 / 符号链接）不进入快照：是链接就只跟随内容、不重建根链接；
+/// 断链按不存在处理并告警。
+fn inspect_agents_skills(path: &Path, warnings: &mut Vec<String>) -> Result<bool, ExportFailure> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(ExportFailure::new(
+                "external_root_unreadable",
+                format!("无法读取 {}：{error}", path.display()),
+            ))
+        }
+    };
+
+    if platform::is_link_like(path) {
+        match fs::metadata(path) {
+            Ok(target) if target.is_dir() => warnings.push(format!(
+                "{} 是符号链接，只同步其内容，不记录根链接",
+                path.display()
+            )),
+            Ok(_) => return Err(external_root_invalid(path)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                warnings.push(format!(
+                    "{} 是断链，按不存在处理，本次不声明该根",
+                    path.display()
+                ));
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(ExportFailure::new(
+                    "external_root_unreadable",
+                    format!("无法读取 {}：{error}", path.display()),
+                ))
+            }
+        }
+    } else if !metadata.is_dir() {
+        return Err(external_root_invalid(path));
+    }
+
+    // 目录存在但读不出内容时导出会得到半套快照，宁可先失败。
+    fs::read_dir(path).map_err(|error| {
+        ExportFailure::new(
+            "external_root_unreadable",
+            format!("无法读取 {}：{error}", path.display()),
+        )
+    })?;
+    Ok(true)
+}
+
+fn external_root_invalid(path: &Path) -> ExportFailure {
+    ExportFailure::new(
+        "external_root_invalid",
+        format!("{} 存在但不是目录，无法作为受管根同步", path.display()),
+    )
+}
+
+/// 预检：同步文件夹路径规范且存在。
+fn precheck_sync_root(sync_root: &Path) -> Result<(), ExportFailure> {
     if !is_plain_absolute(sync_root) {
         return Err(ExportFailure::new(
             "sync_root_invalid",
@@ -303,6 +432,14 @@ fn precheck(agent_dir: &Path, sync_root: &Path) -> Result<(), ExportFailure> {
             "同步文件夹不存在或不是文件夹，请在设置页选择",
         ));
     }
+    Ok(())
+}
+
+/// 预检：受管根可用，且都不与同步文件夹互相嵌套。
+fn precheck_roots(roots: &ManagedRoots, sync_root: &Path) -> Result<(), ExportFailure> {
+    let agent_dir = roots.path(RootId::Agent).ok_or_else(|| {
+        ExportFailure::new("agent_dir_missing", "无法确定宿主目录，请先在设置页填写")
+    })?;
     if !agent_dir.is_dir() {
         return Err(ExportFailure::new(
             "agent_dir_missing",
@@ -314,15 +451,29 @@ fn precheck(agent_dir: &Path, sync_root: &Path) -> Result<(), ExportFailure> {
     let canonical_sync = fs::canonicalize(sync_root).map_err(|error| {
         ExportFailure::new("sync_root_invalid", format!("无法访问同步文件夹：{error}"))
     })?;
-    let canonical_agent = fs::canonicalize(agent_dir).map_err(|error| {
-        ExportFailure::new("agent_dir_missing", format!("无法访问宿主目录：{error}"))
-    })?;
-    if canonical_sync.starts_with(&canonical_agent) || canonical_agent.starts_with(&canonical_sync)
-    {
-        return Err(ExportFailure::new(
-            "sync_root_overlaps_agent_dir",
-            "同步文件夹与宿主目录不能相同，也不能互相嵌套",
-        ));
+    for root in roots.iter() {
+        let canonical_root = fs::canonicalize(&root.path).map_err(|error| {
+            let code = match root.id {
+                RootId::Agent => "agent_dir_missing",
+                RootId::AgentsSkills => "external_root_unreadable",
+            };
+            ExportFailure::new(code, format!("无法访问 {}：{error}", root.path.display()))
+        })?;
+        if canonical_sync.starts_with(&canonical_root)
+            || canonical_root.starts_with(&canonical_sync)
+        {
+            let (code, message) = match root.id {
+                RootId::Agent => (
+                    "sync_root_overlaps_agent_dir",
+                    "同步文件夹与宿主目录不能相同，也不能互相嵌套",
+                ),
+                RootId::AgentsSkills => (
+                    "sync_root_overlaps_external_root",
+                    "同步文件夹与 ~/.agents/skills 不能相同，也不能互相嵌套",
+                ),
+            };
+            return Err(ExportFailure::new(code, message));
+        }
     }
 
     Ok(())
@@ -441,13 +592,25 @@ pub fn verify_files(sync_root: &Path, files: &[ManifestFile]) -> Result<(), Expo
     Ok(())
 }
 
-/// 快照指纹：`formatVersion` 与按 path 排序的 `{path, sha256}` 一起取 SHA-256，取前 12 位。
-pub fn fingerprint(format_version: u32, files: &[ManifestFile]) -> String {
+/// 快照指纹：`formatVersion`、排序后的 `managedRoots` 与按 path 排序的 `{path, sha256}` 一起取
+/// SHA-256，取前 12 位。受管根不同（例如一边声明了空的外部根、另一边没声明）必须指纹不同。
+pub fn fingerprint(
+    format_version: u32,
+    managed_roots: &[RootId],
+    files: &[ManifestFile],
+) -> String {
+    let mut roots: Vec<&str> = managed_roots.iter().map(|id| id.as_str()).collect();
+    roots.sort_unstable();
     let mut sorted: Vec<&ManifestFile> = files.iter().collect();
     sorted.sort_by(|a, b| a.path.cmp(&b.path));
 
     let mut hasher = Sha256::new();
     hasher.update(format!("{format_version}\n").as_bytes());
+    for root in roots {
+        hasher.update(root.as_bytes());
+        hasher.update([0u8]);
+    }
+    hasher.update(b"\n");
     for file in sorted {
         hasher.update(file.path.as_bytes());
         hasher.update([0u8]);
@@ -502,51 +665,114 @@ fn declared_packages(snapshot_dir: &Path) -> Vec<RequiredPackage> {
         .collect()
 }
 
-fn manifest_path(prefix: &str, relative: &Path) -> String {
-    let mut path = String::from(prefix);
+/// 根内相对路径在容器里的虚拟路径：agent 根就是相对路径本身，外部根带 `external/<id>/` 前缀。
+/// 备份目录直接用这个布局，manifest 路径再在前面加 `snapshot/`。
+pub fn virtual_path(root: RootId, relative: &Path) -> String {
+    let mut path = String::from(root.snapshot_prefix());
     for component in relative.components() {
-        path.push('/');
+        if !path.is_empty() {
+            path.push('/');
+        }
         path.push_str(&component.as_os_str().to_string_lossy());
     }
     path
 }
 
+/// 一个根内相对路径的 manifest 路径，形如 `snapshot/settings.json` 或
+/// `snapshot/external/agents-skills/foo/SKILL.md`。
+pub fn manifest_path(root: RootId, relative: &Path) -> String {
+    format!("{SNAPSHOT_DIR_NAME}/{}", virtual_path(root, relative))
+}
+
+/// manifest 路径 → （所属根, 根内相对路径）。不在 `snapshot/` 之下或为空时返回 `None`。
+pub fn split_manifest_path(path: &str) -> Option<(RootId, PathBuf)> {
+    let rest = path
+        .strip_prefix(SNAPSHOT_DIR_NAME)
+        .and_then(|rest| rest.strip_prefix('/'))?;
+    if rest.is_empty() {
+        return None;
+    }
+
+    let prefix = format!("{}/", RootId::AgentsSkills.snapshot_prefix());
+    if let Some(relative) = rest.strip_prefix(&prefix) {
+        return (!relative.is_empty()).then(|| (RootId::AgentsSkills, PathBuf::from(relative)));
+    }
+    // agent 根占快照根：它的白名单里没有 `external/`，所以其余路径都归它。
+    Some((RootId::Agent, PathBuf::from(rest)))
+}
+
+/// 某个根在快照目录里的位置：agent 根就是快照根，外部根在 `external/<id>/`。
+fn snapshot_root_dir(snapshot_dir: &Path, id: RootId) -> PathBuf {
+    let prefix = id.snapshot_prefix();
+    if prefix.is_empty() {
+        snapshot_dir.to_path_buf()
+    } else {
+        snapshot_dir.join(prefix)
+    }
+}
+
 struct CollectedFile {
+    root: RootId,
+    /// 根内相对路径。
     relative: PathBuf,
     size: u64,
     sha256: String,
     kind: &'static str,
 }
 
-fn collect_snapshot_files(root: &Path) -> io::Result<Vec<CollectedFile>> {
-    fn visit(root: &Path, relative: &Path, files: &mut Vec<CollectedFile>) -> io::Result<()> {
-        let mut names: Vec<OsString> = Vec::new();
-        for item in fs::read_dir(root.join(relative))? {
-            names.push(item?.file_name());
-        }
-        names.sort();
-
-        for name in names {
-            let child = relative.join(&name);
-            let metadata = fs::metadata(root.join(&child))?;
-            if metadata.is_dir() {
-                visit(root, &child, files)?;
-            } else if metadata.is_file() {
-                let bytes = fs::read(root.join(&child))?;
-                files.push(CollectedFile {
-                    relative: child.clone(),
-                    size: metadata.len(),
-                    sha256: sha256_hex(&bytes),
-                    kind: kind_for(&child, &bytes),
-                });
-            }
-        }
-        Ok(())
-    }
-
+/// 逐根读临时快照，算出每个文件的哈希与 manifest 路径。
+fn collect_snapshot_files(
+    roots: &ManagedRoots,
+    snapshot_dir: &Path,
+) -> io::Result<Vec<CollectedFile>> {
     let mut files = Vec::new();
-    visit(root, Path::new(""), &mut files)?;
+    for root in roots.iter() {
+        let base = snapshot_root_dir(snapshot_dir, root.id);
+        if base.is_dir() {
+            collect_root(root.id, &base, Path::new(""), &mut files)?;
+        }
+    }
+    files.sort_by(|left, right| {
+        left.root
+            .cmp(&right.root)
+            .then_with(|| left.relative.cmp(&right.relative))
+    });
     Ok(files)
+}
+
+fn collect_root(
+    root: RootId,
+    base: &Path,
+    relative: &Path,
+    files: &mut Vec<CollectedFile>,
+) -> io::Result<()> {
+    let mut names: Vec<OsString> = Vec::new();
+    for item in fs::read_dir(base.join(relative))? {
+        names.push(item?.file_name());
+    }
+    names.sort();
+
+    for name in names {
+        // `external/` 是其它受管根在快照里的位置，不属于 agent 根的内容。
+        if root == RootId::Agent && relative.as_os_str().is_empty() && name == "external" {
+            continue;
+        }
+        let child = relative.join(&name);
+        let metadata = fs::metadata(base.join(&child))?;
+        if metadata.is_dir() {
+            collect_root(root, base, &child, files)?;
+        } else if metadata.is_file() {
+            let bytes = fs::read(base.join(&child))?;
+            files.push(CollectedFile {
+                root,
+                relative: child.clone(),
+                size: metadata.len(),
+                sha256: sha256_hex(&bytes),
+                kind: kind_for(&child, &bytes),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn kind_for(relative: &Path, bytes: &[u8]) -> &'static str {
@@ -653,7 +879,12 @@ fn export_snapshot_blocking(app: &tauri::AppHandle) -> Result<ExportReport, Expo
         &ShellRunner::from_env(),
         HostOs::current(),
     );
-    export_with(&agent_dir, &sync_root, SourceVersions { pi, node })
+    export_with(
+        &agent_dir,
+        home_dir.as_deref(),
+        &sync_root,
+        SourceVersions { pi, node },
+    )
 }
 
 #[cfg(test)]
@@ -722,6 +953,13 @@ mod tests {
         write_file(&root.join("sessions/session.json"), "{}");
     }
 
+    /// 单根夹具的 home：存在但没有 `~/.agents/skills`，导出只声明 agent 根。
+    fn home_without_skills(temp: &TempDir) -> PathBuf {
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).expect("创建 home");
+        home
+    }
+
     fn read_manifest(sync_root: &Path) -> Manifest {
         let text = fs::read_to_string(sync_root.join(MANIFEST_FILE_NAME)).expect("读取 manifest");
         serde_json::from_str(&text).expect("解析 manifest")
@@ -753,14 +991,15 @@ mod tests {
             pi: Some("1.6.0".to_string()),
             node: Some("24.14.0".to_string()),
         };
-        export_with(&agent, &sync_root, versions).expect("导出应成功");
+        let home = home_without_skills(&temp);
+        export_with(&agent, Some(&home), &sync_root, versions).expect("导出应成功");
 
         let manifest = read_manifest(&sync_root);
         assert_eq!(manifest.source.pi.as_deref(), Some("1.6.0"));
         assert_eq!(manifest.source.node.as_deref(), Some("24.14.0"));
 
         // 探测不到时留空：导出照常成功，manifest 里是 null。
-        export(&agent, &sync_root).expect("导出应成功");
+        export(&agent, &home, &sync_root).expect("导出应成功");
         let manifest = read_manifest(&sync_root);
         assert_eq!(manifest.source.pi, None);
         assert_eq!(manifest.source.node, None);
@@ -774,7 +1013,7 @@ mod tests {
         fixture_agent(&agent);
         fs::create_dir_all(&sync_root).expect("创建同步目录");
 
-        let report = export(&agent, &sync_root).expect("导出应成功");
+        let report = export(&agent, &home_without_skills(&temp), &sync_root).expect("导出应成功");
         assert_eq!(report.files, 6, "{:?}", report);
         assert_eq!(report.fingerprint.len(), 12);
         assert!(report.fingerprint.chars().all(|ch| ch.is_ascii_hexdigit()));
@@ -811,11 +1050,13 @@ mod tests {
         );
         verify_files(&sync_root, &manifest.files).expect("自检哈希");
 
-        // 指纹只由 formatVersion 与 {path, sha256} 决定，可复算。
+        // 指纹只由 formatVersion、managedRoots 与 {path, sha256} 决定，可复算。
         assert_eq!(
-            fingerprint(FORMAT_VERSION, &manifest.files),
+            fingerprint(FORMAT_VERSION, &manifest.managed_roots, &manifest.files),
             report.fingerprint
         );
+        assert_eq!(manifest.managed_roots, vec![RootId::Agent]);
+        assert_eq!(report.managed_roots, vec![RootId::Agent]);
 
         // 包声明：字符串与对象两种写法都进 requiredPackages。
         assert_eq!(
@@ -879,14 +1120,35 @@ mod tests {
         let mut reversed = files.clone();
         reversed.reverse();
 
-        let expected = fingerprint(FORMAT_VERSION, &files);
-        assert_eq!(expected, fingerprint(FORMAT_VERSION, &reversed));
+        let expected = fingerprint(FORMAT_VERSION, &[RootId::Agent], &files);
+        assert_eq!(
+            expected,
+            fingerprint(FORMAT_VERSION, &[RootId::Agent], &reversed)
+        );
         assert_eq!(expected.len(), 12);
 
         let mut changed = files.clone();
         changed[0].sha256 = "cc".repeat(32);
-        assert_ne!(expected, fingerprint(FORMAT_VERSION, &changed));
-        assert_ne!(expected, fingerprint(FORMAT_VERSION + 1, &files));
+        assert_ne!(
+            expected,
+            fingerprint(FORMAT_VERSION, &[RootId::Agent], &changed)
+        );
+        assert_ne!(
+            expected,
+            fingerprint(FORMAT_VERSION + 1, &[RootId::Agent], &files)
+        );
+        // 受管根不同必须指纹不同：一边声明了（可为空的）外部根，另一边没有。
+        let both = [RootId::Agent, RootId::AgentsSkills];
+        assert_ne!(expected, fingerprint(FORMAT_VERSION, &both, &files));
+        // 根顺序不影响指纹。
+        assert_eq!(
+            fingerprint(FORMAT_VERSION, &both, &files),
+            fingerprint(
+                FORMAT_VERSION,
+                &[RootId::AgentsSkills, RootId::Agent],
+                &files
+            )
+        );
     }
 
     #[test]
@@ -896,7 +1158,7 @@ mod tests {
         let sync_root = temp.path().join("cloud");
         fixture_agent(&agent);
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        export(&agent, &sync_root).expect("导出应成功");
+        export(&agent, &home_without_skills(&temp), &sync_root).expect("导出应成功");
         let manifest = read_manifest(&sync_root);
 
         // 原样通过。
@@ -920,14 +1182,15 @@ mod tests {
         let sync_root = temp.path().join("cloud");
         fixture_agent(&agent);
         fs::create_dir_all(&sync_root).expect("创建同步目录");
-        export(&agent, &sync_root).expect("首次导出应成功");
+        let home = home_without_skills(&temp);
+        export(&agent, &home, &sync_root).expect("首次导出应成功");
 
         // 第二次：新增的扩展文件也进入快照，旧快照整体被替换。
         write_file(
             &agent.join("extensions/leak/index.ts"),
             &format!("const apiKey = \"sk-{SECRET}\";\n"),
         );
-        let report = export(&agent, &sync_root).expect("第二次导出应成功");
+        let report = export(&agent, &home, &sync_root).expect("第二次导出应成功");
         assert!(report.plaintext_secrets);
         assert!(sync_root
             .join("snapshot/extensions/leak/index.ts")
@@ -941,18 +1204,271 @@ mod tests {
         let temp = TempDir::new("nested");
         let agent = temp.path().join("agent");
         fixture_agent(&agent);
+        let home = home_without_skills(&temp);
 
         let inside = agent.join("cloud");
         fs::create_dir_all(&inside).expect("创建嵌套同步目录");
-        let failure = export(&agent, &inside).expect_err("嵌套应被拒绝");
+        let failure = export(&agent, &home, &inside).expect_err("嵌套应被拒绝");
         assert_eq!(failure.code, "sync_root_overlaps_agent_dir");
 
         let missing = temp.path().join("missing");
-        let failure = export(&agent, &missing).expect_err("缺失应被拒绝");
+        let failure = export(&agent, &home, &missing).expect_err("缺失应被拒绝");
         assert_eq!(failure.code, "sync_root_missing");
 
-        let failure = export(&agent, Path::new("relative/path")).expect_err("相对路径应被拒绝");
+        let failure =
+            export(&agent, &home, Path::new("relative/path")).expect_err("相对路径应被拒绝");
         assert_eq!(failure.code, "sync_root_invalid");
+    }
+
+    /// `~/.agents/skills` 夹具：与 agent 目录平铺在同一个临时 home 下。
+    fn fixture_home(temp: &TempDir, fill: impl FnOnce(&Path)) -> PathBuf {
+        let home = temp.path().join("home");
+        let skills = home.join(".agents/skills");
+        fs::create_dir_all(&skills).expect("创建外部根");
+        fill(&skills);
+        home
+    }
+
+    #[test]
+    fn export_declares_agents_skills_and_puts_its_files_under_external() {
+        let temp = TempDir::new("external");
+        let agent = temp.path().join("agent");
+        let sync_root = temp.path().join("cloud");
+        fixture_agent(&agent);
+        let home = fixture_home(&temp, |skills| {
+            write_file(&skills.join("antd/SKILL.md"), "# 共享技能\n");
+            write_file(&skills.join("auth.json"), "{}");
+        });
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+
+        let report = export_with(&agent, Some(&home), &sync_root, SourceVersions::default())
+            .expect("导出应成功");
+        assert_eq!(
+            report.managed_roots,
+            vec![RootId::Agent, RootId::AgentsSkills]
+        );
+
+        let manifest = read_manifest(&sync_root);
+        assert_eq!(
+            manifest.managed_roots,
+            vec![RootId::Agent, RootId::AgentsSkills]
+        );
+        let paths: Vec<String> = manifest
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect();
+        assert!(
+            paths.contains(&"snapshot/external/agents-skills/antd/SKILL.md".to_string()),
+            "{paths:?}"
+        );
+        // 外部根里的 auth.json 不是凭据位置，不进快照。
+        assert!(
+            !paths.contains(&"snapshot/external/agents-skills/auth.json".to_string()),
+            "{paths:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(sync_root.join("snapshot/external/agents-skills/antd/SKILL.md"))
+                .expect("读取快照里的外部根文件"),
+            "# 共享技能\n"
+        );
+
+        // 声明与不声明外部根是两份不同的快照。
+        let agent_only = TempDir::new("external-agent-only");
+        let agent_only_root = agent_only.path().join("cloud");
+        fs::create_dir_all(&agent_only_root).expect("创建同步目录");
+        let plain = export(&agent, &home_without_skills(&agent_only), &agent_only_root)
+            .expect("导出 agent-only 快照");
+        assert_eq!(plain.managed_roots, vec![RootId::Agent]);
+        assert_ne!(plain.fingerprint, report.fingerprint);
+    }
+
+    #[test]
+    fn empty_agents_skills_dir_is_still_declared() {
+        let temp = TempDir::new("external-empty");
+        let agent = temp.path().join("agent");
+        let sync_root = temp.path().join("cloud");
+        fixture_agent(&agent);
+        let home = fixture_home(&temp, |_| {});
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+
+        let report = export_with(&agent, Some(&home), &sync_root, SourceVersions::default())
+            .expect("导出应成功");
+        assert_eq!(
+            report.managed_roots,
+            vec![RootId::Agent, RootId::AgentsSkills]
+        );
+        // 空目录也要在快照里出现，目标机才能把多出的技能列为删除候选。
+        assert!(sync_root.join("snapshot/external/agents-skills").is_dir());
+        assert!(read_manifest(&sync_root)
+            .managed_roots
+            .contains(&RootId::AgentsSkills));
+    }
+
+    #[test]
+    fn missing_agents_skills_dir_produces_no_external_paths() {
+        let temp = TempDir::new("external-missing");
+        let agent = temp.path().join("agent");
+        let sync_root = temp.path().join("cloud");
+        fixture_agent(&agent);
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).expect("创建 home");
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+
+        let report = export_with(&agent, Some(&home), &sync_root, SourceVersions::default())
+            .expect("导出应成功");
+        assert_eq!(report.managed_roots, vec![RootId::Agent]);
+        assert!(!sync_root.join("snapshot/external").exists());
+    }
+
+    #[test]
+    fn agents_skills_that_is_not_a_directory_fails_the_export() {
+        let temp = TempDir::new("external-file");
+        let agent = temp.path().join("agent");
+        let sync_root = temp.path().join("cloud");
+        fixture_agent(&agent);
+        let home = temp.path().join("home");
+        write_file(&home.join(".agents/skills"), "not a dir");
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+
+        let failure = export_with(&agent, Some(&home), &sync_root, SourceVersions::default())
+            .expect_err("不是目录应导出失败");
+        assert_eq!(failure.code, "external_root_invalid");
+        assert!(!sync_root.join("snapshot").exists(), "失败不留下半套快照");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agents_skills_symlink_is_followed_and_reported() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new("external-link");
+        let agent = temp.path().join("agent");
+        let sync_root = temp.path().join("cloud");
+        fixture_agent(&agent);
+        let home = temp.path().join("home");
+        let shared = temp.path().join("shared-skills");
+        write_file(&shared.join("antd/SKILL.md"), "# 共享技能\n");
+        fs::create_dir_all(home.join(".agents")).expect("创建 .agents");
+        symlink(&shared, home.join(".agents/skills")).expect("建外部根链接");
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+
+        let report = export_with(&agent, Some(&home), &sync_root, SourceVersions::default())
+            .expect("导出应成功");
+        // 根的类型不进快照：只跟内容，不记录根链接。
+        assert_eq!(
+            read_manifest(&sync_root).managed_roots,
+            vec![RootId::Agent, RootId::AgentsSkills]
+        );
+        assert!(sync_root
+            .join("snapshot/external/agents-skills/antd/SKILL.md")
+            .is_file());
+        assert_eq!(report.root_warnings.len(), 1, "{:?}", report.root_warnings);
+        assert!(report.root_warnings[0].contains("符号链接"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_agents_skills_symlink_is_treated_as_missing() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new("external-broken");
+        let agent = temp.path().join("agent");
+        let sync_root = temp.path().join("cloud");
+        fixture_agent(&agent);
+        let home = temp.path().join("home");
+        fs::create_dir_all(home.join(".agents")).expect("创建 .agents");
+        symlink("nowhere", home.join(".agents/skills")).expect("建断链");
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+
+        let report = export_with(&agent, Some(&home), &sync_root, SourceVersions::default())
+            .expect("断链不应导致导出失败");
+        assert_eq!(report.managed_roots, vec![RootId::Agent]);
+        assert_eq!(report.root_warnings.len(), 1, "{:?}", report.root_warnings);
+        assert!(report.root_warnings[0].contains("断链"));
+        assert!(!sync_root.join("snapshot/external").exists());
+    }
+
+    #[test]
+    fn sync_root_nested_with_agents_skills_is_rejected() {
+        let temp = TempDir::new("external-nested");
+        let agent = temp.path().join("agent");
+        fixture_agent(&agent);
+        let home = fixture_home(&temp, |_| {});
+        let inside = home.join(".agents/skills/cloud");
+        fs::create_dir_all(&inside).expect("创建嵌套同步目录");
+
+        let failure = export_with(&agent, Some(&home), &inside, SourceVersions::default())
+            .expect_err("嵌套应被拒绝");
+        assert_eq!(failure.code, "sync_root_overlaps_external_root");
+    }
+
+    #[test]
+    fn export_without_a_home_fails_instead_of_falling_back_to_agent_only() {
+        let temp = TempDir::new("no-home");
+        let agent = temp.path().join("agent");
+        let sync_root = temp.path().join("cloud");
+        fixture_agent(&agent);
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+
+        let failure = export_with(&agent, None, &sync_root, SourceVersions::default())
+            .expect_err("解析不到 home 应导出失败");
+        assert_eq!(failure.code, "home_dir_missing");
+        assert!(
+            !sync_root.join(SNAPSHOT_DIR_NAME).exists(),
+            "失败不留下半套快照"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_root_symlink_is_followed_and_reported() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new("agent-root-link");
+        let real = temp.path().join("real-agent");
+        fixture_agent(&real);
+        let agent = temp.path().join("agent");
+        symlink(&real, &agent).expect("建根链接");
+        let home = home_without_skills(&temp);
+        let sync_root = temp.path().join("cloud");
+        fs::create_dir_all(&sync_root).expect("创建同步目录");
+
+        let report = export(&agent, &home, &sync_root).expect("导出应成功");
+        // 根的类型不进快照：内容跟随链接读出来，但也要告警让人知道写入会落到链接目标。
+        assert_eq!(report.root_warnings.len(), 1, "{:?}", report.root_warnings);
+        assert!(report.root_warnings[0].contains("符号链接"));
+        assert!(sync_root.join("snapshot/settings.json").is_file());
+        assert!(
+            read_manifest(&sync_root).symlinks.is_empty(),
+            "根链接不进 manifest"
+        );
+    }
+
+    #[test]
+    fn manifest_paths_map_back_to_roots() {
+        assert_eq!(
+            manifest_path(RootId::Agent, Path::new("skills/antd/SKILL.md")),
+            "snapshot/skills/antd/SKILL.md"
+        );
+        assert_eq!(
+            manifest_path(RootId::AgentsSkills, Path::new("antd/SKILL.md")),
+            "snapshot/external/agents-skills/antd/SKILL.md"
+        );
+        assert_eq!(
+            split_manifest_path("snapshot/settings.json"),
+            Some((RootId::Agent, PathBuf::from("settings.json")))
+        );
+        assert_eq!(
+            split_manifest_path("snapshot/external/agents-skills/antd/SKILL.md"),
+            Some((RootId::AgentsSkills, PathBuf::from("antd/SKILL.md")))
+        );
+        assert_eq!(split_manifest_path("manifest.json"), None);
+        assert_eq!(split_manifest_path("snapshot/"), None);
+        assert_eq!(
+            split_manifest_path("snapshot/external/agents-skills/"),
+            None
+        );
     }
 
     #[test]
@@ -960,6 +1476,7 @@ mod tests {
         let manifest = Manifest {
             format_version: FORMAT_VERSION,
             profile_id: PROFILE_ID.to_string(),
+            managed_roots: vec![RootId::Agent, RootId::AgentsSkills],
             created_at: "2026-11-20T05:30:00Z".to_string(),
             fingerprint: "a1b2c3d4e5f6".to_string(),
             source: SourceInfo {
@@ -996,6 +1513,7 @@ mod tests {
         for key in [
             "formatVersion",
             "profileId",
+            "managedRoots",
             "createdAt",
             "fingerprint",
             "source",
@@ -1006,6 +1524,11 @@ mod tests {
         ] {
             assert!(value.get(key).is_some(), "manifest 缺少字段 {key}");
         }
+        // 受管根按 id 序列化，前端按同一套拼写解析。
+        assert_eq!(
+            value["managedRoots"],
+            serde_json::json!(["agent", "agents-skills"])
+        );
         assert!(
             value.get("plaintextSecrets").is_none(),
             "false 时不写该字段"
@@ -1014,6 +1537,28 @@ mod tests {
 
         let parsed: Manifest = serde_json::from_str(&text).expect("反序列化");
         assert_eq!(parsed, manifest);
+    }
+
+    #[test]
+    fn manifest_without_managed_roots_still_deserializes() {
+        // v2 快照没有 `managedRoots`。这个字段必须能缺省：`remote-state.json` 里存的是整份
+        // manifest，升级后解析失败会让 WebDAV 上传/下载与定时上行全部停掉。
+        // 快照本身依旧靠 `formatVersion` 拒绝旧格式（见 `plan::read_manifest`）。
+        let text = r#"{
+            "formatVersion": 2,
+            "profileId": "default",
+            "createdAt": "2026-11-18T11:06:40Z",
+            "fingerprint": "a1b2c3d4e5f6",
+            "source": { "app": "0.0.1", "os": "linux", "arch": "x64", "pi": null, "node": null },
+            "requirements": { "node": ">=22.19.0", "pi": ">=1.5.0" },
+            "files": [],
+            "symlinks": [],
+            "requiredPackages": []
+        }"#;
+
+        let manifest: Manifest = serde_json::from_str(text).expect("旧 manifest 应能解析");
+        assert_eq!(manifest.format_version, 2);
+        assert!(manifest.managed_roots.is_empty());
     }
 
     #[test]

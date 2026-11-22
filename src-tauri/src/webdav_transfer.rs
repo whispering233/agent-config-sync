@@ -291,10 +291,13 @@ pub fn upload<T: DavTransport>(
     client: &WebdavClient<T>,
     app_data: &Path,
     agent_dir: &Path,
+    home_dir: Option<&Path>,
     versions: &snapshot::SourceVersions,
     overwrite: bool,
 ) -> Result<UploadOutcome, TransferError> {
-    upload_with(client, app_data, agent_dir, versions, true, overwrite)
+    upload_with(
+        client, app_data, agent_dir, home_dir, versions, true, overwrite,
+    )
 }
 
 /// 自动上行默认使用：不把根级 `auth.json` 传上云端，避免后台覆盖其他机器的登录态。
@@ -302,16 +305,20 @@ pub fn upload_excluding_auth<T: DavTransport>(
     client: &WebdavClient<T>,
     app_data: &Path,
     agent_dir: &Path,
+    home_dir: Option<&Path>,
     versions: &snapshot::SourceVersions,
     overwrite: bool,
 ) -> Result<UploadOutcome, TransferError> {
-    upload_with(client, app_data, agent_dir, versions, false, overwrite)
+    upload_with(
+        client, app_data, agent_dir, home_dir, versions, false, overwrite,
+    )
 }
 
 fn upload_with<T: DavTransport>(
     client: &WebdavClient<T>,
     app_data: &Path,
     agent_dir: &Path,
+    home_dir: Option<&Path>,
     versions: &snapshot::SourceVersions,
     include_auth: bool,
     overwrite: bool,
@@ -320,6 +327,7 @@ fn upload_with<T: DavTransport>(
     let input = UploadInput {
         app_data,
         agent_dir,
+        home_dir,
         versions,
         workspace: &workspace,
         include_auth,
@@ -334,6 +342,7 @@ fn upload_with<T: DavTransport>(
 struct UploadInput<'a> {
     app_data: &'a Path,
     agent_dir: &'a Path,
+    home_dir: Option<&'a Path>,
     versions: &'a snapshot::SourceVersions,
     workspace: &'a Path,
     include_auth: bool,
@@ -352,9 +361,19 @@ fn upload_into<T: DavTransport>(
 ) -> Result<UploadOutcome, TransferError> {
     // 1. 导出：明文扫描、manifest、指纹全部复用快照流水线，不另写一套。
     if input.include_auth {
-        snapshot::export_with(input.agent_dir, input.workspace, input.versions.clone())
+        snapshot::export_with(
+            input.agent_dir,
+            input.home_dir,
+            input.workspace,
+            input.versions.clone(),
+        )
     } else {
-        snapshot::export_without_auth(input.agent_dir, input.workspace, input.versions.clone())
+        snapshot::export_without_auth(
+            input.agent_dir,
+            input.home_dir,
+            input.workspace,
+            input.versions.clone(),
+        )
     }
     .map_err(TransferError::Export)?;
     let manifest = read_workspace_manifest(input.workspace)?;
@@ -810,6 +829,13 @@ mod tests {
         }
     }
 
+    /// 单根夹具的 home：存在但没有 `~/.agents/skills`，导出只声明 agent 根。
+    fn home_without_skills(temp: &TempDir) -> PathBuf {
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).expect("创建 home");
+        home
+    }
+
     struct FakeState {
         requests: RefCell<Vec<DavRequest>>,
         responses: RefCell<VecDeque<Result<DavResponse, DavError>>>,
@@ -883,8 +909,9 @@ mod tests {
         Manifest {
             format_version: FORMAT_VERSION,
             profile_id: PROFILE_ID.to_string(),
+            managed_roots: vec![crate::scope::RootId::Agent],
             created_at: "2026-11-20T05:30:00Z".to_string(),
-            fingerprint: fingerprint(FORMAT_VERSION, &files),
+            fingerprint: fingerprint(FORMAT_VERSION, &[crate::scope::RootId::Agent], &files),
             source: SourceInfo {
                 app: "0.0.1".to_string(),
                 os: "linux".to_string(),
@@ -1037,6 +1064,37 @@ mod tests {
         );
         // 本次观察覆盖旧记录。
         assert_eq!(load_state(&app_data).unwrap().unwrap().manifest, manifest);
+    }
+
+    #[test]
+    fn remote_state_written_by_an_older_release_still_loads() {
+        let temp = TempDir::new("old-state");
+        let app_data = temp.path().join("data");
+        fs::create_dir_all(&app_data).unwrap();
+        // 升级前写下的远端状态：整份 v2 manifest，没有 `managedRoots`。
+        // 解析失败会让 WebDAV 上传/下载与定时上行全部停掉，所以该字段必须能缺省。
+        let text = r#"{
+            "seenAt": "2026-11-01T08:00:00Z",
+            "manifest": {
+                "formatVersion": 2,
+                "profileId": "default",
+                "createdAt": "2026-11-01T07:59:00Z",
+                "fingerprint": "a1b2c3d4e5f6",
+                "source": { "app": "0.0.1", "os": "linux", "arch": "x64", "pi": null, "node": null },
+                "requirements": { "node": ">=22.19.0", "pi": ">=1.5.0" },
+                "files": [],
+                "symlinks": [],
+                "requiredPackages": []
+            }
+        }"#;
+        fs::write(app_data.join(REMOTE_STATE_FILE_NAME), text).unwrap();
+
+        let state = load_state(&app_data)
+            .expect("旧状态应能解析")
+            .expect("状态应存在");
+        assert_eq!(state.seen_at, "2026-11-01T08:00:00Z");
+        assert_eq!(state.manifest.format_version, 2);
+        assert!(state.manifest.managed_roots.is_empty());
     }
 
     #[test]
@@ -1352,6 +1410,7 @@ mod tests {
         // 暂存目录顶替同步根：只读校验与计划一行都不用改。
         let report = crate::plan::plan_snapshot(
             &agent_dir,
+            None,
             &outcome.staging_root,
             &FakeRunner,
             HostOs::Posix,
@@ -1369,6 +1428,7 @@ mod tests {
         // 应用也从暂存目录读内容，备份仍落在应用数据目录。
         let applied = crate::apply::apply(
             &agent_dir,
+            None,
             &outcome.staging_root,
             &outcome.manifest.fingerprint,
             &[],
@@ -1461,6 +1521,7 @@ mod tests {
             &client,
             &app_data,
             &agent,
+            Some(home_without_skills(&temp).as_path()),
             &snapshot::SourceVersions::default(),
             false,
         )
@@ -1540,6 +1601,7 @@ mod tests {
             &client,
             &app_data,
             &agent,
+            Some(home_without_skills(&temp).as_path()),
             &snapshot::SourceVersions::default(),
             false,
         )
@@ -1581,6 +1643,7 @@ mod tests {
             &client,
             &app_data,
             &agent,
+            Some(home_without_skills(&temp).as_path()),
             &snapshot::SourceVersions::default(),
             true,
         )
@@ -1634,6 +1697,7 @@ mod tests {
             &client,
             &app_data,
             &agent,
+            Some(home_without_skills(&temp).as_path()),
             &snapshot::SourceVersions::default(),
             false,
         )
@@ -1653,6 +1717,7 @@ mod tests {
                     &client,
                     &app_data,
                     &agent,
+                    Some(home_without_skills(&temp).as_path()),
                     &snapshot::SourceVersions::default(),
                     true,
                 )
@@ -1677,6 +1742,7 @@ mod tests {
             &client,
             &app_data,
             &agent,
+            Some(home_without_skills(&temp).as_path()),
             &snapshot::SourceVersions::default(),
             false,
         )
@@ -1755,6 +1821,7 @@ mod tests {
             &first_client,
             &app_data,
             &agent,
+            Some(home_without_skills(&temp).as_path()),
             &snapshot::SourceVersions::default(),
             false,
         )
@@ -1770,6 +1837,7 @@ mod tests {
             &client,
             &app_data,
             &agent,
+            Some(home_without_skills(&temp).as_path()),
             &snapshot::SourceVersions::default(),
             false,
         )
@@ -1825,6 +1893,7 @@ mod tests {
             &client,
             &app_data,
             &agent,
+            Some(home_without_skills(&temp).as_path()),
             &snapshot::SourceVersions::default(),
             false,
         )
@@ -1871,6 +1940,7 @@ mod tests {
             &client,
             &app_data,
             &agent,
+            Some(home_without_skills(&temp).as_path()),
             &snapshot::SourceVersions::default(),
             false,
         )
@@ -1910,6 +1980,7 @@ mod tests {
             &client,
             &app_data,
             &agent,
+            Some(home_without_skills(&temp).as_path()),
             &snapshot::SourceVersions::default(),
             true,
         )
@@ -1947,6 +2018,7 @@ mod tests {
             &first_client,
             &app_data,
             &agent,
+            Some(home_without_skills(&temp).as_path()),
             &snapshot::SourceVersions::default(),
             false,
         )
@@ -1964,6 +2036,7 @@ mod tests {
             &client,
             &app_data,
             &agent,
+            Some(home_without_skills(&temp).as_path()),
             &snapshot::SourceVersions::default(),
             false,
         )
@@ -2013,6 +2086,7 @@ mod tests {
             &client,
             &app_data,
             &agent,
+            Some(home_without_skills(&temp).as_path()),
             &snapshot::SourceVersions::default(),
             false,
         )
@@ -2042,6 +2116,7 @@ mod tests {
             &client,
             &app_data,
             &agent,
+            Some(home_without_skills(&temp).as_path()),
             &snapshot::SourceVersions::default(),
             false,
         )
@@ -2067,6 +2142,7 @@ mod tests {
             &client,
             &app_data,
             &agent,
+            Some(home_without_skills(&temp).as_path()),
             &snapshot::SourceVersions::default(),
             false,
         )
@@ -2108,6 +2184,7 @@ mod tests {
             &client,
             &app_data,
             &agent,
+            Some(home_without_skills(&temp).as_path()),
             &snapshot::SourceVersions::default(),
             false,
         )

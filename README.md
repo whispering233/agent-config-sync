@@ -9,11 +9,11 @@ Pi CLI 配置的换机交付工具：把配置导出成**可校验的快照**，
 | 模块 | 做什么 |
 | :--- | :--- |
 | 设置 | 选择传输方式（本地文件夹 / WebDAV）与宿主目录；WebDAV 凭据单独保存；自动上行间隔、是否包含 `auth.json`、开机自启 |
-| 环境检测 | 探测 node/npm/pi/凭据/包/断链；安装或升级 Pi（确认后执行） |
+| 环境检测 | 探测 node/npm/pi/凭据/包/断链；安装或升级 Pi（确认后执行）；「刷新技能」显式启动宿主 RPC，可能新建空 `auth.json`/`models-store.json` |
 | 版本显示 | 点「检查更新」查询 Pi 与插件 npm 最新版；结果缓存 6 小时，不后台联网 |
-| 快照 | 按受管范围导出、原样保存密钥与 `auth.json`、写 manifest（含来源的 Pi/Node 版本）与指纹 |
+| 快照 | 按两个受管根（宿主目录 + `~/.agents/skills`）导出、原样保存密钥与 `auth.json`、写 manifest（含来源的 Pi/Node 版本）与指纹 |
 | 校验 | 校验 manifest 与逐文件哈希，生成新增/修改/删除计划 |
-| 应用 | 计划过期保护、删除逐项确认、备份、原子写、链接重建；快照没声明的陈旧链接只删链接本身 |
+| 应用 | 计划过期保护、删除逐项确认（外部根逐项）、备份、原子写、按根链接重建；快照没声明的陈旧链接只删链接本身 |
 | 回滚 | 列出备份、还原前再备份、按 restore.json 反做 |
 | 密钥 | 只读扫描明文密钥与 `auth.json`，导出/应用时告警 |
 | 包对齐 | 比对 `settings.json` 声明与 `pi list` 实装，安装缺失项 |
@@ -25,11 +25,11 @@ Linux：
 
 ```bash
 # deb（推荐）
-sudo dpkg -i "src-tauri/target/release/bundle/deb/Agent Config Sync_0.0.2_amd64.deb"
+sudo dpkg -i "src-tauri/target/release/bundle/deb/Agent Config Sync_0.0.3_amd64.deb"
 
 # AppImage（不安装）
-chmod +x "src-tauri/target/release/bundle/appimage/Agent Config Sync_0.0.2_amd64.AppImage"
-"./Agent Config Sync_0.0.2_amd64.AppImage"
+chmod +x "src-tauri/target/release/bundle/appimage/Agent Config Sync_0.0.3_amd64.AppImage"
+"./Agent Config Sync_0.0.3_amd64.AppImage"
 ```
 
 文件名含空格，命令需要引号。deb 依赖 `libwebkit2gtk-4.1-0` 与 `libgtk-3-0`。
@@ -42,7 +42,7 @@ Windows 上命令执行走 `cmd /d /s /c`，环境检测与包对齐按逐命令
 
 1. 二选一：装一个文件夹同步工具（坚果云、OneDrive、Syncthing 均可）拿到本地目录；或直接准备 WebDAV 地址与应用密码（坚果云在「账户设置 → 安全设置 → 第三方应用管理」生成）。
 2. 应用 → 设置：传输方式选本地文件夹（同步文件夹选 `<同步目录>/PiAgentSync`）或 WebDAV（填地址、邮箱、应用密码，可先「测试连接」）；宿主目录通常留空（生效 `~/.pi/agent`，或 `PI_CODING_AGENT_DIR`）。
-3. 环境检测 → 开始检查；需要时安装/升级 Pi 或对齐包。
+3. 环境检测 → 开始检查；需要时安装/升级 Pi、对齐包，或点「刷新技能」查看宿主实际加载的技能。
 4. 快照 → 导出（本地模式等云盘传完；WebDAV 模式点「上传到 WebDAV」）。
 5. 另一台机器指向同一目录或同一 WebDAV 账号 → 检查/下载快照 → 勾选删除项 → 应用 → 按提示装包。
 
@@ -51,6 +51,7 @@ Windows 上命令执行走 `cmd /d /s /c`，环境检测与包对齐按逐命令
 - 只支持 WebDAV 一种协议，不做 OAuth 云盘账号直连；WebDAV 凭据明文单独存本机（Linux/macOS 为 0600 文件，Windows 依赖用户配置目录的继承 ACL）。
 - 不做文件监听与自动应用；托盘常驻的后台任务只执行定时上行，默认不包含 `auth.json`。
 - 不做冲突自动合并；云盘冲突副本只做只读扫描（处理动作在 backlog），WebDAV 冲突在应用内选「覆盖云端」或「从云端更新」。
+- 只纳管用户级宿主目录与 `~/.agents/skills`；项目级目录与 `settings.json` 的 `skills` 指向的其它外部路径不纳管。
 - 不做模型路由、代理、用量统计、会话管理。
 - 不自动安装 Node，不修改 shell 启动文件，不代写 OAuth。
 - 快照明文包含 `auth.json` 与配置文件里的字面密钥；不做引用化、不整体加密。WebDAV 在含 `auth.json` 时强制 HTTPS（localhost 例外）。
