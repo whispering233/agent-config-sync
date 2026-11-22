@@ -28,10 +28,10 @@ pub enum DavError {
     Quota,
     /// 网络、超时、其它 5xx。带上底层原因，便于用户自查 DNS/TLS/代理。
     Unreachable(String),
-    /// 412：条件请求（`If-Match` / `If-None-Match`）不成立。
+    /// 412：服务端拒绝了本次前置条件。
     ///
-    /// 单独一类是因为它不代表网络失败，而是远端在本次操作期间被改写过；
-    /// 上传据此报 `remote_changed` 并停下，不重试。
+    /// 包模型上线后传输侧不再发条件请求，所以这一支只会在服务端自行返回 412 时出现；
+    /// 单独列一类是为了不和网络失败或认证失败混成一句「其它错误」。
     PreconditionFailed,
     /// 其余状态与协议层错误。
     Other(String),
@@ -43,7 +43,7 @@ impl fmt::Display for DavError {
             Self::AuthFailed => write!(formatter, "认证失败（凭据无效或权限不足）"),
             Self::Quota => write!(formatter, "远端空间或流量不足"),
             Self::PreconditionFailed => {
-                write!(formatter, "远端在本次操作期间被改写（条件请求未通过）")
+                write!(formatter, "服务端拒绝了本次前置条件（412）")
             }
             Self::Unreachable(detail) | Self::Other(detail) => write!(formatter, "{detail}"),
         }
@@ -414,8 +414,8 @@ impl<T: DavTransport> WebdavClient<T> {
     }
 }
 
-/// 写权限测试用的临时文件名。落在工作根下，探测结束即删。
-const WRITE_TEST_FILE: &str = ".tmp-writetest";
+/// 写权限测试用的临时文件名由 `package` 统一管理（`PROBE_FILE_NAME`），这样探测失败
+/// 留下的残留也能被「清理上传残留」认出来。落在工作根下，探测结束即删。
 
 /// 一次连接探测的结论：地址、凭据、读权限、写权限是否都可用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -447,11 +447,11 @@ pub fn probe<T: DavTransport>(client: &WebdavClient<T>) -> Result<ProbeOutcome, 
         }
     };
 
-    client.put(WRITE_TEST_FILE, b"ok", &[])?;
+    client.put(crate::package::PROBE_FILE_NAME, b"ok", &[])?;
 
     Ok(ProbeOutcome {
         created,
-        leftover_write_test_file: client.delete(WRITE_TEST_FILE).is_err(),
+        leftover_write_test_file: client.delete(crate::package::PROBE_FILE_NAME).is_err(),
     })
 }
 

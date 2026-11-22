@@ -19,6 +19,9 @@ pub const MANIFEST_ENTRY: &str = "manifest.json";
 pub const SNAPSHOT_ENTRY_PREFIX: &str = "snapshot/";
 /// 上传中的临时名前缀：这个名字下的文件永不当作包。
 pub const TEMP_NAME_PREFIX: &str = ".tmp-";
+/// 连接探测用的写权限测试文件。它同样算本应用的临时产物：探测时 `DELETE` 失败就会把它
+/// 留在存储根里，而用户唯一的清理途径就是「清理上传残留」，所以必须被认成自己的临时名。
+pub const PROBE_FILE_NAME: &str = ".tmp-writetest";
 
 const COPY_BUFFER: usize = 64 * 1024;
 /// manifest 是被单独读的唯一条目，它自己也要有体积上限（不可信输入）。
@@ -177,6 +180,9 @@ fn parse_stamp(stamp: &str) -> Option<u64> {
 /// 清理上传残留只认这两种：`.tmp-` 前缀下还可能有用户的笔记、别的工具的探测文件，
 /// 多删一个就是丢用户数据。
 pub fn is_own_temp_name(name: &str) -> bool {
+    if name == PROBE_FILE_NAME {
+        return true;
+    }
     let Some(rest) = name.strip_prefix(TEMP_NAME_PREFIX) else {
         return false;
     };
@@ -945,10 +951,11 @@ mod tests {
     }
 
     #[test]
-    fn is_own_temp_name_accepts_only_the_two_shapes_we_produce() {
+    fn is_own_temp_name_accepts_only_the_shapes_we_produce() {
         for name in [
             ".tmp-1795344750123456789",
             ".tmp-1795344750123456789-deadbeef",
+            PROBE_FILE_NAME,
         ] {
             assert!(is_own_temp_name(name), "{name} 必须认出来");
         }
@@ -962,7 +969,6 @@ mod tests {
             ".tmp-",
             ".tmp-12-",
             "manifest.json",
-            ".tmp-writetest",
             "20261122-105230-deadbeef.zip",
         ] {
             assert!(!is_own_temp_name(name), "{name} 必须拒绝");

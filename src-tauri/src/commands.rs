@@ -127,7 +127,7 @@ fn dav_error(error: DavError) -> String {
         DavError::Unreachable(detail) => format!("无法连接：{detail}"),
         DavError::Quota => "远端空间或流量不足，无法写入测试文件".to_string(),
         DavError::PreconditionFailed => {
-            "远端在本次操作期间被改写：条件请求未通过，请重新尝试".to_string()
+            "服务端拒绝了本次请求（412）：请确认地址可写，或换一个服务端".to_string()
         }
         DavError::Other(detail) => detail,
     }

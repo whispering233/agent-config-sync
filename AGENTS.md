@@ -12,7 +12,7 @@ Pi CLI 配置的换机交付工具（手动快照交付；可选托盘常驻与�
 - 落地语义：快照为准，删除需逐项确认，覆盖前备份。
 - 触发方式：手动双向；可选托盘常驻与定时自动上行（只上传，不自动下载/应用），不做实时监听。
 - 密钥：明文自包含，`auth.json` 纳入快照；WebDAV 一律只接受 HTTPS（本地回环例外），与快照是否含 `auth.json` 无关。
-- 快照包历史：远端包只增不改；"云端有更新" = 可解析包名集合变化，不用时钟或 ETag；保留最近 20 份自动老化，四类绝不删。
+- 快照包历史：远端包只增不改；"云端有更新" = 可解析包名集合变化，不用时钟或 ETag；保留最近 20 份自动老化，三类绝不删。
 - 符号链接：apply 时按 manifest 重建链接优先；目标缺失回退物化并告警；链接之下的写入/删除跳过；快照没声明的链接只按链接本身列为删除候选，不读目标。
 - 技术栈：Tauri v2 + Rust + React + Tailwind，不引入 Node sidecar。
 - 配置套数：v1 单套，manifest 预留 `profileId`。
@@ -64,9 +64,10 @@ cd src-tauri && cargo fmt -- --check
 npm run build
 ```
 
-- WebDAV 互通检查需要真实服务器：`DAV_URL=… DAV_USER=… DAV_PASS=… cargo test interop -- --ignored --nocapture`（会覆盖该地址下 `PiAgentSync/` 的内容，只对测试账号跑）。
+- WebDAV 真机探针：`DAV_CREDENTIALS_DIR=… cargo test interop_probes -- --ignored --nocapture`（定向到本机已保存凭据的目录）。探针**只碰 `.tmp-probe-*`**，不碰既有包；失败重试上限两次，仍失败就报结论而不是继续探。
 
 - 文件遍历、manifest、哈希、密钥扫描、快照包的打包/解包、应用/回滚、包/安装必须有单元测试与临时目录夹具。
+- 涉及远端行为的改动，必须有「非 HTTPS 时一个请求都不发」「下载只发 PROPFIND + GET」这类断言，不能只靠代码审阅。
 - UI 验证交给子代理，条目数给定上限，只报不修。
 - 每个任务卡必须能独立验证、独立回滚。
 - 打包：`npm run tauri -- build --bundles deb,appimage`（AppImage 需要能访问 GitHub release 下载 runtime）；Windows 上 `npm run tauri -- build --bundles nsis`。CI 的 `windows-latest` job 会先跑 `cargo test` 再出包；PR 阶段另有 Windows `cargo test`。
