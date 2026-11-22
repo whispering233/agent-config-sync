@@ -19,7 +19,7 @@
 | `npm` | `where`/`command -v npm` + `npm -v` + `npm prefix -g` | 找到/未找到 | 随 Node 一起装 |
 | `pi.path` | `where`/`command -v pi` + `<agent_dir>/bin/pi` + npm 全局前缀下的入口（POSIX `bin/pi`，Windows `pi.cmd`） | 找到/未找到 | 安装宿主 |
 | `pi.version` | `pi --version`（输出裸版本号，如 `1.5.2`） | 可解析 | 升级宿主 |
-| `pi.install_kind` | 是否存在 `<agent_dir>/install/managed-install.json`；路径是否在 `node_modules` 下 | 托管安装 / npm 安装 / 未知 | 决定升级命令 |
+| `pi.install_kind` | 是否存在 `<agent_dir>/install/managed-install.json`；否则看入口是否 npm 布局：路径含 `node_modules`（POSIX 的链接解析后落在这里），或入口旁边就有 `node_modules`（Windows 的 `npm\pi.cmd` 中间层） | 托管安装 / npm 安装 / 未知 | 决定升级命令；安装页复用同一判定 |
 | `pi.latest` | 仅点「检查更新」时执行 `npm view @earendil-works/pi-coding-agent version`；10 秒超时，最多 2 并发 | 可解析/未发布/未知 | 提示升级 |
 | `auth` | 对已配置的 provider 执行 `pi auth check --provider <id> --json` | `ready` / `not_ready` / `invalid` | 在终端执行 `pi auth login <provider>` |
 | `packages` | 读 `settings.json` 的 `packages` + 解析 `pi list` 文本；实装条目带版本号（读**宿主目录内**安装目录 `package.json` 的 `version` 字段，读不到或落在宿主目录之外则留空） | 声明与实装一致/缺包 | 一键重装 |
@@ -35,6 +35,7 @@
 - **哨兵分隔**：POSIX 用一条登录 shell 命令执行多个探测，每个结果前后打唯一标记，避免被 shell 启动脚本的噪音污染。
 - **命令形态分平台**：Windows 每个探测点单独启动进程（`cmd /d /s /c`），不拼批处理脚本——批处理没有可读的错误处理，且 cmd 自身输出走 OEM 代码页。整行本身再套一层双引号：`/c` 之后引号数 ≥ 3 时 cmd 会剥掉首个引号再删最后一个，`/s` 让它只去掉最外层那一对、内部原样交给程序。
 - **入口解析**：Windows 上由 Rust 侧按 `PATH` 与 `PATHEXT` 找可执行文件；`pi` 再兜底 `<agent_dir>/bin/pi.cmd` 与 npm 全局前缀下的 `pi.cmd`。检测、安装、包对齐与计划页共用同一处入口解析，解析不到就是「未找到」，不猜路径。
+- **安装方式只有一处判定**：检测报告的 `pi.install_kind` 与安装页的命令选择走同一函数，不允许各写一套——Windows 的 npm 入口是 `npm\pi.cmd` 而不是 `node_modules` 里的真实文件，只认路径会让检测报「未知」而安装页报「npm」。
 - **编码与引号**：子进程输出按 UTF-8 解码（宿主 CLI 由 Node 写出），不经 cmd 代码页转换；参数按平台转义，POSIX 用单引号，Windows 用双引号并拒绝 `"`、`%`、`!`、`&`、`|`、`<`、`>`、`^`、`\r`、`\n`（cmd 会展开或换义、换行会把一条命令拆成两条），拒绝时报错而不是改写成别的命令。程序路径只加引号，不过这份名单——它由文件系统解析得出，`C:\Users\a&b\...` 这类目录名在双引号内不构成命令分隔。
 - **超时**：普通命令 5 秒；`pi auth check` 15 秒；`npm view` 10 秒。超时即判 `unknown`，不重试。超时终止整棵进程树：Windows 用 `taskkill /T /F`（`child.kill()` 只杀 `cmd.exe`，npm 的子进程会残留），POSIX 安装命令按进程组终止。
 - **区分状态**：`found` / `not_found` / `broken`（存在但执行失败）/ `unknown`（超时或输出不可解析）。
