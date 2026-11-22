@@ -578,19 +578,42 @@ fn now_seconds() -> u64 {
 /// RFC 3339 UTC（秒级）。只用 std：chrono 不在允许新增的依赖里。
 /// 备份与暂存目录的命名也用它，不另写第二套日历换算。
 pub(crate) fn format_timestamp(unix_seconds: u64) -> String {
+    let (year, month, day, hour, minute, second) = utc_parts(unix_seconds);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// `yyyymmdd-HHmmss` UTC：包名用的紧凑形态，与 [`format_timestamp`] 共用同一套换算。
+pub(crate) fn format_compact_stamp(unix_seconds: u64) -> String {
+    let (year, month, day, hour, minute, second) = utc_parts(unix_seconds);
+    format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}")
+}
+
+fn utc_parts(unix_seconds: u64) -> (i64, u64, u64, u64, u64, u64) {
     let days = (unix_seconds / 86_400) as i64;
     let seconds_of_day = unix_seconds % 86_400;
     let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+    (
+        year,
+        month,
+        day,
         seconds_of_day / 3600,
         (seconds_of_day % 3600) / 60,
-        seconds_of_day % 60
+        seconds_of_day % 60,
     )
 }
 
+/// [`days_from_civil`] 的逆运算：包名要回读日期，同样只此一套日历换算。
+pub(crate) fn days_from_civil(year: i64, month: u64, day: u64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = (year - era * 400) as u64;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era as i64 - 719_468
+}
+
 /// Howard Hinnant 的 civil_from_days：从 epoch 天数换回年月日。
-fn civil_from_days(days: i64) -> (i64, u64, u64) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, u64, u64) {
     let shifted = days + 719_468;
     let era = if shifted >= 0 {
         shifted

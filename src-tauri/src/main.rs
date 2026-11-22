@@ -8,6 +8,7 @@ mod conflicts;
 mod credentials;
 mod doctor;
 mod installer;
+mod package;
 mod packages;
 mod plan;
 mod platform;
