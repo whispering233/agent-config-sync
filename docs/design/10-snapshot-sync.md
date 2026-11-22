@@ -293,6 +293,11 @@ idle → fetching → unpacking → verifying → planning → previewing → ba
 | `remote_move_failed` | 上传定案时 `MOVE` 失败 |
 | `remote_prune_failed` | 保留清理失败（不阻塞上传成功，单独上报） |
 
+表外还有一组**本机与通用**失败码，属于执行环境问题而非设计语义，UI 照原样展示即可：
+`app_config_unavailable` / `app_data_unavailable`（定位不到应用目录）、`export_failed`（打包或读回刚打好的包失败）、
+`upload_failed` / `download_failed` / `list_failed` / `cleanup_failed` / `compare_failed`（各自动作的整体失败，细节在 `message` 里）、
+`compare_empty`（对比没给候选包）、`no_write_permission`（目标不可写或写本机状态失败）。
+
 ## 10. 已知限制
 
 - 每个包都是全量快照，不做增量（配置总量约 100 KB，增量无意义）；代价是同一份内容在多个包里重复。
