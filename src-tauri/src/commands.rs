@@ -7,10 +7,10 @@ use crate::config::{
 use crate::credentials::{self, CredentialError, WebdavCredentials};
 use crate::runtime;
 use crate::snapshot;
-use crate::store::{LocalStore, PackageStore};
+use crate::store::{LocalStore, PackageStore, WebdavStore};
 use crate::upload::{self, UploadFailure, UploadView};
 use crate::webdav::{self, DavError, ReqwestTransport, WebdavClient};
-use crate::webdav_transfer;
+use crate::webdav_transfer::{self, DownloadFailure, StagedPackage};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
@@ -176,14 +176,11 @@ fn app_config(app: &AppHandle) -> Result<AppConfig, String> {
     config::load_config(&config_dir).map_err(|error| error.to_string())
 }
 
-/// WebDAV 侧目前只接上了上传：列举与取包仍走本地存储根，WebDAV 模式明确报错。
-const REMOTE_DOWNLOAD_NOT_READY: &str = "WebDAV 模式暂时只能上传：取包请先用本地文件夹模式";
-
-/// 本地文件夹模式的存储根。WebDAV 模式在这里就被挡下：下载只走本地存储根。
+/// 本地文件夹模式的存储根。WebDAV 的包列表还没接上：那条路只支持取最新一份。
 fn local_store(app: &AppHandle) -> Result<LocalStore, String> {
     let config = app_config(app)?;
     if config.transport != Transport::Local {
-        return Err(REMOTE_DOWNLOAD_NOT_READY.to_string());
+        return Err("WebDAV 模式暂时只支持取最新一份：历史包列表请等后续版本".to_string());
     }
     let root = config
         .sync_root
@@ -245,37 +242,88 @@ pub fn list_snapshot_packages(app: AppHandle) -> Result<PackageListView, String>
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadView {
-    package_name: String,
+    package: String,
+    /// 包文件字节数。
+    size: u64,
+    /// 包内快照文件数（不含 manifest）。
+    files: usize,
+    fingerprint: String,
     created_at: String,
-    file_count: usize,
     staging_root: PathBuf,
+    /// 上一次成功上传/下载时看到的远端时间；本地文件夹模式没有远端，为 null。
+    previous_seen_at: Option<String>,
+}
+
+impl DownloadView {
+    fn new(staged: StagedPackage, previous_seen_at: Option<String>) -> Self {
+        Self {
+            package: staged.package_name,
+            size: staged.size,
+            files: staged.file_count,
+            fingerprint: staged.fingerprint,
+            created_at: staged.created_at,
+            staging_root: staged.staging_root,
+            previous_seen_at,
+        }
+    }
 }
 
 /// 取一份包到本机暂存目录；`package` 缺省时取名字最大的一份。
 ///
-/// 解包之后完全复用 `10-snapshot-sync.md` 第 6 节的校验 → 计划 → 备份 → 应用，本命令不写 live。
+/// 本地文件夹模式走本地存储根，WebDAV 模式走 [`webdav_transfer::download_from_webdav`]；
+/// 之后完全复用 `10-snapshot-sync.md` 第 6 节的校验 → 计划 → 备份 → 应用，本命令不写 live。
 #[tauri::command]
 pub async fn download_remote_snapshot(
     app: AppHandle,
     package: Option<String>,
-) -> Result<DownloadView, String> {
-    // 解包是阻塞 IO，留在 UI 线程会冻住窗口。
+) -> Result<DownloadView, DownloadFailure> {
+    // 取包与解包都是阻塞 IO，留在 UI 线程会冻住窗口。
     tauri::async_runtime::spawn_blocking(move || {
         // 与自动上行、应用/回滚共用同一把锁，避免两套写盘同时跑。
-        let _guard = crate::runtime::lock_operation();
-        let store = local_store(&app)?;
-        let staged =
-            webdav_transfer::stage_package(&store, &app_data_dir(&app)?, package.as_deref())?;
+        let _guard = runtime::lock_operation();
+        let app_data = app_data_dir(&app)
+            .map_err(|message| DownloadFailure::new("app_data_unavailable", message))?;
+        let config = app_config(&app)
+            .map_err(|message| DownloadFailure::new("app_config_unavailable", message))?;
 
-        Ok(DownloadView {
-            package_name: staged.package_name,
-            created_at: staged.created_at,
-            file_count: staged.file_count,
-            staging_root: staged.staging_root,
-        })
+        if config.transport == Transport::Local {
+            let root = config.sync_root.ok_or_else(|| {
+                DownloadFailure::new(
+                    "sync_root_unset",
+                    "还没有设置同步文件夹：请先在设置页选择，再回来取包",
+                )
+            })?;
+            let staged = webdav_transfer::stage_package(
+                &LocalStore::new(root),
+                &app_data,
+                package.as_deref(),
+            )?;
+
+            return Ok(DownloadView::new(staged, None));
+        }
+
+        let credentials = credentials::load(&app_data)
+            .map_err(|error| DownloadFailure::new("remote_not_configured", error.to_string()))?
+            .ok_or_else(|| {
+                DownloadFailure::new(
+                    "remote_not_configured",
+                    "还没有保存 WebDAV 凭据：请先在设置页填写地址、用户名与密码",
+                )
+            })?;
+        let transport = ReqwestTransport::new(&credentials.username, &credentials.password)
+            .map_err(|error| DownloadFailure::new("remote_unreachable", error.to_string()))?;
+        let client = WebdavClient::new(transport, &credentials.url);
+        let outcome = webdav_transfer::download_from_webdav(
+            &WebdavStore::new(&client),
+            &credentials.url,
+            &app_data,
+            package.as_deref(),
+        )?;
+
+        Ok(DownloadView::new(outcome.staged, outcome.previous_seen_at))
     })
     .await
-    .map_err(|error| format!("取快照包失败：{error}"))?
+    .map_err(|error| DownloadFailure::new("download_failed", format!("取快照包失败：{error}")))?
 }
 
 /// 上传：本地模式把 live 导出成包放进存储根（由云盘客户端负责搬运）；WebDAV 模式走
@@ -383,18 +431,37 @@ mod tests {
     #[test]
     fn download_view_serializes_with_camel_case() {
         let view = DownloadView {
-            package_name: "20261122-105230-deadbeef.zip".to_string(),
+            package: "20261122-105230-deadbeef.zip".to_string(),
+            size: 4096,
+            files: 7,
+            fingerprint: "deadbeefcafe".to_string(),
             created_at: "2026-11-22T10:52:30Z".to_string(),
-            file_count: 7,
             staging_root: PathBuf::from("/data/staging/20261122-105230-deadbeef.zip"),
+            previous_seen_at: Some("2026-11-21T09:12:10Z".to_string()),
         };
         assert_eq!(
             serde_json::to_value(&view).unwrap(),
             serde_json::json!({
-                "packageName": "20261122-105230-deadbeef.zip",
+                "package": "20261122-105230-deadbeef.zip",
+                "size": 4096,
+                "files": 7,
+                "fingerprint": "deadbeefcafe",
                 "createdAt": "2026-11-22T10:52:30Z",
-                "fileCount": 7,
                 "stagingRoot": "/data/staging/20261122-105230-deadbeef.zip",
+                "previousSeenAt": "2026-11-21T09:12:10Z",
+            })
+        );
+    }
+
+    /// 取包失败的码要能过 IPC：前端靠它区分「远端空」与「包被删」。
+    #[test]
+    fn download_failure_carries_code_and_message() {
+        let failure = DownloadFailure::new("remote_no_packages", "还没有快照包");
+        assert_eq!(
+            serde_json::to_value(&failure).unwrap(),
+            serde_json::json!({
+                "code": "remote_no_packages",
+                "message": "还没有快照包",
             })
         );
     }

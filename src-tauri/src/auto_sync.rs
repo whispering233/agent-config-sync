@@ -143,11 +143,15 @@ pub fn start(app: AppHandle) {
 fn status_for(result: &Result<UploadOutcome, UploadFailure>) -> (&'static str, String, bool) {
     match result {
         // 内容未变：远端已是最新一份，没有产生新包，也不算失败。
-        Ok(outcome) if outcome.view.unchanged => (
-            "skipped",
-            format!("内容未变，已跳过（{}）", outcome.view.package),
-            false,
-        ),
+        Ok(outcome) if outcome.view.unchanged => {
+            let mut message = format!("内容未变，已跳过（{}）", outcome.view.package);
+            // 另一台机器可能在这期间推了新包：自己没上传，但云端确实有本机未见的快照。
+            if outcome.unseen > 0 {
+                message.push_str(&format!("；云端有 {} 份本机未见的新快照", outcome.unseen));
+                return ("diverged", message, false);
+            }
+            ("skipped", message, false)
+        }
         Ok(outcome) => {
             let mut message = format!("已上传 {}", outcome.view.package);
             if outcome.unseen > 0 {
@@ -249,6 +253,22 @@ mod tests {
         assert_eq!(state, "diverged");
         assert!(message.contains("云端有 2 份本机未见的新快照"), "{message}");
         assert!(stamp);
+    }
+
+    /// 内容未变但云端有他机的新包：跳过的是上传，不是发现新包。
+    #[test]
+    fn unchanged_content_with_new_remote_packages_is_reported_as_diverged() {
+        let outcome = UploadOutcome {
+            view: view("20261122-105230-deadbeef.zip", true),
+            unseen: 1,
+        };
+
+        let (state, message, stamp) = status_for(&Ok(outcome));
+
+        assert_eq!(state, "diverged");
+        assert!(message.contains("内容未变"), "{message}");
+        assert!(message.contains("云端有 1 份本机未见的新快照"), "{message}");
+        assert!(!stamp, "没有尝试上传就不该刷新上次时间");
     }
 
     #[test]

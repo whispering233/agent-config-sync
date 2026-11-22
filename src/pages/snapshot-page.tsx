@@ -152,7 +152,7 @@ type DownloadState =
   | { kind: 'idle' }
   | { kind: 'downloading' }
   | { kind: 'done'; view: RemoteDownload }
-  | { kind: 'failed'; message: string };
+  | { kind: 'failed'; code: string | null; message: string };
 
 type UploadState =
   | { kind: 'idle' }
@@ -400,7 +400,13 @@ export function SnapshotPage() {
       setPlanRoot(view.stagingRoot);
       await runCheck(view.stagingRoot);
     } catch (error) {
-      setDownloaded({ kind: 'failed', message: errorMessage(error) });
+      // 取包失败带设计里的码（远端空、包被删、地址不安全等），原样展示给用户。
+      const failure = asFailure(error);
+      setDownloaded({
+        kind: 'failed',
+        code: failure?.code ?? null,
+        message: failure?.message ?? errorMessage(error),
+      });
     }
   }
 
@@ -551,7 +557,7 @@ export function SnapshotPage() {
         <Card className="p-lg">
           <h2 className="text-sm font-semibold text-foreground">WebDAV</h2>
           <p className="mt-xs text-sm text-muted-foreground">
-            上传会把当前配置打成一个快照包放到云端，并按名字保留最近 20 份；下载还没接上，取包暂时用本地文件夹模式。
+            上传会把当前配置打成一个快照包放到云端，并按名字保留最近 20 份；下载默认取云端名字最大（最新）的一份，解到本机暂存目录后走下面的检查与应用。
           </p>
 
           <div className="mt-md flex flex-wrap items-center gap-md">
@@ -703,10 +709,16 @@ export function SnapshotPage() {
           <div className="mt-md flex flex-col gap-sm">
             <p className="flex items-start gap-sm text-sm text-danger">
               <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
-              <span>取快照包失败：{downloaded.message}</span>
+              <span>
+                取快照包失败：
+                {downloaded.code !== null && (
+                  <code className="mr-xs font-mono text-xs">[{downloaded.code}]</code>
+                )}
+                {downloaded.message}
+              </span>
             </p>
             <p className="text-xs text-muted-foreground">
-              失败即停：本次暂存目录已删除，本机配置不动；修正后可以重新取。
+              失败即停：本次暂存目录已删除，本机配置与远端都不动；修正后可以重新取。
             </p>
           </div>
         )}
@@ -1156,15 +1168,24 @@ function UploadResultView({ result }: { result: UploadResult }) {
   );
 }
 
-/** 取包结果：包名、创建时间、文件数与暂存目录。 */
+/** 取包结果：包名、体积、创建时间、文件数、指纹与暂存目录。 */
 function DownloadResult({ view }: { view: RemoteDownload }) {
   return (
-    <dl className="mt-md flex flex-col gap-sm">
-      <ResultRow label="快照包" value={view.packageName} mono />
-      <ResultRow label="创建时间" value={view.createdAt} />
-      <ResultRow label="文件数" value={String(view.fileCount)} />
-      <ResultRow label="暂存目录" value={view.stagingRoot} mono />
-    </dl>
+    <>
+      <dl className="mt-md flex flex-col gap-sm">
+        <ResultRow label="快照包" value={view.package} mono />
+        <ResultRow label="包体积" value={formatBytes(view.size)} />
+        <ResultRow label="创建时间" value={view.createdAt} />
+        <ResultRow label="文件数" value={String(view.files)} />
+        <ResultRow label="指纹" value={view.fingerprint} mono />
+        <ResultRow label="暂存目录" value={view.stagingRoot} mono />
+      </dl>
+      {view.previousSeenAt !== null && (
+        <p className="mt-sm text-xs text-muted-foreground">
+          上一次记录的云端时间：{view.previousSeenAt}
+        </p>
+      )}
+    </>
   );
 }
 

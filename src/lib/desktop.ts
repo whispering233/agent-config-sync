@@ -63,12 +63,20 @@ export function testWebdavConnection(input: WebdavInput): Promise<WebdavProbe> {
 
 /** 与 Rust 侧 `DownloadView` 一一对应：一份包已经解到本机暂存目录。 */
 export type RemoteDownload = {
-  packageName: string;
+  /** 包名：`<UTC yyyymmdd-HHmmss>-<指纹前 8 位>.zip`。 */
+  package: string;
+  /** 包文件字节数。 */
+  size: number;
+  /** 包内快照文件数（不含 manifest）。 */
+  files: number;
+  /** manifest 里的完整指纹。 */
+  fingerprint: string;
   /** manifest 里的创建时间，RFC 3339 UTC。 */
   createdAt: string;
-  fileCount: number;
   /** 暂存目录；可以当作 `root` 传给 `verify_and_plan` 与 `apply_snapshot`。 */
   stagingRoot: string;
+  /** 上一次成功上传/下载时看到的远端时间；本地文件夹模式没有远端，为 null。 */
+  previousSeenAt: string | null;
 };
 
 /** 存储根里的一个包。 */

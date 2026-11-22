@@ -4,10 +4,13 @@
 //! 这里不决定快照内容，也不碰 live：解包产物与同步根同构（`manifest.json` + `snapshot/`），
 //! 直接交给 `plan` / `apply`，它们不认识「包」这个概念。
 
+use crate::credentials;
 use crate::package;
 use crate::platform;
+use crate::remote_state::{self, RemoteState};
 use crate::snapshot::{self, Manifest};
-use crate::store::{LocalStore, PackageStore};
+use crate::store::{PackageStore, StoreError};
+use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -20,10 +23,55 @@ const STAGING_DIR_MODE: u32 = 0o700;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedPackage {
     pub package_name: String,
+    /// 包文件字节数。
+    pub size: u64,
+    /// 包内快照文件数（不含 manifest）。
+    pub file_count: usize,
+    /// manifest 里的完整指纹。
+    pub fingerprint: String,
     /// manifest 里的 RFC 3339 UTC 创建时间。
     pub created_at: String,
-    pub file_count: usize,
     pub staging_root: PathBuf,
+    /// 取包时看到的可解析包名集合：成功后直接记进本机状态，不必再列一次远端。
+    pub packages: Vec<String>,
+}
+
+/// 取包失败。码取自 `10-snapshot-sync.md` 第 9 节的失败码表。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadFailure {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl DownloadFailure {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for DownloadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+/// 一次下载的结论：包已解到本机，外加本机记录里上一次看到的远端时间。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadOutcome {
+    pub staged: StagedPackage,
+    pub previous_seen_at: Option<String>,
+}
+
+fn store_failure(error: StoreError) -> DownloadFailure {
+    DownloadFailure::new(error.code, error.message)
+}
+
+fn package_failure(error: package::PackageError) -> DownloadFailure {
+    DownloadFailure::new(error.code, error.message)
 }
 
 /// 计划与应用允许的根：配置里的同步根，或应用数据目录下暂存目录的**子目录**。
@@ -59,74 +107,182 @@ pub fn resolve_root(
     }
 }
 
-/// 取包到本机暂存：列举 → 选包（缺省取名字最大的一份）→ 解到 `staging/<包名>/` → 只留这一份。
+/// 取包到本机暂存：列举 → 选包（缺省取名字最大的一份）→ 取 → 解到 `staging/<包名>/` → 只留这一份。
 ///
-/// 选中的包不在列表里就是「刚被别人删了」：宁可报错也不退回另一份，否则用户会应用一份
-/// 没选过的快照。
+/// 本地文件夹与 WebDAV 共用这一条链路，只换 [`PackageStore`] 实现。选中的包不在列表里
+/// 就是「刚被别人删了」：宁可报错也不退回另一份，否则用户会应用一份没选过的快照。
 pub fn stage_package(
-    store: &LocalStore,
+    store: &dyn PackageStore,
     app_data: &Path,
     requested: Option<&str>,
-) -> Result<StagedPackage, String> {
-    let listing = store
-        .list()
-        .map_err(|error| format!("无法列举快照包：{}", error.message))?;
+) -> Result<StagedPackage, DownloadFailure> {
+    let listing = store.list().map_err(store_failure)?;
     let chosen = match requested {
         Some(name) => listing
             .packages
             .iter()
             .find(|entry| entry.name == name)
-            .ok_or_else(|| format!("选中的快照包已不在存储目录里：{name}"))?,
+            .ok_or_else(|| {
+                DownloadFailure::new(
+                    "package_not_found",
+                    format!("选中的快照包已不在存储里：{name}"),
+                )
+            })?,
         None => listing
             .packages
             .iter()
             .max_by(|left, right| left.name.cmp(&right.name))
-            .ok_or_else(|| "同步文件夹里还没有快照包：请先导出一份".to_string())?,
+            .ok_or_else(|| {
+                DownloadFailure::new(
+                    "remote_no_packages",
+                    "还没有快照包：先导出一份，或等另一台机器的包到达",
+                )
+            })?,
     };
 
+    // 体积先按列举值判：超限的包不该被整份取到内存里才发现。
+    let limit = package::Limits::default().package_bytes;
+    if chosen.size > limit {
+        return Err(DownloadFailure::new(
+            "package_too_large",
+            format!("包体积 {} 字节，超过上限 {limit} 字节", chosen.size),
+        ));
+    }
+
     let root = app_data.join(STAGING_DIR_NAME);
-    platform::create_dir_all_mode(&root, STAGING_DIR_MODE)
-        .map_err(|error| format!("无法创建暂存目录 {}：{error}", root.display()))?;
+    platform::create_dir_all_mode(&root, STAGING_DIR_MODE).map_err(|error| {
+        DownloadFailure::new(
+            "no_write_permission",
+            format!("无法创建暂存目录 {}：{error}", root.display()),
+        )
+    })?;
     let target = root.join(&chosen.name);
     // 重新取同一份包时旧暂存还在，而解包拒绝已存在的落点：先整份删掉再解。
     if target.symlink_metadata().is_ok() {
         remove_path(&target)?;
     }
 
-    package::unpack(&store.root().join(&chosen.name), &target).map_err(|error| error.message)?;
+    let bytes = store
+        .get(&chosen.name)
+        .map_err(store_failure)?
+        .ok_or_else(|| {
+            DownloadFailure::new(
+                "package_not_found",
+                format!("取包时存储里已经没有这份包：{}", chosen.name),
+            )
+        })?;
+    // `unpack` 只认路径：先把包落到暂存根下的临时名，解完立刻删。
+    let archive = root.join(format!("{}.incoming", chosen.name));
+    fs::write(&archive, &bytes).map_err(|error| {
+        DownloadFailure::new(
+            "no_write_permission",
+            format!("无法写入临时包 {}：{error}", archive.display()),
+        )
+    })?;
+    let unpacked = package::unpack(&archive, &target);
+    let _ = fs::remove_file(&archive);
+    unpacked.map_err(package_failure)?;
     // 暂存常驻只保留当前这一份：更早的解包结果已经不可能被应用。
     prune_staging(app_data, &target);
 
-    let manifest = read_staged_manifest(&target)?;
+    let manifest = match read_staged_manifest(&target) {
+        Ok(manifest) => manifest,
+        // 不认识 manifest 的暂存交给计划也只会白跑：删掉，别让它冒充一份可用快照。
+        Err(failure) => {
+            let _ = fs::remove_dir_all(&target);
+            return Err(failure);
+        }
+    };
     Ok(StagedPackage {
         package_name: chosen.name.clone(),
-        created_at: manifest.created_at,
+        size: bytes.len() as u64,
         file_count: manifest.files.len(),
+        fingerprint: manifest.fingerprint,
+        created_at: manifest.created_at,
         staging_root: target,
+        packages: listing
+            .packages
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect(),
+    })
+}
+
+/// WebDAV 下载全流程：HTTPS 门槛 → 取包到暂存（列举、选包、体积、取、解包）→ 记录本机状态。
+///
+/// 下载不改动远端：不清理、不删除、不写任何远端文件。
+pub fn download_from_webdav(
+    store: &dyn PackageStore,
+    endpoint: &str,
+    app_data: &Path,
+    requested: Option<&str>,
+) -> Result<DownloadOutcome, DownloadFailure> {
+    // 门槛放在最前：非 HTTPS 的远端不只可能被读走凭据，还可能被塞进任意快照包，
+    // 而落地语义是「快照为准」，所以一个请求都不发。
+    if !credentials::is_secure_url(endpoint) {
+        return Err(DownloadFailure::new(
+            "remote_insecure",
+            "WebDAV 地址必须是 HTTPS（本机回环地址例外），否则拒绝下载",
+        ));
+    }
+
+    let state = remote_state::load(app_data);
+    let staged = stage_package(store, app_data, requested)?;
+
+    let next = RemoteState {
+        seen_at: snapshot::format_timestamp(snapshot::now_seconds()),
+        packages: staged.packages.clone(),
+        // 下载不改写「上次上传的指纹」：它只由上传决定。
+        last_uploaded_fingerprint: state.last_uploaded_fingerprint,
+    };
+    remote_state::save(app_data, &next).map_err(|error| {
+        DownloadFailure::new(
+            "no_write_permission",
+            format!("快照包已取到本机，但无法记录远端状态：{error}"),
+        )
+    })?;
+
+    Ok(DownloadOutcome {
+        staged,
+        // 空记录读出来的 `seenAt` 是空串：没有上一次就不该报一个时间。
+        previous_seen_at: (!state.seen_at.is_empty()).then_some(state.seen_at),
     })
 }
 
 /// 解出来的 manifest：给 UI 报创建时间与文件数，也顺带在进计划前挡掉不认识的格式版本。
-fn read_staged_manifest(staging_root: &Path) -> Result<Manifest, String> {
+fn read_staged_manifest(staging_root: &Path) -> Result<Manifest, DownloadFailure> {
     let path = staging_root.join(snapshot::MANIFEST_FILE_NAME);
-    let bytes = fs::read(&path)
-        .map_err(|error| format!("无法读取解包后的 manifest {}：{error}", path.display()))?;
+    let bytes = fs::read(&path).map_err(|error| {
+        DownloadFailure::new(
+            "package_corrupt",
+            format!("无法读取解包后的 manifest {}：{error}", path.display()),
+        )
+    })?;
 
-    snapshot::parse_manifest(&bytes).map_err(|failure| failure.message)
+    snapshot::parse_manifest(&bytes)
+        .map_err(|failure| DownloadFailure::new(failure.code, failure.message))
 }
 
 /// 暂存里的旧包可能是目录，也可能是同名文件：两种都删掉。
-fn remove_path(path: &Path) -> Result<(), String> {
-    let metadata = path
-        .symlink_metadata()
-        .map_err(|error| format!("无法检查旧暂存 {}：{error}", path.display()))?;
+fn remove_path(path: &Path) -> Result<(), DownloadFailure> {
+    let metadata = path.symlink_metadata().map_err(|error| {
+        DownloadFailure::new(
+            "no_write_permission",
+            format!("无法检查旧暂存 {}：{error}", path.display()),
+        )
+    })?;
     let result = if metadata.is_dir() {
         fs::remove_dir_all(path)
     } else {
         fs::remove_file(path)
     };
 
-    result.map_err(|error| format!("无法清理旧暂存 {}：{error}", path.display()))
+    result.map_err(|error| {
+        DownloadFailure::new(
+            "no_write_permission",
+            format!("无法清理旧暂存 {}：{error}", path.display()),
+        )
+    })
 }
 
 /// 只保留本次的暂存目录：旧暂存对应的是上一份远端快照，留着只会让人误以为还能用。
@@ -153,9 +309,17 @@ mod tests {
     use crate::snapshot::{
         fingerprint, ManifestFile, Requirements, SourceInfo, FORMAT_VERSION, PROFILE_ID,
     };
-    use crate::webdav::{DavRequest, DavResponse, DavTransport, ReqwestTransport};
+    use crate::store::{LocalStore, WebdavStore};
+    use crate::webdav::{
+        DavError, DavRequest, DavResponse, DavTransport, ReqwestTransport, WebdavClient,
+    };
+    use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    const BASE: &str = "https://dav.example.com/dav";
 
     /// 临时目录夹具：Drop 时清理。
     struct TempDir(PathBuf);
@@ -259,12 +423,17 @@ mod tests {
         // 无法识别的文件不参与「最新」，也不该被当成包。
         fs::write(store_root.join("notes.txt"), b"keep me").unwrap();
 
-        let store = LocalStore::new(store_root);
+        let store = LocalStore::new(store_root.clone());
         let staged = stage_package(&store, &app_data, None).expect("取包应成功");
 
         assert_eq!(staged.package_name, newest);
         assert_eq!(staged.created_at, "2026-11-22T10:52:30Z");
         assert_eq!(staged.file_count, 1);
+        assert_eq!(
+            staged.size,
+            fs::metadata(store_root.join(newest)).unwrap().len()
+        );
+        assert_eq!(staged.packages, vec![older.to_string(), newest.to_string()]);
         assert_eq!(
             fs::read_to_string(staged.staging_root.join("snapshot/settings.json")).unwrap(),
             "{\"v\":2}"
@@ -302,7 +471,8 @@ mod tests {
         let store = LocalStore::new(store_root.clone());
 
         let error = stage_package(&store, &app_data, None).expect_err("空存储根必须报错");
-        assert!(error.contains("还没有快照包"), "{error}");
+        assert_eq!(error.code, "remote_no_packages");
+        assert!(error.message.contains("还没有快照包"), "{}", error.message);
 
         write_package(
             &store_root,
@@ -311,7 +481,8 @@ mod tests {
         );
         let error = stage_package(&store, &app_data, Some("20261123-000000-aaaaaaaa.zip"))
             .expect_err("选中的包不存在必须报错");
-        assert!(error.contains("已不在存储目录"), "{error}");
+        assert_eq!(error.code, "package_not_found");
+        assert!(error.message.contains("已不在存储里"), "{}", error.message);
         assert!(staging_entries(&app_data).is_empty(), "报错时不留暂存");
     }
 
@@ -328,11 +499,427 @@ mod tests {
         let store = LocalStore::new(store_root);
         let error = stage_package(&store, &app_data, None).expect_err("坏包必须报错");
 
-        assert!(!error.is_empty());
+        assert_eq!(error.code, "package_corrupt", "{}", error.message);
         assert!(
             staging_entries(&app_data).is_empty(),
-            "失败不污染暂存：{error}"
+            "失败不污染暂存：{}",
+            error.message
         );
+    }
+
+    /// 按给定内容打一个包，返回包字节：远端只认字节。
+    fn package_bytes(name: &str, files: &[(&str, &str)]) -> Vec<u8> {
+        let temp = TempDir::new("pack");
+        let archive = write_package(&temp.path().join("store"), name, files);
+        fs::read(archive).unwrap()
+    }
+
+    /// manifest 里写的哈希与包内内容不符。
+    fn hash_mismatch_package(name: &str) -> Vec<u8> {
+        let temp = TempDir::new("mismatch");
+        let source = temp.path().join("snapshot");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("settings.json"), b"{\"v\":1}").unwrap();
+        let entries = vec![ManifestFile {
+            path: "snapshot/settings.json".to_string(),
+            sha256: snapshot::sha256_hex(b"{\"v\":2}"),
+            size: 7,
+            kind: "text".to_string(),
+        }];
+        let archive = temp.path().join(name);
+        let manifest = serde_json::to_vec_pretty(&manifest_with(entries)).unwrap();
+        package::pack(&archive, &manifest, &source).unwrap();
+        fs::read(archive).unwrap()
+    }
+
+    /// 条目名越出 `snapshot/`：不能用 `package::pack` 造，只能直接写 zip。
+    fn unsafe_entry_package() -> Vec<u8> {
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        {
+            use std::io::Write;
+            let mut writer = zip::ZipWriter::new(&mut buffer);
+            for (entry, content) in [
+                ("manifest.json", &b"{}"[..]),
+                ("snapshot/../evil.txt", &b"x"[..]),
+            ] {
+                writer
+                    .start_file(entry, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(content).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buffer.into_inner()
+    }
+
+    /// 假 WebDAV 服务端：只实现下载链路用到的两个动词。
+    struct DavFiles {
+        requests: RefCell<Vec<DavRequest>>,
+        files: RefCell<BTreeMap<String, Vec<u8>>>,
+        /// 列举时报的体积：让超大包不必真塞 65 MB。
+        sizes: RefCell<BTreeMap<String, u64>>,
+        root_exists: Cell<bool>,
+    }
+
+    #[derive(Clone)]
+    struct FakeDav {
+        state: Rc<DavFiles>,
+    }
+
+    impl FakeDav {
+        fn new() -> Self {
+            Self {
+                state: Rc::new(DavFiles {
+                    requests: RefCell::new(Vec::new()),
+                    files: RefCell::new(BTreeMap::new()),
+                    sizes: RefCell::new(BTreeMap::new()),
+                    root_exists: Cell::new(false),
+                }),
+            }
+        }
+
+        fn seed(&self, name: &str, body: &[u8]) {
+            self.state.root_exists.set(true);
+            self.state
+                .files
+                .borrow_mut()
+                .insert(name.to_string(), body.to_vec());
+        }
+
+        fn claim_size(&self, name: &str, size: u64) {
+            self.state.sizes.borrow_mut().insert(name.to_string(), size);
+        }
+
+        fn methods(&self) -> Vec<String> {
+            self.state
+                .requests
+                .borrow()
+                .iter()
+                .map(|request| request.method.clone())
+                .collect()
+        }
+
+        fn file_names(&self) -> Vec<String> {
+            self.state.files.borrow().keys().cloned().collect()
+        }
+    }
+
+    /// 工作根下的相对名字；工作根自身为空串。
+    fn rel_of(url: &str) -> String {
+        url.split_once("/PiAgentSync")
+            .map(|(_, rest)| rest.trim_matches('/').to_string())
+            .unwrap_or_default()
+    }
+
+    impl DavTransport for FakeDav {
+        fn send(&self, request: DavRequest) -> Result<DavResponse, DavError> {
+            self.state.requests.borrow_mut().push(request.clone());
+            let rel = rel_of(&request.url);
+
+            match request.method.as_str() {
+                "PROPFIND" => {
+                    if !self.state.root_exists.get() {
+                        return Ok(DavResponse {
+                            status: 404,
+                            headers: Vec::new(),
+                            body: Vec::new(),
+                        });
+                    }
+                    let mut body = String::from(
+                        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+                         <d:multistatus xmlns:d=\"DAV:\">\
+                         <d:response><d:href>/dav/PiAgentSync/</d:href>\
+                         <d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype>\
+                         </d:prop></d:propstat></d:response>",
+                    );
+                    for (name, bytes) in self.state.files.borrow().iter() {
+                        let size = self
+                            .state
+                            .sizes
+                            .borrow()
+                            .get(name)
+                            .copied()
+                            .unwrap_or(bytes.len() as u64);
+                        body.push_str(&format!(
+                            "<d:response><d:href>/dav/PiAgentSync/{name}</d:href>\
+                             <d:propstat><d:prop><d:resourcetype/>\
+                             <d:getcontentlength>{size}</d:getcontentlength>\
+                             </d:prop></d:propstat></d:response>"
+                        ));
+                    }
+                    body.push_str("</d:multistatus>");
+                    Ok(DavResponse {
+                        status: 207,
+                        headers: Vec::new(),
+                        body: body.into_bytes(),
+                    })
+                }
+                "GET" => {
+                    let body = self.state.files.borrow().get(&rel).cloned();
+                    Ok(DavResponse {
+                        status: if body.is_some() { 200 } else { 404 },
+                        headers: Vec::new(),
+                        body: body.unwrap_or_default(),
+                    })
+                }
+                other => Err(DavError::Other(format!("测试未实现的方法：{other}"))),
+            }
+        }
+    }
+
+    /// 一套下载夹具：应用数据目录 + 远端。
+    struct Fixture {
+        temp: TempDir,
+        remote: FakeDav,
+    }
+
+    const PKG_OLD: &str = "20261121-091210-7f3e9c01.zip";
+    const PKG_NEW: &str = "20261122-105230-deadbeef.zip";
+
+    impl Fixture {
+        fn new(label: &str) -> Self {
+            Self {
+                temp: TempDir::new(label),
+                remote: FakeDav::new(),
+            }
+        }
+
+        fn app_data(&self) -> PathBuf {
+            self.temp.path().join("data")
+        }
+
+        fn agent(&self) -> PathBuf {
+            self.temp.path().join("agent")
+        }
+
+        fn seed(&self, name: &str, files: &[(&str, &str)]) {
+            self.remote.seed(name, &package_bytes(name, files));
+        }
+
+        fn download(
+            &self,
+            endpoint: &str,
+            requested: Option<&str>,
+        ) -> Result<DownloadOutcome, DownloadFailure> {
+            let client = WebdavClient::new(self.remote.clone(), BASE);
+            let store = WebdavStore::new(&client);
+            download_from_webdav(&store, endpoint, &self.app_data(), requested)
+        }
+
+        fn state(&self) -> RemoteState {
+            remote_state::load(&self.app_data())
+        }
+    }
+
+    #[test]
+    fn download_refuses_a_non_https_endpoint_without_sending_a_request() {
+        let fixture = Fixture::new("download-insecure");
+        fixture.seed(PKG_NEW, &[("settings.json", "{}")]);
+
+        let failure = fixture
+            .download("http://dav.example.com/dav", None)
+            .expect_err("非 HTTPS 必须拒绝");
+
+        assert_eq!(failure.code, "remote_insecure");
+        assert!(
+            fixture.remote.methods().is_empty(),
+            "门槛在最前：一个请求都不该发出"
+        );
+        assert!(staging_entries(&fixture.app_data()).is_empty());
+        assert!(!fixture
+            .app_data()
+            .join(remote_state::REMOTE_STATE_FILE_NAME)
+            .exists());
+    }
+
+    #[test]
+    fn download_allows_loopback_http_endpoints() {
+        for (index, endpoint) in ["http://127.0.0.1:8080/dav", "http://localhost/dav"]
+            .into_iter()
+            .enumerate()
+        {
+            let fixture = Fixture::new(&format!("download-loopback-{index}"));
+            fixture.seed(PKG_NEW, &[("settings.json", "{}")]);
+
+            let outcome = fixture.download(endpoint, None).expect("回环地址应放行");
+
+            assert_eq!(outcome.staged.package_name, PKG_NEW, "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn download_reports_an_empty_remote_and_a_vanished_name() {
+        let fixture = Fixture::new("download-missing");
+
+        let failure = fixture.download(BASE, None).expect_err("远端为空必须报错");
+        assert_eq!(failure.code, "remote_no_packages", "{}", failure.message);
+        assert_eq!(fixture.remote.methods(), vec!["PROPFIND"], "空远端只列一次");
+        assert!(staging_entries(&fixture.app_data()).is_empty());
+
+        fixture.seed(PKG_OLD, &[("settings.json", "{}")]);
+        let failure = fixture
+            .download(BASE, Some(PKG_NEW))
+            .expect_err("选中的包不在列表里");
+        assert_eq!(failure.code, "package_not_found", "{}", failure.message);
+        assert!(
+            staging_entries(&fixture.app_data()).is_empty(),
+            "报错时不留暂存"
+        );
+    }
+
+    #[test]
+    fn oversized_package_is_rejected_before_the_get() {
+        let fixture = Fixture::new("download-too-large");
+        fixture.seed(PKG_NEW, &[("settings.json", "{}")]);
+        fixture.remote.claim_size(PKG_NEW, 64 * 1024 * 1024 + 1);
+
+        let failure = fixture.download(BASE, None).expect_err("超限必须拒绝");
+
+        assert_eq!(failure.code, "package_too_large", "{}", failure.message);
+        assert_eq!(
+            fixture.remote.methods(),
+            vec!["PROPFIND"],
+            "体积先按列举值判，不发 GET"
+        );
+        assert!(staging_entries(&fixture.app_data()).is_empty());
+    }
+
+    #[test]
+    fn download_unpacks_the_newest_package_and_leaves_the_remote_alone() {
+        let fixture = Fixture::new("download-newest");
+        fixture.seed(PKG_OLD, &[("settings.json", "{\"v\":1}")]);
+        fixture.seed(
+            PKG_NEW,
+            &[("settings.json", "{\"v\":2}"), ("AGENTS.md", "# 指令\n")],
+        );
+
+        let outcome = fixture.download(BASE, None).expect("取包应成功");
+
+        assert_eq!(outcome.staged.package_name, PKG_NEW);
+        assert_eq!(outcome.staged.file_count, 2);
+        assert_eq!(outcome.staged.created_at, "2026-11-22T10:52:30Z");
+        assert!(outcome.staged.size > 0);
+        assert_eq!(outcome.staged.fingerprint.len(), 12);
+        assert!(outcome.staged.staging_root.join("manifest.json").is_file());
+        assert_eq!(
+            fs::read_to_string(outcome.staged.staging_root.join("snapshot/settings.json")).unwrap(),
+            "{\"v\":2}"
+        );
+        assert_eq!(
+            staging_entries(&fixture.app_data()),
+            vec![PKG_NEW.to_string()],
+            "暂存只留当前这一份"
+        );
+
+        // 下载不改动远端：只有列举与取包两个动词，包一份不少。
+        assert_eq!(fixture.remote.methods(), vec!["PROPFIND", "GET"]);
+        assert_eq!(fixture.remote.file_names(), vec![PKG_OLD, PKG_NEW]);
+    }
+
+    #[test]
+    fn repeated_download_of_the_same_package_is_idempotent() {
+        let fixture = Fixture::new("download-repeat");
+        fixture.seed(PKG_NEW, &[("settings.json", "{\"v\":2}")]);
+
+        let first = fixture.download(BASE, None).expect("第一次取包");
+        let second = fixture.download(BASE, None).expect("第二次取包");
+
+        assert_eq!(first.staged, second.staged);
+        assert_eq!(
+            staging_entries(&fixture.app_data()),
+            vec![PKG_NEW.to_string()]
+        );
+        assert_eq!(
+            fs::read_to_string(second.staged.staging_root.join("snapshot/settings.json")).unwrap(),
+            "{\"v\":2}"
+        );
+    }
+
+    #[test]
+    fn corrupt_packages_leave_staging_empty() {
+        let valid = package_bytes(PKG_NEW, &[("settings.json", "{\"v\":2}")]);
+        let truncated = valid[..valid.len() / 2].to_vec();
+
+        for (label, body) in [
+            ("truncated", truncated),
+            ("unsafe-entry", unsafe_entry_package()),
+            ("garbage", b"not a zip at all".to_vec()),
+        ] {
+            let fixture = Fixture::new(&format!("download-corrupt-{label}"));
+            fixture.remote.seed(PKG_NEW, &body);
+
+            let failure = fixture.download(BASE, None).expect_err("坏包必须报错");
+
+            assert!(
+                matches!(failure.code, "package_corrupt" | "package_unsafe_entry"),
+                "{label}：{}（{}）",
+                failure.code,
+                failure.message
+            );
+            assert!(
+                staging_entries(&fixture.app_data()).is_empty(),
+                "{label} 失败不能污染暂存"
+            );
+        }
+    }
+
+    /// 哈希不符只有拿到 manifest 才能发现，解包闸门看不到它：这一关由进计划时的校验把守。
+    #[test]
+    fn hash_mismatch_package_is_caught_by_the_plan() {
+        let fixture = Fixture::new("download-hash");
+        fixture
+            .remote
+            .seed(PKG_NEW, &hash_mismatch_package(PKG_NEW));
+        let agent = fixture.agent();
+        fs::create_dir_all(&agent).unwrap();
+
+        let outcome = fixture.download(BASE, None).expect("取包本身成功");
+        let failure = crate::plan::plan_snapshot(
+            &agent,
+            &outcome.staged.staging_root,
+            &FakeRunner,
+            crate::platform::HostOs::Posix,
+        )
+        .expect_err("哈希不符必须被计划挡下");
+
+        assert_eq!(failure.code, "hash_mismatch", "{}", failure.message);
+        assert!(!agent.join("settings.json").exists(), "校验失败不写 live");
+    }
+
+    #[test]
+    fn download_records_the_package_set_without_touching_the_upload_fingerprint() {
+        let fixture = Fixture::new("download-state");
+        fixture.seed(PKG_OLD, &[("settings.json", "{}")]);
+        fixture.seed(PKG_NEW, &[("settings.json", "{}")]);
+        remote_state::save(
+            &fixture.app_data(),
+            &RemoteState {
+                seen_at: "2026-11-20T00:00:00Z".to_string(),
+                packages: vec![PKG_OLD.to_string()],
+                last_uploaded_fingerprint: Some("deadbeefcafe".to_string()),
+            },
+        )
+        .expect("写初始状态");
+
+        let outcome = fixture.download(BASE, Some(PKG_NEW)).expect("指定包应成功");
+
+        assert_eq!(
+            outcome.previous_seen_at.as_deref(),
+            Some("2026-11-20T00:00:00Z")
+        );
+        let state = fixture.state();
+        assert_eq!(
+            state.packages,
+            vec![PKG_OLD.to_string(), PKG_NEW.to_string()],
+            "记录的是这次列举看到的集合"
+        );
+        assert_eq!(
+            state.last_uploaded_fingerprint.as_deref(),
+            Some("deadbeefcafe"),
+            "下载不改写上传指纹"
+        );
+        assert_ne!(state.seen_at, "2026-11-20T00:00:00Z");
+        assert_eq!(state.seen_at.len(), 20, "RFC 3339 秒级：{}", state.seen_at);
     }
 
     /// 固定版本的假命令：计划阶段会探测 node / pi 版本，不真的起进程。

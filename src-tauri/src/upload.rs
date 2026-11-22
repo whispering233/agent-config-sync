@@ -104,11 +104,41 @@ pub fn upload_to_webdav(
             .map_err(|failure| UploadFailure::new(failure.code, failure.message))?;
 
     let Some(stored) = stored else {
-        // 内容没变：不写包、不动远端、不改记录。
+        // 内容没变：不写包、不碰远端。但远端集合可能已被他机改过（另一台机器推了新包），
+        // 不列一次就永远记不到它，`unseen` 恒为 0，托盘会一直报 success。
+        let Some(packages) = listed_package_names(store) else {
+            // 列不出来就保持原记录：状态缺项比把一次上传判失败轻。
+            return Ok(UploadOutcome {
+                unseen: 0,
+                view: UploadView {
+                    package: uploaded_name(&state, baseline.unwrap_or_default()),
+                    unchanged: true,
+                    pruned: Vec::new(),
+                    prune_failed: Vec::new(),
+                },
+            });
+        };
+        let unseen = packages
+            .iter()
+            .filter(|name| !state.packages.contains(name))
+            .count();
+        let next = RemoteState {
+            seen_at: snapshot::format_timestamp(snapshot::now_seconds()),
+            packages,
+            // 这次没上传：上次上传的指纹原样留着，下次比对仍以它为准。
+            last_uploaded_fingerprint: state.last_uploaded_fingerprint.clone(),
+        };
+        remote_state::save(app_data, &next).map_err(|error| {
+            UploadFailure::new(
+                "no_write_permission",
+                format!("内容未变，但本机无法记录远端状态：{error}"),
+            )
+        })?;
+
         return Ok(UploadOutcome {
-            unseen: 0,
+            unseen,
             view: UploadView {
-                package: uploaded_name(&state, baseline.unwrap_or_default()),
+                package: uploaded_name(&next, baseline.unwrap_or_default()),
                 unchanged: true,
                 pruned: Vec::new(),
                 prune_failed: Vec::new(),
@@ -177,6 +207,19 @@ pub fn upload_to_webdav(
             prune_failed,
         },
     })
+}
+
+/// 远端当前的可解析包名。列举失败返回 `None`：调用方保持原记录，不改判成上传失败。
+fn listed_package_names(store: &dyn PackageStore) -> Option<Vec<String>> {
+    let listing = store.list().ok()?;
+
+    Some(
+        listing
+            .packages
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect(),
+    )
 }
 
 /// 上次上传的那份包的展示名：本机记录里指纹前 8 位对得上的最新包名。
@@ -597,13 +640,12 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_content_skips_the_upload_and_keeps_the_state() {
+    fn unchanged_content_only_lists_the_remote_and_keeps_the_upload_fingerprint() {
         let fixture = Fixture::new("unchanged");
-        let first = fixture.upload(BASE).expect("首次上传应成功");
-        let state_path = fixture.app_data().join("remote-state.json");
-        let before = fs::read(&state_path).expect("读状态文件");
+        fixture.upload(BASE).expect("首次上传应成功");
+        let before = fixture.state();
 
-        // 换一个空远端：这次只要发出任何请求就会留下痕迹。
+        // 换一个空远端：这次只要发出写请求就会留下痕迹。
         let second_remote = FakeDav::new();
         let client = WebdavClient::new(second_remote.clone(), BASE);
         let store = WebdavStore::new(&client);
@@ -618,9 +660,55 @@ mod tests {
         .expect("内容未变不是错误");
 
         assert!(outcome.view.unchanged);
-        assert_eq!(outcome.view.package, first.view.package);
-        assert!(second_remote.requests().is_empty(), "内容未变不发任何请求");
-        assert_eq!(fs::read(&state_path).expect("状态文件仍在"), before);
+        assert_eq!(
+            second_remote.methods(),
+            vec!["PROPFIND"],
+            "内容未变只列一次远端"
+        );
+        assert_eq!(outcome.unseen, 0);
+        // 远端已空：展示名无处可取，记录里的集合仍要跟着变。
+        assert_eq!(outcome.view.package, "");
+        let after = fixture.state();
+        assert!(after.packages.is_empty());
+        assert_eq!(
+            after.last_uploaded_fingerprint, before.last_uploaded_fingerprint,
+            "只跳过上传：上次上传的指纹原样留着"
+        );
+        assert_eq!(after.seen_at.len(), 20, "RFC 3339 秒级：{}", after.seen_at);
+    }
+
+    #[test]
+    fn unchanged_content_still_counts_packages_another_machine_pushed() {
+        let fixture = Fixture::new("unchanged-diverged");
+        let first = fixture.upload(BASE).expect("首次上传应成功");
+        let fingerprint = fixture.state().last_uploaded_fingerprint;
+        assert!(fingerprint.is_some(), "首次上传应记下指纹");
+
+        // 他机推了一份新包，而本机记录还停在上一次上传时的样子。
+        let pushed = old_package(30);
+        fixture.remote.seed(&pushed, b"other-machine");
+        remote_state::save(
+            &fixture.app_data(),
+            &RemoteState {
+                seen_at: "2026-11-20T00:00:00Z".to_string(),
+                packages: vec![first.view.package.clone()],
+                last_uploaded_fingerprint: fingerprint.clone(),
+            },
+        )
+        .expect("写初始状态");
+
+        let outcome = fixture.upload(BASE).expect("内容未变不是错误");
+
+        assert!(outcome.view.unchanged);
+        assert_eq!(outcome.unseen, 1, "另一台机器的包要算进来");
+        let state = fixture.state();
+        assert!(state.packages.contains(&pushed));
+        assert_eq!(
+            state.last_uploaded_fingerprint, fingerprint,
+            "只跳过上传：上次上传的指纹原样留着"
+        );
+        assert_ne!(state.seen_at, "2026-11-20T00:00:00Z");
+        assert_eq!(state.seen_at.len(), 20, "RFC 3339 秒级：{}", state.seen_at);
     }
 
     fn old_package(index: u64) -> String {
