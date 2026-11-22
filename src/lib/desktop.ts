@@ -79,25 +79,35 @@ export type RemoteDownload = {
   previousSeenAt: string | null;
 };
 
-/** 存储根里的一个包。 */
+/** 存储根 / 云端里的一个包。 */
 export type PackageEntry = {
   /** `<UTC yyyymmdd-HHmmss>-<指纹前 8 位>.zip`。 */
   name: string;
   size: number;
+  /** 包名里的时间戳换算成的 RFC 3339 UTC；展示时换算本地时区。 */
   createdAt: string;
+  /** 包名里的指纹前 8 位：只用于显示与人工核对。 */
+  fingerprint8: string;
+  /** 名字最大的一份：列表的默认选中项。 */
+  isNewest: boolean;
 };
 
 /** 与 Rust 侧 `PackageListView` 一一对应。 */
 export type PackageList = {
   /** 按名字倒序：最新在前。 */
   packages: PackageEntry[];
-  /** 默认选中项（名字最大的一份）；存储根为空时为 null。 */
-  newest: string | null;
   /** 无法识别的文件（`.tmp-*`、云盘冲突副本等）：只展示，不可操作。 */
   unrecognized: string[];
+  /** 上次成功上传/下载时看到的云端时间；本地文件夹模式没有记录，为 null。 */
+  seenAt: string | null;
+  /** 云端有、本机记录里没有的包数；本地文件夹模式恒为 0。 */
+  unseenCount: number;
 };
 
-/** 列举存储根里的快照包。 */
+/**
+ * 列举当前传输方式的快照包，按名字倒序。只读：WebDAV 模式下只发 `PROPFIND`，
+ * 不改远端，也不改本机记录。
+ */
 export function listSnapshotPackages(): Promise<PackageList> {
   return invoke<PackageList>('list_snapshot_packages');
 }

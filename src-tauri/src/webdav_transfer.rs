@@ -66,6 +66,30 @@ pub struct DownloadOutcome {
     pub previous_seen_at: Option<String>,
 }
 
+/// 列举结果里的一份包：时间与指纹都取自包名，为此不下载包本身。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedPackage {
+    pub name: String,
+    pub size: u64,
+    /// RFC 3339 UTC，由包名里的时间戳换算。
+    pub created_at: String,
+    /// 包名里的指纹前 8 位：只用于显示与人工核对。
+    pub fingerprint8: String,
+    /// 名字最大的一份：UI 的默认选中项。
+    pub is_newest: bool,
+}
+
+/// 一次列举：包按名字倒序（最新在前），无法识别的只留名字。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PackageListing {
+    pub packages: Vec<ListedPackage>,
+    pub unrecognized: Vec<String>,
+    /// 本机记录里上一次看到的远端时间；没有记录或本地文件夹模式为 `None`。
+    pub seen_at: Option<String>,
+    /// 云端有、本机记录里没有的包数；本地文件夹模式没有记录可比，恒为 0。
+    pub unseen_count: usize,
+}
+
 fn store_failure(error: StoreError) -> DownloadFailure {
     DownloadFailure::new(error.code, error.message)
 }
@@ -105,6 +129,71 @@ pub fn resolve_root(
             "{requested} 既不是同步文件夹，也不在本机暂存目录里；拒绝在它之上生成计划"
         ))
     }
+}
+
+/// 列举存储里的包，按名字倒序，并把名字最大的那份标成「最新」。
+///
+/// 只读：不发 `GET`，不碰本机记录。空存储根返回空列表而不是错误——「还没有包」由 UI 说。
+pub fn list_packages(store: &dyn PackageStore) -> Result<PackageListing, DownloadFailure> {
+    let listing = store.list().map_err(store_failure)?;
+    let mut packages: Vec<ListedPackage> = listing
+        .packages
+        .into_iter()
+        // 存储层已按包名闸门筛过；这里再解析一次只为取指纹前 8 位，免得 `StoreEntry`
+        // 多存一份与名字重复的字段。
+        .filter_map(|entry| {
+            let parsed = package::parse_name(&entry.name)?;
+            Some(ListedPackage {
+                created_at: snapshot::format_timestamp(entry.created_at),
+                name: entry.name,
+                size: entry.size,
+                fingerprint8: parsed.fingerprint8,
+                is_newest: false,
+            })
+        })
+        .collect();
+    packages.sort_by(|left, right| right.name.cmp(&left.name));
+    if let Some(newest) = packages.first_mut() {
+        newest.is_newest = true;
+    }
+
+    Ok(PackageListing {
+        packages,
+        unrecognized: listing.unrecognized,
+        seen_at: None,
+        unseen_count: 0,
+    })
+}
+
+/// WebDAV 列举：HTTPS 门槛 → 列举 → 与本机记录比对出「云端有、本机没见过」的包数。
+///
+/// 只发 `PROPFIND`：不改远端，也**不写** `remote-state.json`——只读命令一写状态，
+/// 「本机未见」的提示就会被用户随手一看抹掉。
+pub fn list_from_webdav(
+    store: &dyn PackageStore,
+    endpoint: &str,
+    app_data: &Path,
+) -> Result<PackageListing, DownloadFailure> {
+    // 门槛放在最前：非 HTTPS 的远端不只可能被读走凭据，还可能被塞进任意快照包，
+    // 而落地语义是「快照为准」，所以一个请求都不发。
+    if !credentials::is_secure_url(endpoint) {
+        return Err(DownloadFailure::new(
+            "remote_insecure",
+            "WebDAV 地址必须是 HTTPS（本机回环地址例外），否则拒绝列举远端快照",
+        ));
+    }
+
+    let mut listing = list_packages(store)?;
+    let state = remote_state::load(app_data);
+    listing.unseen_count = listing
+        .packages
+        .iter()
+        .filter(|entry| !state.packages.contains(&entry.name))
+        .count();
+    // 空记录读出来的 `seenAt` 是空串：没有上一次就不该报一个时间。
+    listing.seen_at = (!state.seen_at.is_empty()).then_some(state.seen_at);
+
+    Ok(listing)
 }
 
 /// 取包到本机暂存：列举 → 选包（缺省取名字最大的一份）→ 取 → 解到 `staging/<包名>/` → 只留这一份。
@@ -706,6 +795,12 @@ mod tests {
             download_from_webdav(&store, endpoint, &self.app_data(), requested)
         }
 
+        fn list(&self, endpoint: &str) -> Result<PackageListing, DownloadFailure> {
+            let client = WebdavClient::new(self.remote.clone(), BASE);
+            let store = WebdavStore::new(&client);
+            list_from_webdav(&store, endpoint, &self.app_data())
+        }
+
         fn state(&self) -> RemoteState {
             remote_state::load(&self.app_data())
         }
@@ -920,6 +1015,139 @@ mod tests {
         );
         assert_ne!(state.seen_at, "2026-11-20T00:00:00Z");
         assert_eq!(state.seen_at.len(), 20, "RFC 3339 秒级：{}", state.seen_at);
+    }
+
+    /// 存储层保证只有包名能解析的条目进 `packages`；这里验的是排序、「最新」与两桶分类。
+    #[test]
+    fn list_orders_newest_first_and_buckets_unrecognized_names() {
+        const PKG_MID: &str = "20261121-120000-0f0f0f0f.zip";
+        let fixture = Fixture::new("list-order");
+        // 按名字升序放入，列举结果必须反过来。
+        fixture.seed(PKG_OLD, &[("settings.json", "{}")]);
+        fixture.seed(PKG_MID, &[("settings.json", "{}")]);
+        fixture.seed(PKG_NEW, &[("settings.json", "{}")]);
+        fixture.remote.seed("notes.txt", b"keep me");
+        fixture.remote.seed(".tmp-1700000000-deadbeef", b"partial");
+
+        let listing = fixture.list(BASE).expect("列举应成功");
+
+        let names: Vec<&str> = listing
+            .packages
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, vec![PKG_NEW, PKG_MID, PKG_OLD]);
+        let newest: Vec<&str> = listing
+            .packages
+            .iter()
+            .filter(|entry| entry.is_newest)
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(newest, vec![PKG_NEW], "「最新」只落在名字最大的那份");
+        assert_eq!(listing.packages[2].created_at, "2026-11-21T09:12:10Z");
+        assert_eq!(listing.packages[0].fingerprint8, "deadbeef");
+        assert!(listing.packages.iter().all(|entry| entry.size > 0));
+        assert_eq!(
+            listing.unrecognized,
+            vec![
+                ".tmp-1700000000-deadbeef".to_string(),
+                "notes.txt".to_string()
+            ]
+        );
+        // 列举只发 PROPFIND：不取包，不改远端。
+        assert_eq!(fixture.remote.methods(), vec!["PROPFIND"]);
+    }
+
+    #[test]
+    fn list_reports_an_empty_remote_without_an_error() {
+        let fixture = Fixture::new("list-empty");
+
+        let listing = fixture.list(BASE).expect("空远端不是错误");
+
+        assert!(listing.packages.is_empty());
+        assert!(listing.unrecognized.is_empty());
+        assert_eq!(listing.unseen_count, 0);
+        assert_eq!(listing.seen_at, None);
+    }
+
+    #[test]
+    fn list_refuses_a_non_https_endpoint_without_sending_a_request() {
+        let fixture = Fixture::new("list-insecure");
+        fixture.seed(PKG_NEW, &[("settings.json", "{}")]);
+
+        let failure = fixture
+            .list("http://dav.example.com/dav")
+            .expect_err("非 HTTPS 必须拒绝");
+
+        assert_eq!(failure.code, "remote_insecure");
+        assert!(
+            fixture.remote.methods().is_empty(),
+            "门槛在最前：一个请求都不该发出"
+        );
+    }
+
+    /// 状态里有两个包、远端三个（多出一个新的）。
+    #[test]
+    fn list_counts_unseen_packages_and_leaves_the_state_file_alone() {
+        const PKG_MID: &str = "20261121-120000-0f0f0f0f.zip";
+        let fixture = Fixture::new("list-unseen");
+        fixture.seed(PKG_OLD, &[("settings.json", "{}")]);
+        fixture.seed(PKG_MID, &[("settings.json", "{}")]);
+        fixture.seed(PKG_NEW, &[("settings.json", "{}")]);
+        let state = RemoteState {
+            seen_at: "2026-11-21T12:00:00Z".to_string(),
+            packages: vec![PKG_OLD.to_string(), PKG_MID.to_string()],
+            last_uploaded_fingerprint: None,
+        };
+        remote_state::save(&fixture.app_data(), &state).expect("写初始状态");
+
+        let listing = fixture.list(BASE).expect("列举应成功");
+
+        assert_eq!(listing.unseen_count, 1, "只算云端有、本机记录里没有的");
+        assert_eq!(listing.seen_at.as_deref(), Some("2026-11-21T12:00:00Z"));
+        assert_eq!(fixture.state(), state, "只读命令不能写本机记录");
+    }
+
+    #[test]
+    fn list_creates_no_state_file_and_takes_no_package() {
+        let fixture = Fixture::new("list-no-state");
+        fixture.seed(PKG_NEW, &[("settings.json", "{}")]);
+
+        fixture.list(BASE).expect("列举应成功");
+
+        assert!(!fixture
+            .app_data()
+            .join(remote_state::REMOTE_STATE_FILE_NAME)
+            .exists());
+        assert!(
+            staging_entries(&fixture.app_data()).is_empty(),
+            "列举不取包"
+        );
+    }
+
+    /// 指定旧包：不能退回「最新」那一份，否则用户会应用一份没选过的快照。
+    #[test]
+    fn download_honours_the_named_older_package() {
+        let fixture = Fixture::new("download-older");
+        fixture.seed(PKG_OLD, &[("settings.json", "{\"v\":1}")]);
+        fixture.seed(PKG_NEW, &[("settings.json", "{\"v\":2}")]);
+
+        let outcome = fixture.download(BASE, Some(PKG_OLD)).expect("指定包应成功");
+
+        assert_eq!(outcome.staged.package_name, PKG_OLD);
+        assert_eq!(
+            fs::read_to_string(outcome.staged.staging_root.join("snapshot/settings.json")).unwrap(),
+            "{\"v\":1}"
+        );
+        assert_eq!(
+            staging_entries(&fixture.app_data()),
+            vec![PKG_OLD.to_string()]
+        );
+        assert_eq!(
+            fixture.remote.methods(),
+            vec!["PROPFIND", "GET"],
+            "只取选中那份"
+        );
     }
 
     /// 固定版本的假命令：计划阶段会探测 node / pi 版本，不真的起进程。

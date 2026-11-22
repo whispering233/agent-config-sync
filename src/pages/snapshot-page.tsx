@@ -170,7 +170,7 @@ type PackagesState =
   | { kind: 'idle' }
   | { kind: 'loading' }
   | { kind: 'done'; list: PackageList }
-  | { kind: 'failed'; message: string };
+  | { kind: 'failed'; code: string | null; message: string };
 
 type PlanState =
   | { kind: 'idle' }
@@ -340,19 +340,20 @@ export function SnapshotPage() {
   const isWebdav = config.kind === 'ready' && config.transport === 'webdav';
 
   useEffect(() => {
-    if (!isDesktop || isWebdav || syncRoot === null) {
+    if (!isDesktop || config.kind !== 'ready') {
+      return;
+    }
+    // 本地模式没有同步文件夹就没有包可列；WebDAV 模式靠已存的凭据去列远端。
+    if (!isWebdav && syncRoot === null) {
       return;
     }
     void loadPackages();
-  }, [isWebdav, syncRoot]);
+  }, [config.kind, isWebdav, syncRoot]);
   const exporting = exported.kind === 'exporting';
   const canExport = isDesktop && syncRoot !== null && !exporting;
   const downloading = downloaded.kind === 'downloading';
-  const canDownload = isDesktop && isWebdav && !downloading;
   const uploading = upload.kind === 'uploading';
   const canUpload = isDesktop && isWebdav && !uploading;
-  const canDownloadLocal =
-    isDesktop && !isWebdav && picked !== null && !downloading;
   const checking = planning.kind === 'checking';
   // 检查的是解包后的暂存快照：没有取到包时「同步文件夹」里已经没有目录布局可查。
   const canCheck = isDesktop && planRoot !== null && !checking;
@@ -366,10 +367,15 @@ export function SnapshotPage() {
       setPicked((current) =>
         current !== null && list.packages.some((entry) => entry.name === current)
           ? current
-          : list.newest,
+          : (list.packages.find((entry) => entry.isNewest)?.name ?? null),
       );
     } catch (error) {
-      setPackages({ kind: 'failed', message: errorMessage(error) });
+      const failure = asFailure(error);
+      setPackages({
+        kind: 'failed',
+        code: failure?.code ?? null,
+        message: failure?.message ?? errorMessage(error),
+      });
     }
   }
 
@@ -391,8 +397,9 @@ export function SnapshotPage() {
     }
   }
 
-  async function runDownload(packageName: string | null) {
+  async function runDownload(packageName: string) {
     setDownloaded({ kind: 'downloading' });
+    setPicked(packageName);
     try {
       const view = await downloadRemoteSnapshot(packageName);
       setDownloaded({ kind: 'done', view });
@@ -415,6 +422,8 @@ export function SnapshotPage() {
     try {
       const result = await uploadSnapshot();
       setUpload({ kind: 'done', result });
+      // 上传可能写了一个新包并清理了旧包：列表要跟着刷新。
+      void loadPackages();
     } catch (error) {
       const failure = asFailure(error);
       setUpload({
@@ -557,19 +566,12 @@ export function SnapshotPage() {
         <Card className="p-lg">
           <h2 className="text-sm font-semibold text-foreground">WebDAV</h2>
           <p className="mt-xs text-sm text-muted-foreground">
-            上传会把当前配置打成一个快照包放到云端，并按名字保留最近 20 份；下载默认取云端名字最大（最新）的一份，解到本机暂存目录后走下面的检查与应用。
+            上传会把当前配置打成一个快照包放到云端，并按名字保留最近 20 份；下载在下面的「远端快照」里选一份，解到本机暂存目录后走后面的检查与应用。
           </p>
 
           <div className="mt-md flex flex-wrap items-center gap-md">
             <Button onClick={() => void runUpload()} disabled={!canUpload}>
               {uploading ? '上传中…' : '上传到 WebDAV'}
-            </Button>
-            <Button
-              variant="secondary"
-              onClick={() => void runDownload(null)}
-              disabled={!canDownload}
-            >
-              {downloading ? '下载中…' : '从 WebDAV 下载'}
             </Button>
             {!isDesktop && (
               <span className="text-sm text-muted-foreground">仅桌面版可用</span>
@@ -603,69 +605,73 @@ export function SnapshotPage() {
         </div>
       )}
 
+      {isWebdav && (
+        <Card className="p-lg">
+          <h2 className="text-sm font-semibold text-foreground">远端快照</h2>
+          <p className="mt-xs text-sm text-muted-foreground">
+            云端的历史包，按名字（UTC 时间）倒序；选一份取到本机暂存目录，再走下面的检查与应用。下载不改动远端。
+          </p>
+
+          {packages.kind === 'loading' && (
+            <p className="mt-sm text-sm text-muted-foreground">正在读取云端包列表…</p>
+          )}
+          {packages.kind === 'failed' && (
+            <p className="mt-sm flex items-start gap-sm text-sm text-danger">
+              <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
+              <span>
+                读取快照包失败：
+                {packages.code !== null && (
+                  <code className="mr-xs font-mono text-xs">[{packages.code}]</code>
+                )}
+                {packages.message}
+              </span>
+            </p>
+          )}
+          {packages.kind === 'done' && (
+            <PackageListBlock
+              list={packages.list}
+              picked={picked}
+              onPick={setPicked}
+              onDownload={(name) => void runDownload(name)}
+              downloading={downloading}
+              emptyText="云端还没有快照包：先上传一次，或者等另一台机器上传。"
+            />
+          )}
+        </Card>
+      )}
+
       {!isWebdav && (
         <Card className="p-lg">
-          <h2 className="text-sm font-semibold text-foreground">从存储恢复</h2>
+          <h2 className="text-sm font-semibold text-foreground">本地存储</h2>
           <p className="mt-xs text-sm text-muted-foreground">
-            从同步文件夹里选一份包解到本机暂存目录，再走下面的检查与应用；暂存只保留当前这一份。
+            同步文件夹里的历史包，按名字（UTC 时间）倒序；选一份解到本机暂存目录，再走下面的检查与应用。暂存只保留当前这一份。
           </p>
 
           {packages.kind === 'loading' && (
             <p className="mt-sm text-sm text-muted-foreground">正在读取存储里的包…</p>
           )}
           {packages.kind === 'failed' && (
-            <p className="mt-sm text-sm text-danger">读取快照包失败：{packages.message}</p>
-          )}
-          {packages.kind === 'done' && packages.list.packages.length === 0 && (
-            <p className="mt-sm text-sm text-muted-foreground">
-              同步文件夹里还没有快照包：先导出一次，或者等云盘把另一台机器的包同步下来。
+            <p className="mt-sm flex items-start gap-sm text-sm text-danger">
+              <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
+              <span>
+                读取快照包失败：
+                {packages.code !== null && (
+                  <code className="mr-xs font-mono text-xs">[{packages.code}]</code>
+                )}
+                {packages.message}
+              </span>
             </p>
           )}
-          {packages.kind === 'done' && packages.list.packages.length > 0 && (
-            <ul className="mt-md flex flex-col gap-sm">
-              {packages.list.packages.map((entry) => (
-                <li key={entry.name}>
-                  <label className="flex items-start gap-sm rounded-md bg-surface-muted px-md py-sm">
-                    <input
-                      type="radio"
-                      name="snapshot-package"
-                      className="mt-xs h-4 w-4"
-                      checked={picked === entry.name}
-                      onChange={() => setPicked(entry.name)}
-                      disabled={downloading}
-                    />
-                    <span className="flex flex-col gap-xs">
-                      <span className="break-all font-mono text-xs text-foreground">
-                        {entry.name}
-                      </span>
-                      <span className="text-xs text-muted-foreground">
-                        {entry.createdAt} · {formatBytes(entry.size)}
-                        {entry.name === packages.list.newest && ' · 最新'}
-                      </span>
-                    </span>
-                  </label>
-                </li>
-              ))}
-            </ul>
+          {packages.kind === 'done' && (
+            <PackageListBlock
+              list={packages.list}
+              picked={picked}
+              onPick={setPicked}
+              onDownload={(name) => void runDownload(name)}
+              downloading={downloading}
+              emptyText="同步文件夹里还没有快照包：先导出一次，或者等云盘把另一台机器的包同步下来。"
+            />
           )}
-          {packages.kind === 'done' && packages.list.unrecognized.length > 0 && (
-            <p className="mt-sm text-xs text-muted-foreground">
-              另有 {packages.list.unrecognized.length} 个无法识别的文件（上传残留、云盘冲突副本等）：
-              它们不会被当成包，需要清理时手动处理。
-            </p>
-          )}
-
-          <div className="mt-md flex flex-wrap items-center gap-md">
-            <Button
-              onClick={() => void runDownload(picked)}
-              disabled={!canDownloadLocal}
-            >
-              {downloading ? '取包中…' : '从这份包恢复'}
-            </Button>
-            {!isDesktop && (
-              <span className="text-sm text-muted-foreground">恢复仅桌面版可用</span>
-            )}
-          </div>
         </Card>
       )}
 
@@ -699,7 +705,7 @@ export function SnapshotPage() {
 
         {planRoot === null && isDesktop && (
           <p className="mt-sm text-sm text-muted-foreground">
-            还没有取到快照：先在「从存储恢复」里选一份包，或从 WebDAV 下载。
+            还没有取到快照：先在「本地存储」或「远端快照」里选一份包下载。
           </p>
         )}
 
@@ -1083,7 +1089,7 @@ export function SnapshotPage() {
           <p className="mt-md text-sm text-muted-foreground">
             {exported.report.unchanged
               ? '存储里最新的一份包就是这份内容：没有写新包，历史不会重复堆积。'
-              : '包在存储里出现即代表完整：云盘客户端传完后，另一台机器就能在「从存储恢复」里选到它。'}
+              : '包在存储里出现即代表完整：云盘客户端传完后，另一台机器就能在「本地存储」里选到它。'}
           </p>
         </Card>
       )}
@@ -1187,6 +1193,114 @@ function DownloadResult({ view }: { view: RemoteDownload }) {
       )}
     </>
   );
+}
+
+/**
+ * 历史包列表：本地文件夹与 WebDAV 共用，差别只在标题、空列表文案与是否展示云端状态。
+ *
+ * 每行自带「下载」：选包就是选那一行，不再另设一个顶部按钮——否则两个控件会各说一套。
+ */
+function PackageListBlock({
+  list,
+  picked,
+  onPick,
+  onDownload,
+  downloading,
+  emptyText,
+}: {
+  list: PackageList;
+  picked: string | null;
+  onPick: (name: string) => void;
+  onDownload: (name: string) => void;
+  downloading: boolean;
+  emptyText: string;
+}) {
+  return (
+    <>
+      {list.unseenCount > 0 && (
+        <p className="mt-sm text-sm text-warning">
+          云端有 {list.unseenCount} 份本机未见的新快照：多半是另一台机器上传的，选一份就能恢复。
+        </p>
+      )}
+      {list.seenAt !== null && (
+        <p className="mt-xs text-xs text-muted-foreground">
+          上次记录的云端时间：{list.seenAt}
+        </p>
+      )}
+
+      {list.packages.length === 0 && (
+        <p className="mt-sm text-sm text-muted-foreground">{emptyText}</p>
+      )}
+      {list.packages.length > 0 && (
+        <ul className="mt-md flex flex-col gap-sm">
+          {list.packages.map((entry) => (
+            <li
+              key={entry.name}
+              className="flex flex-wrap items-start justify-between gap-sm rounded-md bg-surface-muted px-md py-sm"
+            >
+              <label className="flex min-w-0 flex-1 items-start gap-sm">
+                <input
+                  type="radio"
+                  name="snapshot-package"
+                  className="mt-xs h-4 w-4"
+                  checked={picked === entry.name}
+                  onChange={() => onPick(entry.name)}
+                  disabled={downloading}
+                />
+                <span className="flex min-w-0 flex-col gap-xs">
+                  <span className="break-all font-mono text-xs text-foreground">
+                    {entry.name}
+                  </span>
+                  <span className="break-all text-xs text-muted-foreground">
+                    包名时间 {packageTime(entry.createdAt)}（本地时区）·{' '}
+                    {formatBytes(entry.size)} · 指纹{' '}
+                    <span className="font-mono">{entry.fingerprint8}</span>
+                    {entry.isNewest && (
+                      <span className="ml-xs text-foreground">· 最新</span>
+                    )}
+                  </span>
+                </span>
+              </label>
+              <Button
+                variant="secondary"
+                onClick={() => onDownload(entry.name)}
+                disabled={downloading}
+              >
+                {downloading && picked === entry.name ? '下载中…' : '下载'}
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {list.unrecognized.length > 0 && (
+        <div className="mt-md">
+          <h3 className="text-xs font-semibold text-muted-foreground">
+            无法识别的文件 {list.unrecognized.length} 个
+          </h3>
+          <ul className="mt-xs flex flex-col gap-xs">
+            {list.unrecognized.map((name) => (
+              <li key={name} className="break-all font-mono text-xs text-muted-foreground">
+                {name}
+              </li>
+            ))}
+          </ul>
+          <p className="mt-xs text-xs text-muted-foreground">
+            上传残留、云盘冲突副本或旧格式文件：不会被当成包，不参与「最新」判定，这里只列出。
+          </p>
+        </div>
+      )}
+    </>
+  );
+}
+
+/**
+ * 包名里的时间是 UTC，而用户看的是本地时间：换算后标出来源，
+ * 免得和 manifest 里的创建时间混为一谈。
+ */
+function packageTime(createdAt: string): string {
+  const date = new Date(createdAt);
+  return Number.isNaN(date.getTime()) ? createdAt : date.toLocaleString();
 }
 
 /** 包体积按 KB / MB 显示：几十 KB 是常态，字节数读起来没意义。 */

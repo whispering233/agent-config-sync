@@ -7,7 +7,7 @@ use crate::config::{
 use crate::credentials::{self, CredentialError, WebdavCredentials};
 use crate::runtime;
 use crate::snapshot;
-use crate::store::{LocalStore, PackageStore, WebdavStore};
+use crate::store::{LocalStore, WebdavStore};
 use crate::upload::{self, UploadFailure, UploadView};
 use crate::webdav::{self, DavError, ReqwestTransport, WebdavClient};
 use crate::webdav_transfer::{self, DownloadFailure, StagedPackage};
@@ -176,26 +176,36 @@ fn app_config(app: &AppHandle) -> Result<AppConfig, String> {
     config::load_config(&config_dir).map_err(|error| error.to_string())
 }
 
-/// 本地文件夹模式的存储根。WebDAV 的包列表还没接上：那条路只支持取最新一份。
-fn local_store(app: &AppHandle) -> Result<LocalStore, String> {
-    let config = app_config(app)?;
-    if config.transport != Transport::Local {
-        return Err("WebDAV 模式暂时只支持取最新一份：历史包列表请等后续版本".to_string());
-    }
-    let root = config
-        .sync_root
-        .ok_or_else(|| "还没有设置同步文件夹：请先在设置页选择，再回来导出或恢复".to_string())?;
-
-    Ok(LocalStore::new(root))
-}
-
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
         .map_err(|error| format!("无法定位应用数据目录：{error}"))
 }
 
-/// 存储根里的一个包。
+/// 按已保存的凭据建 WebDAV 客户端。列举与下载共用这一段凭据流程。
+///
+/// 同时返回地址：HTTPS 门槛看的是用户填的服务地址，而客户端只保留工作根。
+fn webdav_client(
+    app_data: &Path,
+) -> Result<(WebdavClient<ReqwestTransport>, String), DownloadFailure> {
+    let credentials = credentials::load(app_data)
+        .map_err(|error| DownloadFailure::new("remote_not_configured", error.to_string()))?
+        .ok_or_else(|| {
+            DownloadFailure::new(
+                "remote_not_configured",
+                "还没有保存 WebDAV 凭据：请先在设置页填写地址、用户名与密码",
+            )
+        })?;
+    let transport = ReqwestTransport::new(&credentials.username, &credentials.password)
+        .map_err(|error| DownloadFailure::new("remote_unreachable", error.to_string()))?;
+
+    Ok((
+        WebdavClient::new(transport, &credentials.url),
+        credentials.url,
+    ))
+}
+
+/// 存储根里的一个包。时间与指纹都取自包名，不为此下载包。
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackageEntryView {
@@ -203,39 +213,77 @@ pub struct PackageEntryView {
     size: u64,
     /// RFC 3339 UTC，由包名里的时间戳换算。
     created_at: String,
+    /// 包名里的指纹前 8 位：只用于显示与人工核对。
+    fingerprint8: String,
+    /// 名字最大的一份：默认选中项。
+    is_newest: bool,
 }
 
-/// 一次列举的结果。`newest` 是默认选中项：恢复时先挑名字最大的一份。
+/// 一次列举的结果。本地文件夹与 WebDAV 共用这个形状。
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackageListView {
+    /// 按名字倒序：最新在前。
     packages: Vec<PackageEntryView>,
-    newest: Option<String>,
     /// 无法识别的文件（`.tmp-*`、云盘冲突副本等）：只展示，不可操作。
     unrecognized: Vec<String>,
+    /// 上一次成功上传/下载时看到的云端时间；本地文件夹模式没有记录，为 null。
+    seen_at: Option<String>,
+    /// 云端有、本机记录里没有的包数；本地文件夹模式为 0。
+    unseen_count: usize,
 }
 
-/// 列举存储根里的快照包，按名字倒序（最新在前）。
-#[tauri::command]
-pub fn list_snapshot_packages(app: AppHandle) -> Result<PackageListView, String> {
-    let listing = local_store(&app)?.list().map_err(|error| error.message)?;
-    let mut packages: Vec<PackageEntryView> = listing
-        .packages
-        .into_iter()
-        .map(|entry| PackageEntryView {
-            name: entry.name,
-            size: entry.size,
-            created_at: snapshot::format_timestamp(entry.created_at),
-        })
-        .collect();
-    packages.sort_by(|left, right| right.name.cmp(&left.name));
-    let newest = packages.first().map(|entry| entry.name.clone());
+impl PackageListView {
+    fn new(listing: webdav_transfer::PackageListing) -> Self {
+        Self {
+            packages: listing
+                .packages
+                .into_iter()
+                .map(|entry| PackageEntryView {
+                    name: entry.name,
+                    size: entry.size,
+                    created_at: entry.created_at,
+                    fingerprint8: entry.fingerprint8,
+                    is_newest: entry.is_newest,
+                })
+                .collect(),
+            unrecognized: listing.unrecognized,
+            seen_at: listing.seen_at,
+            unseen_count: listing.unseen_count,
+        }
+    }
+}
 
-    Ok(PackageListView {
-        packages,
-        newest,
-        unrecognized: listing.unrecognized,
+/// 列举当前传输方式的快照包，按名字倒序（最新在前）。只读：不改远端，也不改本机记录。
+#[tauri::command]
+pub async fn list_snapshot_packages(app: AppHandle) -> Result<PackageListView, DownloadFailure> {
+    // WebDAV 要发 PROPFIND，留在 UI 线程会冻住窗口。
+    tauri::async_runtime::spawn_blocking(move || {
+        let app_data = app_data_dir(&app)
+            .map_err(|message| DownloadFailure::new("app_data_unavailable", message))?;
+        let config = app_config(&app)
+            .map_err(|message| DownloadFailure::new("app_config_unavailable", message))?;
+
+        if config.transport == Transport::Local {
+            let root = config.sync_root.ok_or_else(|| {
+                DownloadFailure::new(
+                    "sync_root_unset",
+                    "还没有设置同步文件夹：请先在设置页选择，再回来看历史包",
+                )
+            })?;
+            let listing = webdav_transfer::list_packages(&LocalStore::new(root))?;
+
+            return Ok(PackageListView::new(listing));
+        }
+
+        let (client, endpoint) = webdav_client(&app_data)?;
+        let listing =
+            webdav_transfer::list_from_webdav(&WebdavStore::new(&client), &endpoint, &app_data)?;
+
+        Ok(PackageListView::new(listing))
     })
+    .await
+    .map_err(|error| DownloadFailure::new("list_failed", format!("列举快照包失败：{error}")))?
 }
 
 /// 取包到本机暂存的结果。`stagingRoot` 顶替同步根，交给 `verify_and_plan` 与 `apply_snapshot`。
@@ -302,20 +350,10 @@ pub async fn download_remote_snapshot(
             return Ok(DownloadView::new(staged, None));
         }
 
-        let credentials = credentials::load(&app_data)
-            .map_err(|error| DownloadFailure::new("remote_not_configured", error.to_string()))?
-            .ok_or_else(|| {
-                DownloadFailure::new(
-                    "remote_not_configured",
-                    "还没有保存 WebDAV 凭据：请先在设置页填写地址、用户名与密码",
-                )
-            })?;
-        let transport = ReqwestTransport::new(&credentials.username, &credentials.password)
-            .map_err(|error| DownloadFailure::new("remote_unreachable", error.to_string()))?;
-        let client = WebdavClient::new(transport, &credentials.url);
+        let (client, endpoint) = webdav_client(&app_data)?;
         let outcome = webdav_transfer::download_from_webdav(
             &WebdavStore::new(&client),
-            &credentials.url,
+            &endpoint,
             &app_data,
             package.as_deref(),
         )?;
@@ -473,9 +511,12 @@ mod tests {
                 name: "20261122-105230-deadbeef.zip".to_string(),
                 size: 4096,
                 created_at: "2026-11-22T10:52:30Z".to_string(),
+                fingerprint8: "deadbeef".to_string(),
+                is_newest: true,
             }],
-            newest: Some("20261122-105230-deadbeef.zip".to_string()),
             unrecognized: vec!["notes.txt".to_string()],
+            seen_at: Some("2026-11-21T09:12:10Z".to_string()),
+            unseen_count: 2,
         };
         assert_eq!(
             serde_json::to_value(&list).unwrap(),
@@ -484,9 +525,12 @@ mod tests {
                     "name": "20261122-105230-deadbeef.zip",
                     "size": 4096,
                     "createdAt": "2026-11-22T10:52:30Z",
+                    "fingerprint8": "deadbeef",
+                    "isNewest": true,
                 }],
-                "newest": "20261122-105230-deadbeef.zip",
                 "unrecognized": ["notes.txt"],
+                "seenAt": "2026-11-21T09:12:10Z",
+                "unseenCount": 2,
             })
         );
     }
