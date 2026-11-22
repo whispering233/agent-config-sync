@@ -11,7 +11,7 @@ use crate::runtime;
 use crate::snapshot;
 use crate::store::{LocalStore, WebdavStore};
 use crate::upload::{self, UploadFailure, UploadView};
-use crate::webdav::{self, DavError, ReqwestTransport, WebdavClient};
+use crate::webdav::{DavError, ReqwestTransport, WebdavClient};
 use crate::webdav_transfer::{self, DownloadFailure, StagedPackage};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
@@ -156,8 +156,12 @@ pub async fn test_webdav_connection(
             .map_err(probe_credential_error)?;
         let transport = ReqwestTransport::new(&credentials.username, &credentials.password)
             .map_err(dav_error)?;
-        let outcome =
-            webdav::probe(&WebdavClient::new(transport, &credentials.url)).map_err(dav_error)?;
+        // HTTPS 门槛在 `probe_connection` 里：探测会 PROPFIND、PUT、DELETE，明文不能出网线。
+        let outcome = webdav_transfer::probe_connection(
+            &WebdavClient::new(transport, &credentials.url),
+            &credentials.url,
+        )
+        .map_err(dav_error)?;
 
         Ok(WebdavProbeView {
             created: outcome.created,
@@ -473,9 +477,9 @@ pub async fn upload_snapshot(app: AppHandle) -> Result<UploadView, UploadFailure
         let config = app_config(&app)
             .map_err(|message| UploadFailure::new("app_config_unavailable", message))?;
         if config.transport == Transport::Local {
-            let report = snapshot::export_to_local_store(&app)
+            let (report, pruned) = snapshot::export_to_local_store(&app)
                 .map_err(|failure| UploadFailure::new(failure.code, failure.message))?;
-            return Ok(UploadView::from_export(report));
+            return Ok(UploadView::from_export(report, pruned));
         }
 
         // 与自动上行、应用/回滚共用一把锁：导出会重建工作区，不能两份同时跑。

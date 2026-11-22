@@ -13,7 +13,7 @@ use crate::package;
 use crate::platform::{self, HostOs};
 use crate::scope;
 use crate::secrets::{self, SecretLevel};
-use crate::store::{LocalStore, PackageStore};
+use crate::store::{LocalStore, PackageStore, PruneOutcome};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
@@ -29,6 +29,8 @@ pub const SNAPSHOT_DIR_NAME: &str = "snapshot";
 pub const MANIFEST_FILE_NAME: &str = "manifest.json";
 /// manifest 格式版本。不认识的值一律拒绝读取。
 pub const FORMAT_VERSION: u32 = 2;
+/// 快照包保留份数（硬编码，不做配置项）：本地文件夹与 WebDAV 共用同一套保留语义。
+pub const KEEP_PACKAGES: usize = 20;
 /// 快照目录权限：含明文凭据，只允许本用户进入。
 const SNAPSHOT_DIR_MODE: u32 = 0o700;
 /// 导出工作区权限：中间产物含明文凭据。
@@ -194,28 +196,46 @@ impl StoredPackage {
     }
 }
 
-/// 导出成包并放进存储根：先物化到本机工作区，打成 zip，再经存储的原子放入定案。
+/// 导出成包并放进存储根：先物化到本机工作区，打成 zip，再经存储的原子放入定案，
+/// 最后按保留份数清理旧包。
 ///
 /// 内容未变（存储里最新包的完整指纹与本机这次要产出的相同）时不写新包，返回那份已存在的包：
-/// 空闲期反复导出不该堆历史。
+/// 空闲期反复导出不该堆历史。返回的清理结果由调用方展示：清理失败不阻塞导出成功。
 pub fn export(
     store: &LocalStore,
     agent_dir: &Path,
     app_data: &Path,
     versions: SourceVersions,
-) -> Result<ExportReport, ExportFailure> {
+) -> Result<(ExportReport, PruneOutcome), ExportFailure> {
     precheck(agent_dir, store.root())?;
 
     // 本地模式的比对基准要读最新包的 manifest：包就在本机，读它不额外花销。
     let existing = newest_package(store);
     let baseline = existing.as_ref().map(|report| report.fingerprint.as_str());
 
-    match pack_and_store(store, baseline, agent_dir, app_data, versions, true)? {
-        Some(stored) => Ok(stored.into_report()),
+    let Some(stored) = pack_and_store(store, baseline, agent_dir, app_data, versions, true)? else {
         // 只有与 `existing` 的指纹相同时才会是 `None`，因此它必然是一份完整报告。
-        None => existing
-            .ok_or_else(|| ExportFailure::new("export_failed", "内容比对基准已失效，请重新导出")),
-    }
+        // 没写新包也就不清理：保留份数只在真正新添一份后才重算。
+        let report = existing
+            .ok_or_else(|| ExportFailure::new("export_failed", "内容比对基准已失效，请重新导出"))?;
+
+        return Ok((report, PruneOutcome::default()));
+    };
+
+    let report = stored.into_report();
+    let pruned = prune_kept(store, &report.package_name);
+
+    Ok((report, pruned))
+}
+
+/// 保留清理：单份删不掉只进 `failed`，整个清理动作失败也只是一个失败项，都不改判成导出失败。
+fn prune_kept(store: &dyn PackageStore, current: &str) -> PruneOutcome {
+    store
+        .prune(KEEP_PACKAGES, current)
+        .unwrap_or_else(|error| PruneOutcome {
+            pruned: Vec::new(),
+            failed: vec![(String::new(), error.message)],
+        })
 }
 
 /// 打包并原子放入存储。`baseline` 是调用方给的「上次已交付内容」的完整指纹：与本次相同就
@@ -692,12 +712,16 @@ pub(crate) fn civil_from_days(days: i64) -> (i64, u64, u64) {
 }
 
 /// command 层入口：从应用配置读取存储根与宿主目录，再跑导出。
+///
+/// 导出一次与「上传」是同一次动作：清理已经真的执行了，这里只丢掉清理明细，列表刷新会显示结果。
 #[tauri::command]
 pub async fn export_snapshot(app: tauri::AppHandle) -> Result<ExportReport, ExportFailure> {
     // 版本探测要起子进程，最多各等 5 秒；放阻塞线程池，别占住 UI 线程。
-    tauri::async_runtime::spawn_blocking(move || export_to_local_store(&app))
-        .await
-        .map_err(|error| ExportFailure::new("export_failed", format!("导出失败：{error}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        export_to_local_store(&app).map(|(report, _)| report)
+    })
+    .await
+    .map_err(|error| ExportFailure::new("export_failed", format!("导出失败：{error}")))?
 }
 
 /// 一次导出需要的本机上下文：应用数据目录（工作区与状态文件）、宿主目录与来源版本。
@@ -748,7 +772,10 @@ pub fn export_context(app: &tauri::AppHandle) -> Result<ExportContext, ExportFai
 }
 
 /// 本地文件夹模式的上传与导出共用这一条链路：两者都是「把 live 导出成包放进存储根」。
-pub fn export_to_local_store(app: &tauri::AppHandle) -> Result<ExportReport, ExportFailure> {
+/// 返回导出结果与保留清理结果：两个入口对清理的展示方式不同。
+pub fn export_to_local_store(
+    app: &tauri::AppHandle,
+) -> Result<(ExportReport, PruneOutcome), ExportFailure> {
     // 与自动上行、应用/回滚共用一把锁：导出会重建工作区，不能两份同时跑。
     let _guard = crate::runtime::lock_operation();
     let config_dir = app.path().app_config_dir().map_err(|error| {
@@ -876,7 +903,7 @@ mod tests {
         fixture_agent(&agent);
         fs::create_dir_all(&app_data).expect("创建应用数据目录");
 
-        let report = export(
+        let (report, pruned) = export(
             &LocalStore::new(store_root.clone()),
             &agent,
             &app_data,
@@ -886,6 +913,8 @@ mod tests {
             },
         )
         .expect("导出应成功");
+
+        assert!(pruned.pruned.is_empty(), "只有一份包：没有可清理的");
 
         assert!(!report.unchanged, "{:?}", report);
         assert_eq!(report.files, 6);
@@ -990,8 +1019,9 @@ mod tests {
         fixture_agent(&agent);
 
         let store = LocalStore::new(store_root.clone());
-        let first = export(&store, &agent, &app_data, SourceVersions::default()).expect("首次导出");
-        let second =
+        let (first, _) =
+            export(&store, &agent, &app_data, SourceVersions::default()).expect("首次导出");
+        let (second, _) =
             export(&store, &agent, &app_data, SourceVersions::default()).expect("再次导出");
 
         assert!(!first.unchanged);
@@ -1013,7 +1043,9 @@ mod tests {
         fixture_agent(&agent);
         let store = LocalStore::new(store_root.clone());
 
-        let first = export(&store, &agent, &app_data, SourceVersions::default()).expect("首次导出");
+        let first = export(&store, &agent, &app_data, SourceVersions::default())
+            .expect("首次导出")
+            .0;
         write_file(
             &agent.join("extensions/leak/index.ts"),
             &format!(
@@ -1021,8 +1053,9 @@ mod tests {
 "
             ),
         );
-        let second =
-            export(&store, &agent, &app_data, SourceVersions::default()).expect("再次导出");
+        let second = export(&store, &agent, &app_data, SourceVersions::default())
+            .expect("再次导出")
+            .0;
 
         assert!(!second.unchanged);
         assert_ne!(second.package_name, first.package_name);
@@ -1037,6 +1070,77 @@ mod tests {
             .files
             .iter()
             .any(|file| file.path == "snapshot/extensions/leak/index.ts"));
+    }
+
+    /// 旧包的夹具名：只有名字参与保留判定，内容不是真包也行。
+    fn old_package_name(index: u64) -> String {
+        format!(
+            "20250101-{:02}{:02}{:02}-deadbeef.zip",
+            index / 3600,
+            (index % 3600) / 60,
+            index % 60
+        )
+    }
+
+    #[test]
+    fn export_prunes_the_store_to_the_keep_limit() {
+        let temp = TempDir::new("export-prune");
+        let agent = temp.path().join("agent");
+        let store_root = temp.path().join("cloud");
+        let app_data = temp.path().join("data");
+        fixture_agent(&agent);
+        for index in 0..24 {
+            write_file(&store_root.join(old_package_name(index)), "old");
+        }
+
+        let (report, pruned) = export(
+            &LocalStore::new(store_root.clone()),
+            &agent,
+            &app_data,
+            SourceVersions::default(),
+        )
+        .expect("导出应成功");
+
+        assert_eq!(
+            pruned.pruned.len(),
+            5,
+            "24 份旧包 + 本次 1 份，留 20 删最旧 5 份"
+        );
+        assert!(pruned.failed.is_empty(), "{:?}", pruned);
+        let names = dir_entries(&store_root);
+        assert_eq!(names.len(), KEEP_PACKAGES, "{names:?}");
+        assert!(names.contains(&report.package_name));
+        assert!(!names.contains(&old_package_name(0)), "删的是最旧的 5 份");
+    }
+
+    #[test]
+    fn prune_failure_does_not_fail_the_export() {
+        let temp = TempDir::new("export-prune-failure");
+        let agent = temp.path().join("agent");
+        let store_root = temp.path().join("cloud");
+        let app_data = temp.path().join("data");
+        fixture_agent(&agent);
+        // 名字像包、实际是目录：删不掉，于是清理失败但不阻塞导出。
+        let stuck = old_package_name(0);
+        fs::create_dir_all(store_root.join(&stuck)).expect("创建删不掉的包");
+        for index in 1..24 {
+            write_file(&store_root.join(old_package_name(index)), "old");
+        }
+
+        let (report, pruned) = export(
+            &LocalStore::new(store_root.clone()),
+            &agent,
+            &app_data,
+            SourceVersions::default(),
+        )
+        .expect("清理失败不阻塞导出");
+
+        assert_eq!(pruned.pruned.len(), 4);
+        assert_eq!(pruned.failed.len(), 1);
+        assert_eq!(pruned.failed[0].0, stuck);
+        assert!(!pruned.failed[0].1.is_empty());
+        assert!(store_root.join(&stuck).is_dir(), "删不掉的那份不动");
+        assert!(store_root.join(&report.package_name).is_file());
     }
 
     #[test]

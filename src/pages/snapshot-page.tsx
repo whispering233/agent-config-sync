@@ -428,6 +428,8 @@ export function SnapshotPage() {
       setDownloaded({ kind: 'done', view });
       // 后面的检查与应用都针对这份暂存快照，不再指向同步文件夹。
       setPlanRoot(view.stagingRoot);
+      // 下载写了本机记录：列表里的「云端有 N 份未见」与上次同步时间要跟着刷新。
+      void loadPackages();
       await runCheck(view.stagingRoot);
     } catch (error) {
       // 取包失败带设计里的码（远端空、包被删、地址不安全等），原样展示给用户。
@@ -1277,6 +1279,18 @@ function DownloadResult({ view }: { view: RemoteDownload }) {
   );
 }
 
+/** 对比按钮的文案：对比中、还没勾选、已勾选 N 份，三种状态各一句。 */
+function compareButtonLabel(comparing: boolean, picked: number): string {
+  if (comparing) {
+    return '对比中…';
+  }
+  if (picked === 0) {
+    return '对比';
+  }
+
+  return `对比选中的 ${picked} 份`;
+}
+
 /**
  * 历史包列表：本地文件夹与 WebDAV 共用，差别只在标题、空列表文案与是否展示云端状态。
  *
@@ -1378,11 +1392,7 @@ function PackageListBlock({
               onClick={onCompare}
               disabled={comparing || comparePicked.length === 0}
             >
-              {comparing
-                ? '对比中…'
-                : comparePicked.length === 0
-                  ? '对比'
-                  : `对比选中的 ${comparePicked.length} 份`}
+              {compareButtonLabel(comparing, comparePicked.length)}
             </Button>
             <span className="text-xs text-muted-foreground">
               先勾选候选包，再看应用它会发生什么。对比只读，不会改动你的配置或云端。
@@ -1481,12 +1491,7 @@ function CompareTable({
                 <td className="py-sm pr-md whitespace-nowrap text-xs text-muted-foreground">
                   {packageTime(row.createdAt)}
                 </td>
-                {row.error !== null ? (
-                  <td colSpan={4} className="py-sm pr-md text-xs text-danger">
-                    <code className="mr-xs font-mono">[{row.error.code}]</code>
-                    {row.error.message}
-                  </td>
-                ) : (
+                {row.error === null ? (
                   <>
                     <td className="py-sm pr-md text-foreground">{row.added ?? 0}</td>
                     <td className="py-sm pr-md text-foreground">{row.modified ?? 0}</td>
@@ -1508,6 +1513,11 @@ function CompareTable({
                     </td>
                     <td className="py-sm pr-md text-foreground">{row.unchanged ?? 0}</td>
                   </>
+                ) : (
+                  <td colSpan={4} className="py-sm pr-md text-xs text-danger">
+                    <code className="mr-xs font-mono">[{row.error.code}]</code>
+                    {row.error.message}
+                  </td>
                 )}
                 <td className="py-sm">
                   <Button

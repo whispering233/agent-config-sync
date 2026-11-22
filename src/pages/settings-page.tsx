@@ -942,6 +942,25 @@ function probeNote(probe: WebdavProbe): ProbeNote {
 }
 
 /**
+ * 明文 http 指向非本机地址：执行时会被以 `remote_insecure` 硬拒，保存时先给一条可见提示。
+ * 判定与后端 `credentials::is_secure_url` 同一套：HTTPS，或本机回环的 http。
+ */
+function isPlainHttpToRemote(url: string): boolean {
+  const trimmed = url.trim();
+  if (!trimmed.startsWith('http://')) {
+    return false;
+  }
+  // host 在第一个分隔符之前；丢掉 userinfo、端口与 IPv6 的方括号。
+  const authority = trimmed.slice('http://'.length).split(/[/?#]/)[0] ?? '';
+  const hostPort = authority.split('@').pop() ?? '';
+  const host = (
+    hostPort.startsWith('[') ? hostPort.split(']')[0].slice(1) : hostPort.split(':')[0]
+  ).toLowerCase();
+
+  return host !== 'localhost' && host !== '127.0.0.1' && host !== '::1';
+}
+
+/**
  * 凭据单独保存：它不参与配置校验，也不进快照。
  * 密码永远是空白输入框，只在输入非空时覆盖已保存的值。
  */
@@ -1069,7 +1088,7 @@ function WebdavCard() {
         <Field
           id="webdav-url"
           label="服务地址"
-          hint="只接受 http:// 或 https://；应用会在该地址下建 PiAgentSync/ 目录。"
+          hint="只接受 HTTPS；本机回环地址（localhost / 127.0.0.1 / ::1）可以用 http。应用会在该地址下建 PiAgentSync/ 目录。"
         >
           <div className="mt-sm flex gap-sm">
             <Input
@@ -1088,6 +1107,11 @@ function WebdavCard() {
               坚果云
             </Button>
           </div>
+          {isPlainHttpToRemote(form.url) && (
+            <p className="mt-xs text-sm text-warning">
+              非本机地址不能用 http：明文会把凭据与快照暴露在网络上，执行上传/下载时会直接拒绝。
+            </p>
+          )}
         </Field>
 
         <Field

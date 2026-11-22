@@ -6,15 +6,12 @@
 use crate::credentials;
 use crate::package;
 use crate::remote_state::{self, RemoteState};
-use crate::snapshot::{self, SourceVersions};
-use crate::store::{PackageStore, WebdavStore};
+use crate::snapshot::{self, SourceVersions, KEEP_PACKAGES};
+use crate::store::{PackageStore, PruneOutcome, WebdavStore};
 use crate::webdav::{ReqwestTransport, WebdavClient};
 use serde::Serialize;
 use std::path::Path;
 use tauri::Manager;
-
-/// 远端保留份数（硬编码，不做配置项）。
-pub const KEEP_PACKAGES: usize = 20;
 
 /// 一次上传的结果，按包语义描述。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -65,15 +62,23 @@ pub struct UploadOutcome {
 }
 
 impl UploadView {
-    /// 本地文件夹模式的「上传」没有远端可言：只有导出结论，没有清理。
-    pub fn from_export(report: snapshot::ExportReport) -> Self {
+    /// 本地文件夹模式的「上传」没有远端可言：导出结论与保留清理结果。
+    pub fn from_export(report: snapshot::ExportReport, prune: PruneOutcome) -> Self {
         Self {
             package: report.package_name,
             unchanged: report.unchanged,
-            pruned: Vec::new(),
-            prune_failed: Vec::new(),
+            pruned: prune.pruned,
+            prune_failed: prune_failures(prune.failed),
         }
     }
+}
+
+/// 清理失败的份过 IPC 前换成带名字的结构：整个清理动作失败时 `name` 为空。
+fn prune_failures(failed: Vec<(String, String)>) -> Vec<PruneFailure> {
+    failed
+        .into_iter()
+        .map(|(name, reason)| PruneFailure { name, reason })
+        .collect()
 }
 
 /// WebDAV 上传全流程：HTTPS 门槛 → 导出成包 → 内容未变则跳过 → 原子放入 → 重新列举 →
@@ -124,7 +129,9 @@ pub fn upload_to_webdav(
             .count();
         let next = RemoteState {
             seen_at: snapshot::format_timestamp(snapshot::now_seconds()),
-            packages,
+            // 集合原样留着：把它刷成「远端现有」就等于把这次发现的差异记成见过了，
+            // `unseen` 下次归零、`diverged` 只亮一个周期，用户再也看不到提醒。
+            packages: state.packages.clone(),
             // 这次没上传：上次上传的指纹原样留着，下次比对仍以它为准。
             last_uploaded_fingerprint: state.last_uploaded_fingerprint.clone(),
         };
@@ -148,14 +155,7 @@ pub fn upload_to_webdav(
 
     let fingerprint = stored.manifest.fingerprint.clone();
     let (pruned, prune_failed) = match store.prune(KEEP_PACKAGES, &stored.name) {
-        Ok(outcome) => (
-            outcome.pruned,
-            outcome
-                .failed
-                .into_iter()
-                .map(|(name, reason)| PruneFailure { name, reason })
-                .collect(),
-        ),
+        Ok(outcome) => (outcome.pruned, prune_failures(outcome.failed)),
         // 包已经在远端了：清理失败只单独上报，不改判成上传失败。
         Err(error) => (
             Vec::new(),
@@ -665,11 +665,12 @@ mod tests {
             vec!["PROPFIND"],
             "内容未变只列一次远端"
         );
-        assert_eq!(outcome.unseen, 0);
-        // 远端已空：展示名无处可取，记录里的集合仍要跟着变。
-        assert_eq!(outcome.view.package, "");
+        assert_eq!(outcome.unseen, 0, "远端已空：没有本机未见的新包");
         let after = fixture.state();
-        assert!(after.packages.is_empty());
+        assert_eq!(
+            after.packages, before.packages,
+            "只推进时间：集合只由用户主动动作推进"
+        );
         assert_eq!(
             after.last_uploaded_fingerprint, before.last_uploaded_fingerprint,
             "只跳过上传：上次上传的指纹原样留着"
@@ -702,7 +703,11 @@ mod tests {
         assert!(outcome.view.unchanged);
         assert_eq!(outcome.unseen, 1, "另一台机器的包要算进来");
         let state = fixture.state();
-        assert!(state.packages.contains(&pushed));
+        assert_eq!(
+            state.packages,
+            vec![first.view.package.clone()],
+            "集合不动：后台把它记成见过就再也报不出 diverged"
+        );
         assert_eq!(
             state.last_uploaded_fingerprint, fingerprint,
             "只跳过上传：上次上传的指纹原样留着"

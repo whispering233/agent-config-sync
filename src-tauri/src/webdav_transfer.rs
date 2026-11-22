@@ -11,6 +11,7 @@ use crate::platform;
 use crate::remote_state::{self, RemoteState};
 use crate::snapshot::{self, Manifest};
 use crate::store::{PackageStore, StoreError};
+use crate::webdav::{self, DavError, DavTransport, ProbeOutcome, WebdavClient};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,8 @@ pub const STAGING_DIR_NAME: &str = "staging";
 pub const COMPARE_DIR_NAME: &str = "compare";
 /// 暂存目录权限：快照可能含明文密钥，只允许本用户读写。
 const STAGING_DIR_MODE: u32 = 0o700;
+/// 解包临时落点的名字前缀：在暂存根下，成功后才改名成常驻暂存。
+const STAGING_LANDING_PREFIX: &str = ".incoming-";
 
 /// 一份已取到本机的包。`staging_root` 顶替同步根，交给计划与应用复用。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,6 +308,24 @@ pub fn cleanup_from_webdav(
     cleanup_temp_files(store)
 }
 
+/// 连接探测（设置页「测试连接」）：HTTPS 门槛 → PROPFIND + 写测试文件 → 结论。
+///
+/// 探测会 PROPFIND、PUT、DELETE，Basic 凭据明文出网；门槛放在最前，非 HTTPS 时一个请求都不发。
+/// 与其它远端入口一样，只看服务地址，不看本次快照是否含 `auth.json`。
+pub fn probe_connection<T: DavTransport>(
+    client: &WebdavClient<T>,
+    endpoint: &str,
+) -> Result<ProbeOutcome, DavError> {
+    if !credentials::is_secure_url(endpoint) {
+        // 门槛失败没有对应的协议错误码：这句话就是设置页要显示的全部。
+        return Err(DavError::Other(
+            "WebDAV 地址必须是 HTTPS（本机回环地址例外），否则拒绝测试连接".to_string(),
+        ));
+    }
+
+    webdav::probe(client)
+}
+
 /// 取包到本机暂存：列举 → 选包（缺省取名字最大的一份）→ 取 → 解到 `staging/<包名>/` → 只留这一份。
 ///
 /// 本地文件夹与 WebDAV 共用这一条链路，只换 [`PackageStore`] 实现。选中的包不在列表里
@@ -355,23 +376,45 @@ pub fn stage_package(
         )
     })?;
     let target = root.join(&chosen.name);
-    // 重新取同一份包时旧暂存还在，而解包拒绝已存在的落点：先整份删掉再解。
-    if target.symlink_metadata().is_ok() {
-        remove_path(&target)?;
+    // 重新取同一份包时 `target` 就是当前常驻暂存：先解到临时落点，取包或解包失败时它还原封不动。
+    let landing = root.join(format!("{STAGING_LANDING_PREFIX}{}", chosen.name));
+    // 上一次中断可能留下半套解包，而解包拒绝已存在的落点。
+    if landing.symlink_metadata().is_ok() {
+        let _ = remove_path(&landing);
     }
 
-    let size = fetch_into(store, &root, &chosen.name, &target)?;
-    // 暂存常驻只保留当前这一份：更早的解包结果已经不可能被应用。
-    prune_staging(app_data, &target);
-
-    let manifest = match read_staged_manifest(&target) {
-        Ok(manifest) => manifest,
-        // 不认识 manifest 的暂存交给计划也只会白跑：删掉，别让它冒充一份可用快照。
+    let size = match fetch_into(store, &root, &chosen.name, &landing) {
+        Ok(size) => size,
         Err(failure) => {
-            let _ = fs::remove_dir_all(&target);
+            let _ = remove_path(&landing);
             return Err(failure);
         }
     };
+    let manifest = match read_staged_manifest(&landing) {
+        Ok(manifest) => manifest,
+        // 不认识 manifest 的暂存交给计划也只会白跑：删掉新的那份，别让它冒充一份可用快照。
+        Err(failure) => {
+            let _ = remove_path(&landing);
+            return Err(failure);
+        }
+    };
+
+    // 新的一份已完整落盘：这时才顶替常驻暂存，中途失败都还留着上一份。
+    if target.symlink_metadata().is_ok() {
+        if let Err(failure) = remove_path(&target) {
+            let _ = remove_path(&landing);
+            return Err(failure);
+        }
+    }
+    if let Err(error) = fs::rename(&landing, &target) {
+        let _ = remove_path(&landing);
+        return Err(DownloadFailure::new(
+            "no_write_permission",
+            format!("无法把新解包结果换到 {}：{error}", target.display()),
+        ));
+    }
+    // 暂存常驻只保留当前这一份：更早的解包结果已经不可能被应用。
+    prune_staging(app_data, &target);
     Ok(StagedPackage {
         package_name: chosen.name.clone(),
         size,
@@ -901,6 +944,45 @@ mod tests {
         let again = stage_package(&store, &app_data, Some(older)).expect("重复取同一份");
         assert_eq!(again.staging_root, staged.staging_root);
         assert_eq!(staging_entries(&app_data), vec![older.to_string()]);
+    }
+
+    /// 探测要写测试文件、删测试文件：非 HTTPS 时这些东西一个都不该发生。
+    #[test]
+    fn probe_refuses_a_non_https_endpoint_without_sending_a_request() {
+        let remote = FakeDav::new();
+        let client = WebdavClient::new(remote.clone(), "http://dav.example.com/dav");
+
+        let error =
+            probe_connection(&client, "http://dav.example.com/dav").expect_err("非 HTTPS 必须拒绝");
+
+        assert!(error.to_string().contains("HTTPS"), "{error}");
+        assert!(
+            remote.methods().is_empty(),
+            "门槛在最前：一个请求都不该发出"
+        );
+    }
+
+    #[test]
+    fn failed_fetch_keeps_the_resident_staging_untouched() {
+        let temp = TempDir::new("stage-keep");
+        let store_root = temp.path().join("cloud");
+        let app_data = temp.path().join("data");
+        let name = "20261122-105230-deadbeef.zip";
+        let archive = write_package(&store_root, name, &[("settings.json", "{\"v\":2}")]);
+        let store = LocalStore::new(store_root);
+        let staged = stage_package(&store, &app_data, None).expect("先取一份");
+
+        // 同一份包再取一次，但这次字节坏了：常驻的那份必须原封不动地留着。
+        fs::write(&archive, b"not a zip at all").expect("替换成坏字节");
+        let error = stage_package(&store, &app_data, None).expect_err("坏包必须报错");
+
+        assert_eq!(error.code, "package_corrupt", "{}", error.message);
+        assert_eq!(staging_entries(&app_data), vec![name.to_string()]);
+        assert_eq!(
+            fs::read_to_string(staged.staging_root.join("snapshot/settings.json")).unwrap(),
+            "{\"v\":2}",
+            "取包失败不该把上一份可用暂存也带走"
+        );
     }
 
     #[test]

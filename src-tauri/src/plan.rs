@@ -9,6 +9,7 @@
 use crate::config;
 use crate::doctor::{self, CommandOutcome, CommandRunner, ShellRunner, Version, PROBE_TIMEOUT};
 use crate::platform::{HostOs, ProgramPath};
+use crate::runtime;
 use crate::scope::{self, EntryKind};
 use crate::snapshot::{
     self, Manifest, ManifestFile, Requirements, SourceInfo, FORMAT_VERSION, MANIFEST_FILE_NAME,
@@ -731,9 +732,13 @@ pub async fn verify_and_plan(
     app: AppHandle,
     root: Option<String>,
 ) -> Result<PlanReport, PlanFailure> {
-    tauri::async_runtime::spawn_blocking(move || probe(&app, root))
-        .await
-        .map_err(|error| PlanFailure::new("plan_failed", format!("检查失败：{error}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        // 与上传/下载/应用/回滚共用一把锁：计划要读暂存目录，而取包成功后会清掉旧暂存。
+        let _guard = runtime::lock_operation();
+        probe(&app, root)
+    })
+    .await
+    .map_err(|error| PlanFailure::new("plan_failed", format!("检查失败：{error}")))?
 }
 
 #[cfg(test)]
