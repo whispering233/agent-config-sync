@@ -638,6 +638,9 @@ export function SnapshotPage() {
           <p className="mt-xs text-sm text-muted-foreground">
             上传会把当前配置打成一个快照包放到云端，并按名字保留最近 20 份；下载在下面的「远端快照」里选一份，解到本机暂存目录后走后面的检查与应用。
           </p>
+          <p className="mt-xs text-xs text-warning">
+            超出 20 份的旧包会从云端删除。云端只增不改，但删除是真的删除。
+          </p>
 
           <div className="mt-md flex flex-wrap items-center gap-md">
             <Button onClick={() => void runUpload()} disabled={!canUpload}>
@@ -660,19 +663,32 @@ export function SnapshotPage() {
       )}
 
       {!isWebdav && (
-        <div className="flex flex-wrap items-center gap-md">
-          <Button onClick={() => void runExport()} disabled={!canExport}>
-            {exporting ? '导出中…' : '导出快照'}
-          </Button>
-          {!isDesktop && (
-            <span className="text-sm text-muted-foreground">导出仅桌面版可用</span>
-          )}
-          {exporting && (
-            <span className="text-sm text-muted-foreground" aria-live="polite">
-              正在收集配置、扫描明文密钥并打包…
+        <Card className="p-lg">
+          <h2 className="text-sm font-semibold text-foreground">导出快照包</h2>
+          <p className="mt-xs text-sm text-muted-foreground">
+            导出会把当前配置打成一个快照包放进上面的同步文件夹，并按名字保留最近 20 份；另一台机器指向同一个文件夹后，在下面的列表里选一份检查并应用。
+          </p>
+          <p className="mt-xs flex items-start gap-sm text-xs text-warning">
+            <TriangleAlert className="mt-xs h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            <span>
+              超出 20 份的旧包会被删除，而这是同步文件夹里的真实删除：云盘会把它同步到其它机器，那些机器上的同一份包也会消失。需要长期留着的一份，请先复制到同步文件夹以外的地方。
             </span>
-          )}
-        </div>
+          </p>
+
+          <div className="mt-md flex flex-wrap items-center gap-md">
+            <Button onClick={() => void runExport()} disabled={!canExport}>
+              {exporting ? '导出中…' : '导出快照'}
+            </Button>
+            {!isDesktop && (
+              <span className="text-sm text-muted-foreground">导出仅桌面版可用</span>
+            )}
+            {exporting && (
+              <span className="text-sm text-muted-foreground" aria-live="polite">
+                正在收集配置、扫描明文密钥并打包…
+              </span>
+            )}
+          </div>
+        </Card>
       )}
 
       {isWebdav && (
