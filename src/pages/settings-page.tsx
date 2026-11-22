@@ -508,7 +508,7 @@ const autoSyncStateText: Record<AutoSyncStatus['state'], string> = {
   idle: '等待下次自动上行',
   running: '正在上传…',
   success: '已上传',
-  conflict: '云端有更新，已停止',
+  diverged: '已上传（云端有新快照）',
   failed: '失败',
   skipped: '本次跳过',
   paused: '已暂停',

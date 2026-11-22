@@ -104,7 +104,7 @@ pub fn update_tooltip(app: &AppHandle, status: &AutoSyncStatus) {
     let label = match status.state {
         "running" => "正在同步",
         "success" => "同步完成",
-        "conflict" => "云端有更新",
+        "diverged" => "云端有新快照",
         "failed" => "同步失败",
         "paused" => "自动同步已暂停",
         "skipped" => "自动同步已跳过",

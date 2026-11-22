@@ -4,9 +4,6 @@
 //! `docs/design/40-webdav.md` 第 4、5 节。包名解析与 `.tmp-` 约定复用 [`crate::package`]：
 //! 这一层不重判包名，也不认识 manifest 与快照内容。
 
-// 这一层的调用方是导出与上传流程，还没接上；在那之前整层只由下面的测试引用。
-#![allow(dead_code)]
-
 use crate::package::{self, TEMP_NAME_PREFIX};
 use crate::platform;
 use crate::webdav::{DavError, DavTransport, RenameOutcome, WebdavClient};
@@ -96,9 +93,12 @@ impl std::error::Error for StoreError {}
 pub trait PackageStore {
     fn list(&self) -> Result<StoreListing, StoreError>;
     /// 包不存在返回 `Ok(None)`：它不是错误。
+    // 取包与单独删包只有下载与显式清理会用；它们属于同一套存储面，不在上传这一条链上。
+    #[allow(dead_code)]
     fn get(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError>;
     /// 原子定案：先写临时名，再改名到正式名。失败时清掉自己写的临时名。
     fn put(&self, name: &str, bytes: &[u8]) -> Result<(), StoreError>;
+    #[allow(dead_code)]
     fn delete(&self, name: &str) -> Result<(), StoreError>;
     fn prune(&self, keep: usize, current: &str) -> Result<PruneOutcome, StoreError>;
 }

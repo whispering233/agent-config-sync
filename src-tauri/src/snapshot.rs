@@ -4,8 +4,8 @@
 //! 顺序固定为：预检 → 物化到工作区 → 只读密钥扫描 → 打成 zip → 经存储原子放入。
 //! 任一步失败都删掉工作区，存储里已存在的包不受影响。
 //!
-//! `export_snapshot` 是 command 层入口；核心逻辑 [`export`] 只碰文件系统、给定的版本号
-//! 与本地存储根，可直接用临时目录单测。
+//! `export_snapshot` 是 command 层入口；核心逻辑 [`export`] / [`pack_and_store`] 只碰文件系统、
+//! 给定的版本号与一个包存储，可直接用临时目录与假存储单测。
 
 use crate::config::{self, AGENT_DIR_ENV_VAR};
 use crate::doctor::{self, ShellRunner};
@@ -172,6 +172,28 @@ pub fn export_fixture(agent_dir: &Path, sync_root: &Path) -> Result<(), ExportFa
     })
 }
 
+/// 一次打包的产物：写进存储的包名、体积，以及生成它的 manifest。
+pub struct StoredPackage {
+    pub name: String,
+    pub size: u64,
+    pub manifest: Manifest,
+}
+
+impl StoredPackage {
+    /// 本次真的写了一个新包。
+    fn into_report(self) -> ExportReport {
+        ExportReport {
+            unchanged: false,
+            package_name: self.name,
+            size: self.size,
+            files: self.manifest.files.len(),
+            fingerprint: self.manifest.fingerprint,
+            created_at: self.manifest.created_at,
+            plaintext_secrets: self.manifest.plaintext_secrets,
+        }
+    }
+}
+
 /// 导出成包并放进存储根：先物化到本机工作区，打成 zip，再经存储的原子放入定案。
 ///
 /// 内容未变（存储里最新包的完整指纹与本机这次要产出的相同）时不写新包，返回那份已存在的包：
@@ -184,34 +206,58 @@ pub fn export(
 ) -> Result<ExportReport, ExportFailure> {
     precheck(agent_dir, store.root())?;
 
+    // 本地模式的比对基准要读最新包的 manifest：包就在本机，读它不额外花销。
+    let existing = newest_package(store);
+    let baseline = existing.as_ref().map(|report| report.fingerprint.as_str());
+
+    match pack_and_store(store, baseline, agent_dir, app_data, versions, true)? {
+        Some(stored) => Ok(stored.into_report()),
+        // 只有与 `existing` 的指纹相同时才会是 `None`，因此它必然是一份完整报告。
+        None => existing
+            .ok_or_else(|| ExportFailure::new("export_failed", "内容比对基准已失效，请重新导出")),
+    }
+}
+
+/// 打包并原子放入存储。`baseline` 是调用方给的「上次已交付内容」的完整指纹：与本次相同就
+/// 不写新包，返回 `None`。
+///
+/// 基准由调用方注入，是因为 WebDAV 模式下最新包在远端：为了比对而下载整包不合算，那里改用
+/// 本机记录的 `lastUploadedFingerprint`。
+pub fn pack_and_store(
+    store: &dyn PackageStore,
+    baseline: Option<&str>,
+    agent_dir: &Path,
+    app_data: &Path,
+    versions: SourceVersions,
+    include_auth: bool,
+) -> Result<Option<StoredPackage>, ExportFailure> {
     let workspace = prepare_workspace(app_data)?;
-    let result = pack_and_store(store, &workspace, agent_dir, versions);
+    let result = pack_into_store(
+        store,
+        baseline,
+        &workspace,
+        agent_dir,
+        versions,
+        include_auth,
+    );
     // 工作区只是本次导出的中间产物：内容已经在包里，成功失败都不留。
     let _ = fs::remove_dir_all(&workspace);
     result
 }
 
-fn pack_and_store(
-    store: &LocalStore,
+fn pack_into_store(
+    store: &dyn PackageStore,
+    baseline: Option<&str>,
     workspace: &Path,
     agent_dir: &Path,
     versions: SourceVersions,
-) -> Result<ExportReport, ExportFailure> {
+    include_auth: bool,
+) -> Result<Option<StoredPackage>, ExportFailure> {
     let snapshot_dir = workspace.join(SNAPSHOT_DIR_NAME);
-    let (manifest, plaintext_secrets) = collect_into(&snapshot_dir, agent_dir, &versions, true)?;
+    let (manifest, _) = collect_into(&snapshot_dir, agent_dir, &versions, include_auth)?;
 
-    if let Some((name, size, existing)) = newest_package(store) {
-        if existing.fingerprint == manifest.fingerprint {
-            return Ok(ExportReport {
-                unchanged: true,
-                package_name: name,
-                size,
-                files: existing.files.len(),
-                fingerprint: existing.fingerprint,
-                created_at: existing.created_at,
-                plaintext_secrets: existing.plaintext_secrets,
-            });
-        }
+    if baseline.is_some_and(|fingerprint| fingerprint == manifest.fingerprint) {
+        return Ok(None);
     }
 
     // 打包前自检一次：manifest 与快照内容是分头产出的，错位时宁可不落包。
@@ -228,22 +274,19 @@ fn pack_and_store(
         .put(&name, &bytes)
         .map_err(|error| ExportFailure::new(error.code, error.message))?;
 
-    Ok(ExportReport {
-        unchanged: false,
-        package_name: name,
+    Ok(Some(StoredPackage {
+        name,
         size: bytes.len() as u64,
-        files: manifest.files.len(),
-        fingerprint: manifest.fingerprint,
-        created_at: manifest.created_at,
-        plaintext_secrets,
-    })
+        manifest,
+    }))
 }
 
-/// 存储里名字最大的可解析包与它的 manifest。名字大小只用来挑默认项，不当安全判定。
+/// 存储里名字最大的可解析包，按「内容未变」的报告形状返回。名字大小只用来挑默认项，
+/// 不当安全判定。
 ///
 /// 读不出来（例如云盘还没传完的半包）就当没有可比对的基准：让这次导出照常写新包，
 /// 坏包留给用户显式清理，而不是让一份残留把导出永久卡住。
-fn newest_package(store: &LocalStore) -> Option<(String, u64, Manifest)> {
+fn newest_package(store: &LocalStore) -> Option<ExportReport> {
     let listing = store.list().ok()?;
     let newest = listing
         .packages
@@ -252,7 +295,15 @@ fn newest_package(store: &LocalStore) -> Option<(String, u64, Manifest)> {
     let bytes = package::read_manifest(&store.root().join(&newest.name)).ok()?;
     let manifest = parse_manifest(&bytes).ok()?;
 
-    Some((newest.name, newest.size, manifest))
+    Some(ExportReport {
+        unchanged: true,
+        package_name: newest.name,
+        size: newest.size,
+        files: manifest.files.len(),
+        fingerprint: manifest.fingerprint,
+        created_at: manifest.created_at,
+        plaintext_secrets: manifest.plaintext_secrets,
+    })
 }
 
 /// 解析包里的 manifest。版本单独先看：结构不认识时要报「版本不支持」而不是「文件损坏」。
@@ -573,7 +624,7 @@ fn kind_for(relative: &Path, bytes: &[u8]) -> &'static str {
     }
 }
 
-fn now_seconds() -> u64 {
+pub(crate) fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
@@ -649,10 +700,15 @@ pub async fn export_snapshot(app: tauri::AppHandle) -> Result<ExportReport, Expo
         .map_err(|error| ExportFailure::new("export_failed", format!("导出失败：{error}")))?
 }
 
-/// 本地文件夹模式的上传与导出共用这一条链路：两者都是「把 live 导出成包放进存储根」。
-pub fn export_to_local_store(app: &tauri::AppHandle) -> Result<ExportReport, ExportFailure> {
-    // 与自动上行、应用/回滚共用一把锁：导出会重建工作区，不能两份同时跑。
-    let _guard = crate::runtime::lock_operation();
+/// 一次导出需要的本机上下文：应用数据目录（工作区与状态文件）、宿主目录与来源版本。
+pub struct ExportContext {
+    pub app_data: PathBuf,
+    pub agent_dir: PathBuf,
+    pub versions: SourceVersions,
+}
+
+/// 解析导出上下文。宿主目录决定采集范围，版本只作来源记录。
+pub fn export_context(app: &tauri::AppHandle) -> Result<ExportContext, ExportFailure> {
     let config_dir = app.path().app_config_dir().map_err(|error| {
         ExportFailure::new(
             "app_config_unavailable",
@@ -661,13 +717,6 @@ pub fn export_to_local_store(app: &tauri::AppHandle) -> Result<ExportReport, Exp
     })?;
     let config = config::load_config(&config_dir)
         .map_err(|error| ExportFailure::new("app_config_unavailable", error.to_string()))?;
-
-    let sync_root = config.sync_root.clone().ok_or_else(|| {
-        ExportFailure::new(
-            "sync_root_missing",
-            "还没有设置同步文件夹，请先在设置页选择",
-        )
-    })?;
     let app_data = app.path().app_data_dir().map_err(|error| {
         ExportFailure::new(
             "app_data_unavailable",
@@ -691,11 +740,39 @@ pub fn export_to_local_store(app: &tauri::AppHandle) -> Result<ExportReport, Exp
         HostOs::current(),
     );
 
+    Ok(ExportContext {
+        app_data,
+        agent_dir,
+        versions: SourceVersions { pi, node },
+    })
+}
+
+/// 本地文件夹模式的上传与导出共用这一条链路：两者都是「把 live 导出成包放进存储根」。
+pub fn export_to_local_store(app: &tauri::AppHandle) -> Result<ExportReport, ExportFailure> {
+    // 与自动上行、应用/回滚共用一把锁：导出会重建工作区，不能两份同时跑。
+    let _guard = crate::runtime::lock_operation();
+    let config_dir = app.path().app_config_dir().map_err(|error| {
+        ExportFailure::new(
+            "app_config_unavailable",
+            format!("无法定位应用配置目录：{error}"),
+        )
+    })?;
+    let config = config::load_config(&config_dir)
+        .map_err(|error| ExportFailure::new("app_config_unavailable", error.to_string()))?;
+
+    let sync_root = config.sync_root.clone().ok_or_else(|| {
+        ExportFailure::new(
+            "sync_root_missing",
+            "还没有设置同步文件夹，请先在设置页选择",
+        )
+    })?;
+    let context = export_context(app)?;
+
     export(
         &LocalStore::new(sync_root),
-        &agent_dir,
-        &app_data,
-        SourceVersions { pi, node },
+        &context.agent_dir,
+        &context.app_data,
+        context.versions,
     )
 }
 

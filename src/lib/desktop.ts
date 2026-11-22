@@ -121,9 +121,21 @@ export type SnapshotExport = {
   plaintextSecrets: boolean;
 };
 
-/** 把当前配置导出成快照包，放进存储根（本地文件夹模式下即同步文件夹）。 */
-export function uploadSnapshot(): Promise<SnapshotExport> {
-  return invoke<SnapshotExport>('upload_snapshot');
+/** 与 Rust 侧 `UploadView` 一一对应：一次上传的包语义结果。 */
+export type UploadResult = {
+  /** 上传的包名；内容未变时是上次上传的那份。 */
+  package: string;
+  /** 内容与上次上传相同：没有写新包、没动远端。 */
+  unchanged: boolean;
+  /** 本次清理掉的旧包名。 */
+  pruned: string[];
+  /** 清理失败的份：不阻塞上传成功。`name` 为空表示整个清理动作失败。 */
+  pruneFailed: { name: string; reason: string }[];
+};
+
+/** 把当前配置导出成一个快照包，WebDAV 模式下同时上传并清理旧包。 */
+export function uploadSnapshot(): Promise<UploadResult> {
+  return invoke<UploadResult>('upload_snapshot');
 }
 
 /** 与 Rust 侧 `AutoSyncStatus` 一一对应。`state` 是有限状态机，不是自由文本。 */
@@ -131,7 +143,7 @@ export type AutoSyncState =
   | 'idle'
   | 'running'
   | 'success'
-  | 'conflict'
+  | 'diverged'
   | 'failed'
   | 'skipped'
   | 'paused';

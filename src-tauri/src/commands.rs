@@ -6,8 +6,9 @@ use crate::config::{
 };
 use crate::credentials::{self, CredentialError, WebdavCredentials};
 use crate::runtime;
-use crate::snapshot::{self, ExportReport};
+use crate::snapshot;
 use crate::store::{LocalStore, PackageStore};
+use crate::upload::{self, UploadFailure, UploadView};
 use crate::webdav::{self, DavError, ReqwestTransport, WebdavClient};
 use crate::webdav_transfer;
 use std::path::{Path, PathBuf};
@@ -175,11 +176,14 @@ fn app_config(app: &AppHandle) -> Result<AppConfig, String> {
     config::load_config(&config_dir).map_err(|error| error.to_string())
 }
 
-/// 本地文件夹模式的存储根。WebDAV 模式在这里就被挡下，两个方向都不会退到旧链路。
+/// WebDAV 侧目前只接上了上传：列举与取包仍走本地存储根，WebDAV 模式明确报错。
+const REMOTE_DOWNLOAD_NOT_READY: &str = "WebDAV 模式暂时只能上传：取包请先用本地文件夹模式";
+
+/// 本地文件夹模式的存储根。WebDAV 模式在这里就被挡下：下载只走本地存储根。
 fn local_store(app: &AppHandle) -> Result<LocalStore, String> {
     let config = app_config(app)?;
     if config.transport != Transport::Local {
-        return Err(webdav_transfer::REMOTE_NOT_READY_MESSAGE.to_string());
+        return Err(REMOTE_DOWNLOAD_NOT_READY.to_string());
     }
     let root = config
         .sync_root
@@ -274,41 +278,27 @@ pub async fn download_remote_snapshot(
     .map_err(|error| format!("取快照包失败：{error}"))?
 }
 
-/// 上传失败。码沿用 `10-snapshot-sync.md` §9 的失败码表。
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UploadFailure {
-    code: &'static str,
-    message: String,
-}
-
-/// 本地文件夹模式的「上传」= 导出成包放进存储根（由云盘客户端负责搬运）；
-/// WebDAV 模式沿用同一个失败形状，只是先停在这里。
+/// 上传：本地模式把 live 导出成包放进存储根（由云盘客户端负责搬运）；WebDAV 模式走
+/// [`upload::upload_to_webdav`]，与自动上行同一条链路。
 #[tauri::command]
-pub async fn upload_snapshot(app: AppHandle) -> Result<ExportReport, UploadFailure> {
-    // 导出要遍历、扫描并打包，留在 UI 线程会冻住窗口。
+pub async fn upload_snapshot(app: AppHandle) -> Result<UploadView, UploadFailure> {
+    // 导出要遍历、扫描、打包，留在 UI 线程会冻住窗口。
     tauri::async_runtime::spawn_blocking(move || {
-        let config = app_config(&app).map_err(|message| UploadFailure {
-            code: "app_config_unavailable",
-            message,
-        })?;
-        if config.transport != Transport::Local {
-            return Err(UploadFailure {
-                code: "remote_not_ready",
-                message: webdav_transfer::REMOTE_NOT_READY_MESSAGE.to_string(),
-            });
+        let config = app_config(&app)
+            .map_err(|message| UploadFailure::new("app_config_unavailable", message))?;
+        if config.transport == Transport::Local {
+            let report = snapshot::export_to_local_store(&app)
+                .map_err(|failure| UploadFailure::new(failure.code, failure.message))?;
+            return Ok(UploadView::from_export(report));
         }
 
-        snapshot::export_to_local_store(&app).map_err(|failure| UploadFailure {
-            code: failure.code,
-            message: failure.message,
-        })
+        // 与自动上行、应用/回滚共用一把锁：导出会重建工作区，不能两份同时跑。
+        let _guard = runtime::lock_operation();
+        // 手动上传是用户显式动作：按设计包含根级 auth.json。
+        upload::upload_from_app(&app, true).map(|outcome| outcome.view)
     })
     .await
-    .map_err(|error| UploadFailure {
-        code: "upload_failed",
-        message: format!("上传失败：{error}"),
-    })?
+    .map_err(|error| UploadFailure::new("upload_failed", format!("上传失败：{error}")))?
 }
 
 #[tauri::command]
@@ -437,15 +427,38 @@ mod tests {
     /// 失败码与文案要能过 IPC。
     #[test]
     fn upload_failure_carries_code_and_message() {
-        let failure = UploadFailure {
-            code: "remote_not_ready",
-            message: webdav_transfer::REMOTE_NOT_READY_MESSAGE.to_string(),
-        };
+        let failure = UploadFailure::new("remote_insecure", "WebDAV 地址必须是 HTTPS");
         assert_eq!(
             serde_json::to_value(&failure).unwrap(),
             serde_json::json!({
-                "code": "remote_not_ready",
-                "message": webdav_transfer::REMOTE_NOT_READY_MESSAGE,
+                "code": "remote_insecure",
+                "message": "WebDAV 地址必须是 HTTPS",
+            })
+        );
+    }
+
+    /// 上传结果是包语义：前端按这些字段渲染「已清理 N 份」「有 N 份清理失败」。
+    #[test]
+    fn upload_view_serializes_with_camel_case() {
+        let view = UploadView {
+            package: "20261122-105230-deadbeef.zip".to_string(),
+            unchanged: false,
+            pruned: vec!["20261121-091210-7f3e9c01.zip".to_string()],
+            prune_failed: vec![upload::PruneFailure {
+                name: "20261120-091210-7f3e9c01.zip".to_string(),
+                reason: "远端拒绝删除".to_string(),
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(&view).unwrap(),
+            serde_json::json!({
+                "package": "20261122-105230-deadbeef.zip",
+                "unchanged": false,
+                "pruned": ["20261121-091210-7f3e9c01.zip"],
+                "pruneFailed": [{
+                    "name": "20261120-091210-7f3e9c01.zip",
+                    "reason": "远端拒绝删除",
+                }],
             })
         );
     }

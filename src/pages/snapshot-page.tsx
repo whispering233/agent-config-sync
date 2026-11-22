@@ -12,6 +12,7 @@ import {
   type PackageList,
   type RemoteDownload,
   type SnapshotExport,
+  type UploadResult,
 } from '../lib/desktop';
 import { cn } from '../lib/utils';
 
@@ -156,7 +157,7 @@ type DownloadState =
 type UploadState =
   | { kind: 'idle' }
   | { kind: 'uploading' }
-  | { kind: 'done'; report: SnapshotExport }
+  | { kind: 'done'; result: UploadResult }
   | { kind: 'failed'; message: string };
 
 type ExportState =
@@ -406,8 +407,8 @@ export function SnapshotPage() {
   async function runUpload() {
     setUpload({ kind: 'uploading' });
     try {
-      const report = await uploadSnapshot();
-      setUpload({ kind: 'done', report });
+      const result = await uploadSnapshot();
+      setUpload({ kind: 'done', result });
     } catch (error) {
       const failure = asFailure(error);
       setUpload({
@@ -550,7 +551,7 @@ export function SnapshotPage() {
         <Card className="p-lg">
           <h2 className="text-sm font-semibold text-foreground">WebDAV</h2>
           <p className="mt-xs text-sm text-muted-foreground">
-            快照包的 WebDAV 传输还没有接上：下面两个按钮会明确报错，不会退到逐文件上传。
+            上传会把当前配置打成一个快照包放到云端，并按名字保留最近 20 份；下载还没接上，取包暂时用本地文件夹模式。
           </p>
 
           <div className="mt-md flex flex-wrap items-center gap-md">
@@ -569,7 +570,7 @@ export function SnapshotPage() {
             )}
           </div>
 
-          {upload.kind === 'done' && <ExportResult report={upload.report} />}
+          {upload.kind === 'done' && <UploadResultView result={upload.result} />}
 
           {upload.kind === 'failed' && (
             <p className="mt-md flex items-start gap-sm text-sm text-danger">
@@ -1113,6 +1114,43 @@ function ExportResult({ report }: { report: SnapshotExport }) {
           快照含明文密钥（auth.json 或高危命中）：包在云盘/WebDAV 服务端及其版本历史里可见。
           OAuth 多机共享可能互相失效，切换机器前先应用最新快照。
         </p>
+      )}
+    </>
+  );
+}
+
+/** 上传结果：包名、是否跳过、清理了哪些旧包。 */
+function UploadResultView({ result }: { result: UploadResult }) {
+  return (
+    <>
+      <dl className="mt-md flex flex-col gap-sm">
+        <ResultRow
+          label="快照包"
+          value={result.package === '' ? '—' : result.package}
+          mono
+        />
+      </dl>
+      {result.unchanged && (
+        <p className="mt-sm text-sm text-muted-foreground">
+          跳过（内容未变）：云端已是最新一份，这次没有写新包。
+        </p>
+      )}
+      {result.pruned.length > 0 && (
+        <p className="mt-sm text-sm text-muted-foreground">
+          已清理 {result.pruned.length} 份旧包：{result.pruned.join('、')}
+        </p>
+      )}
+      {result.pruneFailed.length > 0 && (
+        <div className="mt-sm text-sm text-warning">
+          <p>有 {result.pruneFailed.length} 份清理失败（上传已成功，下次上传会重算）：</p>
+          <ul className="mt-xs flex flex-col gap-xs">
+            {result.pruneFailed.map((failure, index) => (
+              <li key={`${failure.name}-${index}`} className="break-all">
+                {failure.name === '' ? '整个清理动作' : failure.name}：{failure.reason}
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
     </>
   );

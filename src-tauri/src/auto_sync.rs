@@ -1,14 +1,14 @@
 //! 托盘常驻时的自动上行。
 //!
 //! 只上行：按配置的间隔把当前 live 导出并上传（默认不传 `auth.json`），不自动下载/应用，
-//! 失败只更新状态，不重试。
+//! 失败只更新状态，不重试。上传本身与手动上传同一条链路（[`crate::upload`]）。
 //!
-//! WebDAV 侧的包上传尚未接上（包只能落到本地存储根），所以这里只报一次可读的失败，
-//! 不退回逐文件链路。
+//! 远端有本机未见的新包时限常上传并报 `diverged`：包名唯一且只增不改，不存在覆盖别人
+//! 的风险，没必要因此停住上行。
 
 use crate::config::{self, AppConfig, Transport};
 use crate::snapshot;
-use crate::webdav_transfer::REMOTE_NOT_READY_MESSAGE;
+use crate::upload::{self, UploadFailure, UploadOutcome};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -30,7 +30,7 @@ static STATUS: LazyLock<Mutex<AutoSyncStatus>> =
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoSyncStatus {
-    /// `idle` / `running` / `success` / `conflict` / `failed` / `skipped` / `paused`
+    /// `idle` / `running` / `success` / `diverged` / `failed` / `skipped` / `paused`
     pub state: &'static str,
     pub message: Option<String>,
     /// 最近一次真正尝试上传的时间；从未尝试过为 `null`。
@@ -131,14 +131,43 @@ pub fn start(app: AppHandle) {
                 );
                 continue;
             };
-            set_status(
-                &app,
-                "failed",
-                Some(REMOTE_NOT_READY_MESSAGE.to_string()),
-                true,
-            );
+
+            let result = upload::upload_from_app(&app, config.auto_sync_include_credentials);
+            let (state, message, stamp) = status_for(&result);
+            set_status(&app, state, Some(message), stamp);
         }
     });
+}
+
+/// 一次上行的结论 → 托盘与设置页看到的状态。只做映射，不做 IO。
+fn status_for(result: &Result<UploadOutcome, UploadFailure>) -> (&'static str, String, bool) {
+    match result {
+        // 内容未变：远端已是最新一份，没有产生新包，也不算失败。
+        Ok(outcome) if outcome.view.unchanged => (
+            "skipped",
+            format!("内容未变，已跳过（{}）", outcome.view.package),
+            false,
+        ),
+        Ok(outcome) => {
+            let mut message = format!("已上传 {}", outcome.view.package);
+            if outcome.unseen > 0 {
+                message.push_str(&format!("；云端有 {} 份本机未见的新快照", outcome.unseen));
+            }
+            if !outcome.view.prune_failed.is_empty() {
+                message.push_str(&format!(
+                    "；{} 份旧包清理失败",
+                    outcome.view.prune_failed.len()
+                ));
+            }
+            let state = if outcome.unseen > 0 {
+                "diverged"
+            } else {
+                "success"
+            };
+            (state, message, true)
+        }
+        Err(failure) => ("failed", failure.message.clone(), true),
+    }
 }
 
 fn config_interval(app: &AppHandle) -> Duration {
@@ -178,4 +207,89 @@ fn now_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::upload::{PruneFailure, UploadView};
+
+    fn view(package: &str, unchanged: bool) -> UploadView {
+        UploadView {
+            package: package.to_string(),
+            unchanged,
+            pruned: Vec::new(),
+            prune_failed: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn unchanged_content_is_reported_as_skipped() {
+        let outcome = UploadOutcome {
+            view: view("20261122-105230-deadbeef.zip", true),
+            unseen: 0,
+        };
+
+        let (state, message, stamp) = status_for(&Ok(outcome));
+
+        assert_eq!(state, "skipped");
+        assert!(message.contains("内容未变"), "{message}");
+        assert!(!stamp, "没有尝试上传就不该刷新上次时间");
+    }
+
+    #[test]
+    fn remote_newer_packages_are_reported_as_diverged() {
+        let outcome = UploadOutcome {
+            view: view("20261122-105230-deadbeef.zip", false),
+            unseen: 2,
+        };
+
+        let (state, message, stamp) = status_for(&Ok(outcome));
+
+        assert_eq!(state, "diverged");
+        assert!(message.contains("云端有 2 份本机未见的新快照"), "{message}");
+        assert!(stamp);
+    }
+
+    #[test]
+    fn upload_without_new_remote_packages_is_reported_as_success() {
+        let outcome = UploadOutcome {
+            view: view("20261122-105230-deadbeef.zip", false),
+            unseen: 0,
+        };
+
+        let (state, message, _) = status_for(&Ok(outcome));
+
+        assert_eq!(state, "success");
+        assert!(message.contains("已上传"), "{message}");
+    }
+
+    #[test]
+    fn prune_failures_are_mentioned_but_keep_the_success_state() {
+        let mut upload = view("20261122-105230-deadbeef.zip", false);
+        upload.prune_failed.push(PruneFailure {
+            name: "20261121-091210-7f3e9c01.zip".to_string(),
+            reason: "远端拒绝删除".to_string(),
+        });
+        let outcome = UploadOutcome {
+            view: upload,
+            unseen: 0,
+        };
+
+        let (state, message, _) = status_for(&Ok(outcome));
+
+        assert_eq!(state, "success");
+        assert!(message.contains("1 份旧包清理失败"), "{message}");
+    }
+
+    #[test]
+    fn failure_is_reported_with_its_message() {
+        let failure = UploadFailure::new("remote_insecure", "WebDAV 地址必须是 HTTPS");
+
+        let (state, message, stamp) = status_for(&Err(failure));
+
+        assert_eq!(state, "failed");
+        assert_eq!(message, "WebDAV 地址必须是 HTTPS");
+        assert!(stamp);
+    }
 }

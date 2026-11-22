@@ -13,8 +13,6 @@ use std::path::{Path, PathBuf};
 
 /// 暂存目录名：位于应用数据目录下，与 `backups/` 同级，不进云盘也不进快照。
 pub const STAGING_DIR_NAME: &str = "staging";
-/// WebDAV 侧的包传输还没接上：上传/下载/自动上行只能报这一句，都不退到旧链路。
-pub const REMOTE_NOT_READY_MESSAGE: &str = "快照包传输尚未接上，请暂时使用本地文件夹模式";
 /// 暂存目录权限：快照可能含明文密钥，只允许本用户读写。
 const STAGING_DIR_MODE: u32 = 0o700;
 
