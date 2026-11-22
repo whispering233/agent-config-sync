@@ -128,8 +128,8 @@ export type CompareRow = {
   /** 「将删除」：当前配置里有、包里没有的受管文件数。 */
   deleted: number | null;
   unchanged: number | null;
-  /** 将被删掉的具体路径。 */
-  deletedPaths: string[];
+  /** 将被删掉的具体条目：所属根 + 根内相对路径。 */
+  deletedItems: { root: 'agent' | 'agents-skills'; path: string }[];
   error: { code: string; message: string } | null;
 };
 

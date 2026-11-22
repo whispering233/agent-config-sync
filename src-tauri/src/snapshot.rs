@@ -292,8 +292,10 @@ pub fn export(
     else {
         // 只有与 `existing` 的指纹相同时才会是 `None`，因此它必然是一份完整报告。
         // 没写新包也就不清理：保留份数只在真正新添一份后才重算。
-        let report = existing
+        let mut report = existing
             .ok_or_else(|| ExportFailure::new("export_failed", "内容比对基准已失效，请重新导出"))?;
+        // 内容没变时也要重新探测根告警：根链接/断链的状态可能变了，不能因为跳过写包就把提示吞掉。
+        detect_roots(agent_dir, home_dir, &mut report.root_warnings)?;
 
         return Ok((report, PruneOutcome::default()));
     };

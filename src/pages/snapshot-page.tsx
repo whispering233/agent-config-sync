@@ -1627,10 +1627,10 @@ function CompareTable({
               {expanded === row.package && (
                 <tr className="border-t border-border">
                   <td colSpan={7} className="py-sm">
-                    <PathList
+                    <PlanPathList
                       title="将被删除"
                       hint="应用时默认不勾选，逐项确认"
-                      paths={row.deletedPaths}
+                      items={row.deletedItems}
                     />
                   </td>
                 </tr>
@@ -1659,6 +1659,51 @@ function PairDiff({ pair }: { pair: ComparePair }) {
         <PathList title="右侧修改" paths={pair.modified} />
         <PathList title="右侧没有" paths={pair.removed} />
       </div>
+    </div>
+  );
+}
+
+/** 计划条目的路径清单：带上所属根，两个根同相对路径也不串。 */
+function PlanPathList({
+  title,
+  hint,
+  items,
+}: {
+  title: string;
+  hint?: string;
+  items: { root: RootId; path: string }[];
+}) {
+  if (items.length === 0) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        {title}：0 项
+      </p>
+    );
+  }
+  const shown = items.slice(0, PLAN_LIST_LIMIT);
+  return (
+    <div>
+      <h4 className="text-xs font-semibold text-foreground">
+        {title} {items.length} 项
+        {hint !== undefined && (
+          <span className="ml-xs font-normal text-muted-foreground">· {hint}</span>
+        )}
+      </h4>
+      <ul className="mt-xs flex flex-col gap-xs">
+        {shown.map((item) => (
+          <li key={`${item.root}:${item.path}`} className="flex flex-wrap items-baseline gap-xs text-xs">
+            <span className="rounded bg-surface-muted px-xs py-0.5 text-muted-foreground">
+              {rootLabels[item.root]}
+            </span>
+            <span className="break-all font-mono text-foreground">{item.path}</span>
+          </li>
+        ))}
+      </ul>
+      {items.length > shown.length && (
+        <p className="mt-xs text-xs text-muted-foreground">
+          还有 {items.length - shown.length} 项
+        </p>
+      )}
     </div>
   );
 }

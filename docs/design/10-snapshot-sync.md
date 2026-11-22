@@ -188,7 +188,7 @@
 
 - `formatVersion` 为 **3**：包化只改了容器与存放方式；`managedRoots` 是多根快照带来的格式变化。`files[].path` 仍带 `snapshot/` 前缀，与包内条目名一致。
 - `managedRoots`：本快照受管的根 id。`agent` 始终存在；`agents-skills` 仅在源机存在 `~/.agents/skills` 时出现。未知 id 视为格式不支持；缺字段或缺少 `agent` 视为损坏。
-- 快照不记录 home 绝对路径；`agents-skills` 在 apply 时解析为当前机器的 `<home>/.agents/skills`。目标根不存在时按快照创建；是文件、不可写或落在链接外的非法路径时失败。
+- 快照不记录 home 绝对路径；`agents-skills` 在 apply 时解析为当前机器的 `<home>/.agents/skills`。目标根不存在时按快照里的文件创建（源机空根只声明，不强制建空目录）；是文件、不可写或落在链接外的非法路径时失败。
 - `source.pi` / `source.node`：手动导出时按环境检测同一组探测取版本（能解析就规范成 `x.y.z`），探测不到记 `null`；自动上行不探测版本，记 `null`。只作来源记录，不参与指纹与"是否有更新"的判定。
 - `fingerprint`：对 `formatVersion`、排序后的 `managedRoots` 与所有 `{path, sha256}` 排序后取哈希，显示前 12 位，包名里用的是前 8 位。用途：两台机器肉眼核对"是不是同一份快照"；`managedRoots` 不同（例如一个声明了空的外部根、另一个没有）必须得到不同指纹。
 - manifest **随包一起写**，包在正式名下出现即代表快照完整；包内没有"先文件后清单"的中间态。
@@ -281,7 +281,7 @@ idle → fetching → unpacking → verifying → planning → previewing → ba
 - `restore.json` 版本为 2；版本 1 的旧备份没有 `root`，按 `agent` 读取。
 - 位置在本机应用数据目录（**不放云盘**）；目录权限 `0700`。
 - 覆盖/删除前备份；被物化替换的祖先链接也会记录，便于回滚恢复链接。
-- 保留最近 10 份，超出清理最旧。
+- 按 `backupRetention`（1–100，默认 10）保留最近几份，超出清理最旧。
 - 回滚：按 `restore.json` 反做（文件写回并恢复 mode、链接重建、新增路径删除），路径先按条目的 `root` 解析到本机根目录（外部根用当前机器的 `<home>/.agents/skills`，解析不到 home 时整次拒绝）；**还原前再备份一次当前状态**；回滚不触碰快照。路径越界或备份损坏时整次拒绝。`mode` 为 `null` 时跳过权限还原，不报错。
 - 回滚重建链接失败（Windows 默认权限）时，按记录的链接目标物化成本地副本并告警——目标还在，内容不会丢；与 apply 建不成链接时的回退一致。
 - 备份份数与快照包保留份数是**两套不同的东西**：前者是 live 的回滚点，后者是跨机快照历史，不要合并。

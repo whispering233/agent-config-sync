@@ -43,7 +43,7 @@
 - 只有可解析的包名参与"最新"判定与保留清理；其它文件（`.tmp-*`、旧版目录布局残留、快照目录布局残留、云盘冲突副本、外来文件）一律进"无法识别的文件"。
 - 不把同步根设在云盘根目录：坚果云对**根目录下的集合** `DELETE` 返回 403。
 - 包内含第二个受管根时，文件位于 `snapshot/external/agents-skills/…`；目录创建与上传逻辑不变，仍是整包搬运。
-- 包内 manifest 只接受当前 `formatVersion`（3）且必须带 `managedRoots`；远端是 v2 或更早的包时按 `package_corrupt` 跳过，需在源机重新导出并上传。
+- 包内 manifest 只接受当前 `formatVersion`（3）且必须带 `managedRoots`；远端是 v2 或更早的包时按 `manifest_unsupported` 跳过，需在源机重新导出并上传。
 
 ## 4. 协议
 
