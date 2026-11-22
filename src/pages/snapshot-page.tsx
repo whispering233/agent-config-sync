@@ -5,10 +5,12 @@ import { Button } from '../components/ui/button';
 import { Card } from '../components/ui/card';
 import { loadAppConfig, type PathStatus, type Transport } from '../lib/app-config';
 import {
+  cleanupUploadLeftovers,
   downloadRemoteSnapshot,
   isDesktop,
   listSnapshotPackages,
   uploadSnapshot,
+  type LeftoverCleanup,
   type PackageList,
   type RemoteDownload,
   type SnapshotExport,
@@ -172,6 +174,13 @@ type PackagesState =
   | { kind: 'done'; list: PackageList }
   | { kind: 'failed'; code: string | null; message: string };
 
+type CleanupState =
+  | { kind: 'idle' }
+  | { kind: 'confirming' }
+  | { kind: 'cleaning' }
+  | { kind: 'done'; result: LeftoverCleanup }
+  | { kind: 'failed'; code: string | null; message: string };
+
 type PlanState =
   | { kind: 'idle' }
   | { kind: 'checking' }
@@ -297,6 +306,8 @@ export function SnapshotPage() {
   /** 存储根里的包列表，与选中的那一份（缺省跟随最新）。 */
   const [packages, setPackages] = useState<PackagesState>({ kind: 'idle' });
   const [picked, setPicked] = useState<string | null>(null);
+  /** 清理上传残留：确认框、执行与结果。 */
+  const [cleanup, setCleanup] = useState<CleanupState>({ kind: 'idle' });
 
   useEffect(() => {
     if (!isDesktop) {
@@ -428,6 +439,24 @@ export function SnapshotPage() {
       const failure = asFailure(error);
       setUpload({
         kind: 'failed',
+        message: failure?.message ?? errorMessage(error),
+      });
+    }
+  }
+
+  async function runCleanup() {
+    setCleanup({ kind: 'cleaning' });
+    try {
+      const result = await cleanupUploadLeftovers();
+      setCleanup({ kind: 'done', result });
+      // 残留已从存储里没了：列表与「无法识别」区块都要重新读一次。
+      void loadPackages();
+    } catch (error) {
+      // 非 HTTPS、同步文件夹没设、凭据缺失都在这里带着失败码上报，原样展示。
+      const failure = asFailure(error);
+      setCleanup({
+        kind: 'failed',
+        code: failure?.code ?? null,
         message: failure?.message ?? errorMessage(error),
       });
     }
@@ -635,6 +664,10 @@ export function SnapshotPage() {
               onDownload={(name) => void runDownload(name)}
               downloading={downloading}
               emptyText="云端还没有快照包：先上传一次，或者等另一台机器上传。"
+              cleanup={cleanup}
+              onStartCleanup={() => setCleanup({ kind: 'confirming' })}
+              onConfirmCleanup={() => void runCleanup()}
+              onCancelCleanup={() => setCleanup({ kind: 'idle' })}
             />
           )}
         </Card>
@@ -670,6 +703,10 @@ export function SnapshotPage() {
               onDownload={(name) => void runDownload(name)}
               downloading={downloading}
               emptyText="同步文件夹里还没有快照包：先导出一次，或者等云盘把另一台机器的包同步下来。"
+              cleanup={cleanup}
+              onStartCleanup={() => setCleanup({ kind: 'confirming' })}
+              onConfirmCleanup={() => void runCleanup()}
+              onCancelCleanup={() => setCleanup({ kind: 'idle' })}
             />
           )}
         </Card>
@@ -1207,6 +1244,10 @@ function PackageListBlock({
   onDownload,
   downloading,
   emptyText,
+  cleanup,
+  onStartCleanup,
+  onConfirmCleanup,
+  onCancelCleanup,
 }: {
   list: PackageList;
   picked: string | null;
@@ -1214,6 +1255,10 @@ function PackageListBlock({
   onDownload: (name: string) => void;
   downloading: boolean;
   emptyText: string;
+  cleanup: CleanupState;
+  onStartCleanup: () => void;
+  onConfirmCleanup: () => void;
+  onCancelCleanup: () => void;
 }) {
   return (
     <>
@@ -1290,7 +1335,127 @@ function PackageListBlock({
           </p>
         </div>
       )}
+
+      <CleanupLeftoversBlock
+        list={list}
+        cleanup={cleanup}
+        onStart={onStartCleanup}
+        onConfirm={onConfirmCleanup}
+        onCancel={onCancelCleanup}
+      />
     </>
+  );
+}
+
+/**
+ * 清理上传残留：只删本应用自己产生过的临时名，其它无法识别的文件一律不动。
+ *
+ * 按钮总是显示：没有可清理项时置灰并说明原因，比凭空消失更好解释。
+ */
+function CleanupLeftoversBlock({
+  list,
+  cleanup,
+  onStart,
+  onConfirm,
+  onCancel,
+}: {
+  list: PackageList;
+  cleanup: CleanupState;
+  onStart: () => void;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const cleaning = cleanup.kind === 'cleaning';
+  const canClean = isDesktop && !cleaning && list.tempFiles.length > 0;
+  // 「不动」就是本轮列表里除上传残留之外的无法识别项：确认框里先说清楚，免得误点。
+  const untouched = list.unrecognized.filter((name) => !list.tempFiles.includes(name));
+
+  return (
+    <div className="mt-md">
+      <div className="flex flex-wrap items-center gap-md">
+        <Button variant="secondary" onClick={onStart} disabled={!canClean}>
+          {cleaning ? '清理中…' : '清理上传残留'}
+        </Button>
+        {list.tempFiles.length === 0 && (
+          <span className="text-xs text-muted-foreground">
+            没有本应用的上传残留可清理
+          </span>
+        )}
+        {!isDesktop && (
+          <span className="text-sm text-muted-foreground">清理仅桌面版可用</span>
+        )}
+      </div>
+
+      {cleanup.kind === 'confirming' && (
+        <div className="mt-sm rounded-md bg-surface-muted px-md py-sm">
+          <p className="text-sm text-foreground">
+            将删除 {list.tempFiles.length} 个上传残留：
+          </p>
+          <ul className="mt-xs flex flex-col gap-xs">
+            {list.tempFiles.map((name) => (
+              <li key={name} className="break-all font-mono text-xs text-foreground">
+                {name}
+              </li>
+            ))}
+          </ul>
+          {untouched.length > 0 && (
+            <p className="mt-xs break-all text-xs text-muted-foreground">
+              这些不会动（{untouched.length} 个）：{untouched.join('、')}
+            </p>
+          )}
+          <div className="mt-sm flex flex-wrap gap-sm">
+            <Button onClick={onConfirm}>确认清理</Button>
+            <Button variant="secondary" onClick={onCancel}>
+              取消
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {cleaning && (
+        <p className="mt-sm text-sm text-muted-foreground" aria-live="polite">
+          正在删除上传残留…
+        </p>
+      )}
+
+      {cleanup.kind === 'done' && (
+        <div className="mt-sm flex flex-col gap-xs">
+          <p className="text-sm text-foreground">
+            已清理 {cleanup.result.deleted.length} 项
+            {cleanup.result.failed.length > 0 &&
+              ` / ${cleanup.result.failed.length} 项失败`}
+          </p>
+          {cleanup.result.failed.length > 0 && (
+            <ul className="flex flex-col gap-xs">
+              {cleanup.result.failed.map((item) => (
+                <li key={item.name} className="break-all text-xs text-danger">
+                  <span className="font-mono">{item.name}</span>：{item.reason}
+                </li>
+              ))}
+            </ul>
+          )}
+          {cleanup.result.skipped.length > 0 && (
+            <p className="break-all text-xs text-muted-foreground">
+              没有动的 {cleanup.result.skipped.length} 个：
+              {cleanup.result.skipped.join('、')}
+            </p>
+          )}
+        </div>
+      )}
+
+      {cleanup.kind === 'failed' && (
+        <p className="mt-sm flex items-start gap-sm text-sm text-danger">
+          <TriangleAlert className="mt-xs h-4 w-4 shrink-0" aria-hidden="true" />
+          <span>
+            清理失败：
+            {cleanup.code !== null && (
+              <code className="mr-xs font-mono text-xs">[{cleanup.code}]</code>
+            )}
+            {cleanup.message}
+          </span>
+        </p>
+      )}
+    </div>
   );
 }
 

@@ -90,6 +90,26 @@ pub struct PackageListing {
     pub unseen_count: usize,
 }
 
+/// 一次清理上传残留的结论。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupOutcome {
+    /// 删掉的项。
+    pub deleted: Vec<String>,
+    /// 删不掉的项：单项失败不影响其它项，也不把整次清理判成失败。
+    pub failed: Vec<CleanupFailure>,
+    /// 没动的无法识别文件：它们不在清理许可范围内，只列给用户看。
+    pub skipped: Vec<String>,
+}
+
+/// 删不掉的一项。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupFailure {
+    pub name: String,
+    pub reason: String,
+}
+
 fn store_failure(error: StoreError) -> DownloadFailure {
     DownloadFailure::new(error.code, error.message)
 }
@@ -194,6 +214,48 @@ pub fn list_from_webdav(
     listing.seen_at = (!state.seen_at.is_empty()).then_some(state.seen_at);
 
     Ok(listing)
+}
+
+/// 清理上传残留：重新列举一次，只删名字匹配本应用临时名的项。
+///
+/// 不接收待删名单：候选每次都从新列举里算，因此重复调用是幂等的（第二遍没有候选），
+/// 也不会因为界面上的列表已过期而删到别人的文件。合法包、`manifest.json`、`snapshot/`
+/// 与任何外来文件都不在候选里；目录不删（`store.delete` 只删文件）。
+pub fn cleanup_temp_files(store: &dyn PackageStore) -> Result<CleanupOutcome, DownloadFailure> {
+    let listing = store.list().map_err(store_failure)?;
+    let mut outcome = CleanupOutcome::default();
+    for name in listing.unrecognized {
+        if !package::is_own_temp_name(&name) {
+            outcome.skipped.push(name);
+            continue;
+        }
+        match store.delete(&name) {
+            Ok(()) => outcome.deleted.push(name),
+            Err(error) => outcome.failed.push(CleanupFailure {
+                name,
+                reason: error.message,
+            }),
+        }
+    }
+
+    Ok(outcome)
+}
+
+/// WebDAV 模式的清理：HTTPS 门槛 → 清理上传残留。
+///
+/// 门槛放在列举之前：非 HTTPS 远端连一个 `PROPFIND` 都不该发，更不用说 `DELETE`。
+pub fn cleanup_from_webdav(
+    store: &dyn PackageStore,
+    endpoint: &str,
+) -> Result<CleanupOutcome, DownloadFailure> {
+    if !credentials::is_secure_url(endpoint) {
+        return Err(DownloadFailure::new(
+            "remote_insecure",
+            "WebDAV 地址必须是 HTTPS（本机回环地址例外），否则拒绝清理远端",
+        ));
+    }
+
+    cleanup_temp_files(store)
 }
 
 /// 取包到本机暂存：列举 → 选包（缺省取名字最大的一份）→ 取 → 解到 `staging/<包名>/` → 只留这一份。
@@ -403,7 +465,7 @@ mod tests {
         DavError, DavRequest, DavResponse, DavTransport, ReqwestTransport, WebdavClient,
     };
     use std::cell::{Cell, RefCell};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::rc::Rc;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -641,12 +703,14 @@ mod tests {
         buffer.into_inner()
     }
 
-    /// 假 WebDAV 服务端：只实现下载链路用到的两个动词。
+    /// 假 WebDAV 服务端：只实现下载与清理链路用到的动词。
     struct DavFiles {
         requests: RefCell<Vec<DavRequest>>,
         files: RefCell<BTreeMap<String, Vec<u8>>>,
         /// 列举时报的体积：让超大包不必真塞 65 MB。
         sizes: RefCell<BTreeMap<String, u64>>,
+        /// 删除时返回 500 的名字：用来验「逐项失败不影响其它项」。
+        failing_deletes: RefCell<BTreeSet<String>>,
         root_exists: Cell<bool>,
     }
 
@@ -662,6 +726,7 @@ mod tests {
                     requests: RefCell::new(Vec::new()),
                     files: RefCell::new(BTreeMap::new()),
                     sizes: RefCell::new(BTreeMap::new()),
+                    failing_deletes: RefCell::new(BTreeSet::new()),
                     root_exists: Cell::new(false),
                 }),
             }
@@ -677,6 +742,13 @@ mod tests {
 
         fn claim_size(&self, name: &str, size: u64) {
             self.state.sizes.borrow_mut().insert(name.to_string(), size);
+        }
+
+        fn fail_delete(&self, name: &str) {
+            self.state
+                .failing_deletes
+                .borrow_mut()
+                .insert(name.to_string());
         }
 
         fn methods(&self) -> Vec<String> {
@@ -751,6 +823,21 @@ mod tests {
                         body: body.unwrap_or_default(),
                     })
                 }
+                "DELETE" => {
+                    if self.state.failing_deletes.borrow().contains(&rel) {
+                        return Ok(DavResponse {
+                            status: 500,
+                            headers: Vec::new(),
+                            body: Vec::new(),
+                        });
+                    }
+                    let removed = self.state.files.borrow_mut().remove(&rel);
+                    Ok(DavResponse {
+                        status: if removed.is_some() { 204 } else { 404 },
+                        headers: Vec::new(),
+                        body: Vec::new(),
+                    })
+                }
                 other => Err(DavError::Other(format!("测试未实现的方法：{other}"))),
             }
         }
@@ -799,6 +886,11 @@ mod tests {
             let client = WebdavClient::new(self.remote.clone(), BASE);
             let store = WebdavStore::new(&client);
             list_from_webdav(&store, endpoint, &self.app_data())
+        }
+
+        fn cleanup(&self, endpoint: &str) -> Result<CleanupOutcome, DownloadFailure> {
+            let client = WebdavClient::new(self.remote.clone(), BASE);
+            cleanup_from_webdav(&WebdavStore::new(&client), endpoint)
         }
 
         fn state(&self) -> RemoteState {
@@ -1123,6 +1215,141 @@ mod tests {
             staging_entries(&fixture.app_data()).is_empty(),
             "列举不取包"
         );
+    }
+
+    /// 清理只认本应用自己产出过的临时名：合法包、`manifest.json`、云盘冲突副本一律不动。
+    #[test]
+    fn cleanup_deletes_only_our_own_temp_names() {
+        const TEMP_PACKAGE: &str = ".tmp-1795344750123456789-deadbeef";
+        const TEMP_PLAIN: &str = ".tmp-1795344750123456789";
+        const FOREIGN_TEMP: &str = ".tmp-notes.txt";
+        const CONFLICT: &str = "a (冲突).zip";
+        let fixture = Fixture::new("cleanup-only-own");
+        fixture.seed(PKG_NEW, &[("settings.json", "{}")]);
+        for name in [
+            TEMP_PACKAGE,
+            TEMP_PLAIN,
+            FOREIGN_TEMP,
+            "manifest.json",
+            CONFLICT,
+        ] {
+            fixture.remote.seed(name, b"leftover");
+        }
+
+        let outcome = fixture.cleanup(BASE).expect("清理应成功");
+
+        let mut deleted = outcome.deleted.clone();
+        deleted.sort();
+        assert_eq!(
+            deleted,
+            vec![TEMP_PLAIN.to_string(), TEMP_PACKAGE.to_string()]
+        );
+        let mut skipped = outcome.skipped.clone();
+        skipped.sort();
+        assert_eq!(
+            skipped,
+            vec![
+                FOREIGN_TEMP.to_string(),
+                CONFLICT.to_string(),
+                "manifest.json".to_string(),
+            ]
+        );
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        // 两项候选、两次 DELETE：不多删也不重删。
+        assert_eq!(
+            fixture.remote.methods(),
+            vec!["PROPFIND", "DELETE", "DELETE"]
+        );
+        assert_eq!(
+            fixture.remote.file_names(),
+            vec![
+                FOREIGN_TEMP.to_string(),
+                PKG_NEW.to_string(),
+                CONFLICT.to_string(),
+                "manifest.json".to_string(),
+            ],
+            "合法包与外来文件必须还在"
+        );
+    }
+
+    #[test]
+    fn cleanup_reports_a_failed_delete_and_still_deletes_the_rest() {
+        const OK_TEMP: &str = ".tmp-1795344750123456789-deadbeef";
+        const BAD_TEMP: &str = ".tmp-1795344750123456790";
+        let fixture = Fixture::new("cleanup-partial");
+        fixture.remote.seed(OK_TEMP, b"leftover");
+        fixture.remote.seed(BAD_TEMP, b"leftover");
+        fixture.remote.fail_delete(BAD_TEMP);
+
+        let outcome = fixture
+            .cleanup(BASE)
+            .expect("单项失败不能把整次清理判成失败");
+
+        assert_eq!(outcome.deleted, vec![OK_TEMP.to_string()]);
+        assert_eq!(outcome.failed.len(), 1, "{:?}", outcome.failed);
+        assert_eq!(outcome.failed[0].name, BAD_TEMP);
+        assert!(!outcome.failed[0].reason.is_empty());
+        assert_eq!(
+            fixture.remote.file_names(),
+            vec![BAD_TEMP.to_string()],
+            "删不掉的那项留在远端"
+        );
+    }
+
+    #[test]
+    fn cleanup_refuses_a_non_https_endpoint_without_sending_a_request() {
+        const TEMP_PACKAGE: &str = ".tmp-1795344750123456789-deadbeef";
+        let fixture = Fixture::new("cleanup-insecure");
+        fixture.remote.seed(TEMP_PACKAGE, b"leftover");
+
+        let failure = fixture
+            .cleanup("http://dav.example.com/dav")
+            .expect_err("非 HTTPS 必须拒绝");
+
+        assert_eq!(failure.code, "remote_insecure");
+        assert!(
+            fixture.remote.methods().is_empty(),
+            "门槛在最前：连 PROPFIND 都不该发出"
+        );
+        assert_eq!(fixture.remote.file_names(), vec![TEMP_PACKAGE.to_string()]);
+    }
+
+    /// 本地实现用真目录：清理后合法包与外来文件必须还在，再来一遍不报错也不删东西。
+    #[test]
+    fn local_cleanup_keeps_packages_and_foreign_files() {
+        const TEMP_PACKAGE: &str = ".tmp-1795344750123456789-deadbeef";
+        const TEMP_PLAIN: &str = ".tmp-1795344750123456789";
+        let temp = TempDir::new("cleanup-local");
+        let store_root = temp.path().join("cloud");
+        write_package(&store_root, PKG_NEW, &[("settings.json", "{}")]);
+        for name in [TEMP_PACKAGE, TEMP_PLAIN, ".tmp-notes.txt", "manifest.json"] {
+            fs::write(store_root.join(name), b"leftover").unwrap();
+        }
+        fs::create_dir_all(store_root.join("snapshot")).unwrap();
+
+        let store = LocalStore::new(store_root.clone());
+        let outcome = cleanup_temp_files(&store).expect("清理应成功");
+
+        assert_eq!(outcome.deleted.len(), 2, "{:?}", outcome.deleted);
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        assert_eq!(outcome.skipped.len(), 3, "{:?}", outcome.skipped);
+        assert!(store_root.join(PKG_NEW).is_file(), "合法包不能动");
+        assert!(
+            store_root.join(".tmp-notes.txt").is_file(),
+            "外来文件不能动"
+        );
+        assert!(store_root.join("manifest.json").is_file());
+        assert!(store_root.join("snapshot").is_dir(), "目录不在清理范围");
+        assert!(!store_root.join(TEMP_PACKAGE).exists());
+        assert!(!store_root.join(TEMP_PLAIN).exists());
+
+        // 幂等：第二遍候选为空，不报错也不删东西。
+        let again = cleanup_temp_files(&store).expect("重复清理应成功");
+        assert!(again.deleted.is_empty(), "{:?}", again.deleted);
+        assert!(again.failed.is_empty(), "{:?}", again.failed);
+        assert_eq!(again.skipped.len(), 3);
+        assert!(store_root.join(PKG_NEW).is_file());
+        assert!(store_root.join(".tmp-notes.txt").is_file());
     }
 
     /// 指定旧包：不能退回「最新」那一份，否则用户会应用一份没选过的快照。

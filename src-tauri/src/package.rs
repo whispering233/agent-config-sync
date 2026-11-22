@@ -132,11 +132,7 @@ pub fn parse_name(name: &str) -> Option<PackageName> {
     let (head, tail) = name.split_at(16);
     let stamp = head.strip_suffix('-')?;
     let (fingerprint8, suffix) = tail.split_at(8);
-    if suffix != ".zip"
-        || !fingerprint8
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if suffix != ".zip" || !is_lower_hex8(fingerprint8) {
         return None;
     }
     Some(PackageName {
@@ -173,6 +169,32 @@ fn parse_stamp(stamp: &str) -> Option<u64> {
         return None;
     }
     Some(days as u64 * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+/// 本应用自己产出过的临时名，只有两种形态：`.tmp-<纳秒戳>` 与
+/// `.tmp-<纳秒戳>-<指纹前 8 位小写>`（`store::temp_name` 的产物）。
+///
+/// 清理上传残留只认这两种：`.tmp-` 前缀下还可能有用户的笔记、别的工具的探测文件，
+/// 多删一个就是丢用户数据。
+pub fn is_own_temp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(TEMP_NAME_PREFIX) else {
+        return false;
+    };
+    match rest.split_once('-') {
+        Some((nanos, fingerprint8)) => is_digits(nanos) && is_lower_hex8(fingerprint8),
+        None => is_digits(rest),
+    }
+}
+
+fn is_digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_lower_hex8(text: &str) -> bool {
+    text.len() == 8
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// 打包：`manifest.json` 原样写入，`snapshot_dir` 的内容递归带 `snapshot/` 前缀。
@@ -920,6 +942,31 @@ mod tests {
         );
         let generated = build_name(parsed.unix_seconds, &parsed.fingerprint8);
         assert_eq!(parse_name(&generated), Some(parsed));
+    }
+
+    #[test]
+    fn is_own_temp_name_accepts_only_the_two_shapes_we_produce() {
+        for name in [
+            ".tmp-1795344750123456789",
+            ".tmp-1795344750123456789-deadbeef",
+        ] {
+            assert!(is_own_temp_name(name), "{name} 必须认出来");
+        }
+
+        for name in [
+            ".tmp-notes.txt",
+            ".tmp-probe-123-abc",
+            ".tmp-12-deadbeef-extra",
+            ".tmp-1795344750123456789-DEADBEEF",
+            ".tmp--deadbeef",
+            ".tmp-",
+            ".tmp-12-",
+            "manifest.json",
+            ".tmp-writetest",
+            "20261122-105230-deadbeef.zip",
+        ] {
+            assert!(!is_own_temp_name(name), "{name} 必须拒绝");
+        }
     }
 
     #[test]

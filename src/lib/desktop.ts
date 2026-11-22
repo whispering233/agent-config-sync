@@ -98,6 +98,8 @@ export type PackageList = {
   packages: PackageEntry[];
   /** 无法识别的文件（`.tmp-*`、云盘冲突副本等）：只展示，不可操作。 */
   unrecognized: string[];
+  /** `unrecognized` 里名字是本应用上传残留的那些：只有它们可以被清理动作删掉。 */
+  tempFiles: string[];
   /** 上次成功上传/下载时看到的云端时间；本地文件夹模式没有记录，为 null。 */
   seenAt: string | null;
   /** 云端有、本机记录里没有的包数；本地文件夹模式恒为 0。 */
@@ -110,6 +112,26 @@ export type PackageList = {
  */
 export function listSnapshotPackages(): Promise<PackageList> {
   return invoke<PackageList>('list_snapshot_packages');
+}
+
+/** 与 Rust 侧 `CleanupOutcome` 一一对应：清理上传残留的三桶结果。 */
+export type LeftoverCleanup = {
+  /** 已删掉的项。 */
+  deleted: string[];
+  /** 删不掉的项：单项失败不影响其它项，整次清理仍算跑完。 */
+  failed: { name: string; reason: string }[];
+  /** 不在清理范围、没有动的无法识别文件。 */
+  skipped: string[];
+};
+
+/**
+ * 清理当前传输方式下的上传残留，只删本应用自己产生过的临时名。
+ *
+ * 候选由核心侧重新列举后算出，因此重复调用是幂等的；合法包、`manifest.json`、
+ * `snapshot/` 与外来文件不会进入候选。
+ */
+export function cleanupUploadLeftovers(): Promise<LeftoverCleanup> {
+  return invoke<LeftoverCleanup>('cleanup_upload_leftovers');
 }
 
 /**

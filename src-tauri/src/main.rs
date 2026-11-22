@@ -62,6 +62,7 @@ fn main() {
             commands::test_webdav_connection,
             commands::download_remote_snapshot,
             commands::list_snapshot_packages,
+            commands::cleanup_upload_leftovers,
             commands::upload_snapshot,
             doctor::run_check,
             installer::preview_install,

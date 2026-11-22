@@ -5,6 +5,7 @@ use crate::config::{
     self, AppConfig, ConfigError, ConfigValidation, Transport, AGENT_DIR_ENV_VAR, CONFIG_FILE_NAME,
 };
 use crate::credentials::{self, CredentialError, WebdavCredentials};
+use crate::package;
 use crate::runtime;
 use crate::snapshot;
 use crate::store::{LocalStore, WebdavStore};
@@ -227,6 +228,8 @@ pub struct PackageListView {
     packages: Vec<PackageEntryView>,
     /// 无法识别的文件（`.tmp-*`、云盘冲突副本等）：只展示，不可操作。
     unrecognized: Vec<String>,
+    /// `unrecognized` 里名字匹配本应用临时名的那些：上传残留，可以被清理动作删掉。
+    temp_files: Vec<String>,
     /// 上一次成功上传/下载时看到的云端时间；本地文件夹模式没有记录，为 null。
     seen_at: Option<String>,
     /// 云端有、本机记录里没有的包数；本地文件夹模式为 0。
@@ -235,6 +238,14 @@ pub struct PackageListView {
 
 impl PackageListView {
     fn new(listing: webdav_transfer::PackageListing) -> Self {
+        // 清理许可名单在核心侧算：前端把 `temp_files` 当「会删」、其余当「不动」。
+        let temp_files = listing
+            .unrecognized
+            .iter()
+            .filter(|name| package::is_own_temp_name(name))
+            .cloned()
+            .collect();
+
         Self {
             packages: listing
                 .packages
@@ -248,6 +259,7 @@ impl PackageListView {
                 })
                 .collect(),
             unrecognized: listing.unrecognized,
+            temp_files,
             seen_at: listing.seen_at,
             unseen_count: listing.unseen_count,
         }
@@ -284,6 +296,43 @@ pub async fn list_snapshot_packages(app: AppHandle) -> Result<PackageListView, D
     })
     .await
     .map_err(|error| DownloadFailure::new("list_failed", format!("列举快照包失败：{error}")))?
+}
+
+/// 清理当前传输方式下的上传残留：只删本应用自己产生过的临时名，返回删了哪些、哪些失败、
+/// 哪些没动。
+///
+/// 不改动正式包：`manifest.json`、`snapshot/` 与外来文件不在候选里。因为候选每次都从
+/// 新列举里算，重复调用不会删到新东西，也不会把「已经不在了」当失败。
+#[tauri::command]
+pub async fn cleanup_upload_leftovers(
+    app: AppHandle,
+) -> Result<webdav_transfer::CleanupOutcome, DownloadFailure> {
+    // WebDAV 要发 PROPFIND 与 DELETE，留在 UI 线程会冻住窗口。
+    tauri::async_runtime::spawn_blocking(move || {
+        // 与上传共用同一把锁：正在上传的临时名不能被当成残留删掉。
+        let _guard = runtime::lock_operation();
+        let app_data = app_data_dir(&app)
+            .map_err(|message| DownloadFailure::new("app_data_unavailable", message))?;
+        let config = app_config(&app)
+            .map_err(|message| DownloadFailure::new("app_config_unavailable", message))?;
+
+        if config.transport == Transport::Local {
+            let root = config.sync_root.ok_or_else(|| {
+                DownloadFailure::new(
+                    "sync_root_unset",
+                    "还没有设置同步文件夹：请先在设置页选择，再回来清理上传残留",
+                )
+            })?;
+
+            return webdav_transfer::cleanup_temp_files(&LocalStore::new(root));
+        }
+
+        let (client, endpoint) = webdav_client(&app_data)?;
+
+        webdav_transfer::cleanup_from_webdav(&WebdavStore::new(&client), &endpoint)
+    })
+    .await
+    .map_err(|error| DownloadFailure::new("cleanup_failed", format!("清理上传残留失败：{error}")))?
 }
 
 /// 取包到本机暂存的结果。`stagingRoot` 顶替同步根，交给 `verify_and_plan` 与 `apply_snapshot`。
@@ -515,6 +564,7 @@ mod tests {
                 is_newest: true,
             }],
             unrecognized: vec!["notes.txt".to_string()],
+            temp_files: vec![".tmp-1795344750123456789-deadbeef".to_string()],
             seen_at: Some("2026-11-21T09:12:10Z".to_string()),
             unseen_count: 2,
         };
@@ -529,8 +579,33 @@ mod tests {
                     "isNewest": true,
                 }],
                 "unrecognized": ["notes.txt"],
+                "tempFiles": [".tmp-1795344750123456789-deadbeef"],
                 "seenAt": "2026-11-21T09:12:10Z",
                 "unseenCount": 2,
+            })
+        );
+    }
+
+    /// 清理结果按 `deleted` / `failed` / `skipped` 三桶过 IPC：前端分别报「删了」「失败」「不动」。
+    #[test]
+    fn cleanup_outcome_serializes_with_camel_case() {
+        let outcome = webdav_transfer::CleanupOutcome {
+            deleted: vec![".tmp-1795344750123456789-deadbeef".to_string()],
+            failed: vec![webdav_transfer::CleanupFailure {
+                name: ".tmp-1795344750123456789".to_string(),
+                reason: "远端拒绝删除".to_string(),
+            }],
+            skipped: vec!["manifest.json".to_string()],
+        };
+        assert_eq!(
+            serde_json::to_value(&outcome).unwrap(),
+            serde_json::json!({
+                "deleted": [".tmp-1795344750123456789-deadbeef"],
+                "failed": [{
+                    "name": ".tmp-1795344750123456789",
+                    "reason": "远端拒绝删除",
+                }],
+                "skipped": ["manifest.json"],
             })
         );
     }
