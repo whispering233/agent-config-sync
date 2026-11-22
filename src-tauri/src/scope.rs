@@ -89,6 +89,13 @@ pub enum RootId {
     AgentsSkills,
 }
 
+impl Default for RootId {
+    /// 缺 `root` 字段的旧记录（版本 1 的 `restore.json`）只可能来自 agent 根。
+    fn default() -> Self {
+        Self::Agent
+    }
+}
+
 impl RootId {
     pub const ALL: [RootId; 2] = [Self::Agent, Self::AgentsSkills];
 
@@ -101,6 +108,19 @@ impl RootId {
 
     pub fn parse(value: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|id| id.as_str() == value)
+    }
+
+    /// 面向用户的根名称。告警与错误信息用它：manifest 里的 id 是格式标识，不是给用户看的。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Agent => "宿主目录",
+            Self::AgentsSkills => "~/.agents/skills",
+        }
+    }
+
+    /// 告警与错误里的位置：根名 + 根内相对路径，两个根的同名路径因此不混。
+    pub fn describe(self, relative: &str) -> String {
+        format!("{} 里的 {relative}", self.label())
     }
 
     /// 根内相对路径在快照目录里的前缀。`agent` 根占快照根，其它根放进 `external/<id>/`，

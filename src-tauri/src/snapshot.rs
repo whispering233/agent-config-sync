@@ -665,20 +665,23 @@ fn declared_packages(snapshot_dir: &Path) -> Vec<RequiredPackage> {
         .collect()
 }
 
-/// 一个根内相对路径的 manifest 路径，形如 `snapshot/settings.json` 或
-/// `snapshot/external/agents-skills/foo/SKILL.md`。
-pub fn manifest_path(root: RootId, relative: &Path) -> String {
-    let mut path = String::from(SNAPSHOT_DIR_NAME);
-    let prefix = root.snapshot_prefix();
-    if !prefix.is_empty() {
-        path.push('/');
-        path.push_str(prefix);
-    }
+/// 根内相对路径在容器里的虚拟路径：agent 根就是相对路径本身，外部根带 `external/<id>/` 前缀。
+/// 备份目录直接用这个布局，manifest 路径再在前面加 `snapshot/`。
+pub fn virtual_path(root: RootId, relative: &Path) -> String {
+    let mut path = String::from(root.snapshot_prefix());
     for component in relative.components() {
-        path.push('/');
+        if !path.is_empty() {
+            path.push('/');
+        }
         path.push_str(&component.as_os_str().to_string_lossy());
     }
     path
+}
+
+/// 一个根内相对路径的 manifest 路径，形如 `snapshot/settings.json` 或
+/// `snapshot/external/agents-skills/foo/SKILL.md`。
+pub fn manifest_path(root: RootId, relative: &Path) -> String {
+    format!("{SNAPSHOT_DIR_NAME}/{}", virtual_path(root, relative))
 }
 
 /// manifest 路径 → （所属根, 根内相对路径）。不在 `snapshot/` 之下或为空时返回 `None`。

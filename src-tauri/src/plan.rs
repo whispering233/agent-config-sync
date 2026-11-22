@@ -196,7 +196,7 @@ pub fn plan_snapshot(
         });
     }
 
-    let roots = resolve_roots(agent_dir, home_dir, &manifest)?;
+    let roots = resolve_roots(agent_dir, home_dir, &manifest.managed_roots)?;
     let live = live_scan(&roots, &manifest)?;
     let (plan, totals) = build_plan(&manifest, &live);
 
@@ -363,13 +363,13 @@ struct LiveScan {
 }
 
 /// 按 manifest 声明的根解析本机路径。未声明的根不出现：目标机完全不读、不写、不删。
-fn resolve_roots(
+pub(crate) fn resolve_roots(
     agent_dir: &Path,
     home_dir: Option<&Path>,
-    manifest: &Manifest,
+    managed_roots: &[RootId],
 ) -> Result<ManagedRoots, PlanFailure> {
     let mut roots = vec![ManagedRoot::agent(agent_dir)];
-    if manifest.managed_roots.contains(&RootId::AgentsSkills) {
+    if managed_roots.contains(&RootId::AgentsSkills) {
         let home_dir = home_dir.ok_or_else(|| {
             PlanFailure::new(
                 "home_dir_missing",
