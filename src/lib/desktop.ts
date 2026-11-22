@@ -238,6 +238,8 @@ export type UploadResult = {
   pruned: string[];
   /** 清理失败的份：不阻塞上传成功。`name` 为空表示整个清理动作失败。 */
   pruneFailed: { name: string; reason: string }[];
+  /** 导出时的根告警（根是链接、外部根断链等）。 */
+  rootWarnings: string[];
 };
 
 /** 把当前配置导出成一个快照包，WebDAV 模式下同时上传并清理旧包。 */

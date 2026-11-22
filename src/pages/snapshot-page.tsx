@@ -1337,6 +1337,11 @@ function UploadResultView({ result }: { result: UploadResult }) {
           已清理 {result.pruned.length} 份旧包：{result.pruned.join('、')}
         </p>
       )}
+      {result.rootWarnings.length > 0 && (
+        <div className="mt-sm">
+          <WarningList warnings={result.rootWarnings} />
+        </div>
+      )}
       {result.pruneFailed.length > 0 && (
         <div className="mt-sm text-sm text-warning">
           <p>有 {result.pruneFailed.length} 份清理失败（上传已成功，下次上传会重算）：</p>

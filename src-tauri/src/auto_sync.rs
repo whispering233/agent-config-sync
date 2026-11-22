@@ -224,6 +224,7 @@ mod tests {
             unchanged,
             pruned: Vec::new(),
             prune_failed: Vec::new(),
+            root_warnings: Vec::new(),
         }
     }
 

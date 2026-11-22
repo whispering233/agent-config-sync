@@ -24,6 +24,8 @@ pub struct UploadView {
     pub pruned: Vec<String>,
     /// 清理失败的份：不阻塞上传成功，单独上报。
     pub prune_failed: Vec<PruneFailure>,
+    /// 导出时的根告警（根是链接、外部根断链等）；上传成功后仍需让用户看见。
+    pub root_warnings: Vec<String>,
 }
 
 /// 清理失败的一份包。整个清理动作失败（列不出来）时 `name` 为空。
@@ -69,6 +71,7 @@ impl UploadView {
             unchanged: report.unchanged,
             pruned: prune.pruned,
             prune_failed: prune_failures(prune.failed),
+            root_warnings: report.root_warnings,
         }
     }
 }
@@ -129,6 +132,7 @@ pub fn upload_to_webdav(
                     unchanged: true,
                     pruned: Vec::new(),
                     prune_failed: Vec::new(),
+                    root_warnings: Vec::new(),
                 },
             });
         };
@@ -158,6 +162,7 @@ pub fn upload_to_webdav(
                 unchanged: true,
                 pruned: Vec::new(),
                 prune_failed: Vec::new(),
+                root_warnings: Vec::new(),
             },
         });
     };
@@ -214,6 +219,7 @@ pub fn upload_to_webdav(
             unchanged: false,
             pruned,
             prune_failed,
+            root_warnings: stored.root_warnings,
         },
     })
 }

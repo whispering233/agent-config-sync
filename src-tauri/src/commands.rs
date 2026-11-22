@@ -692,6 +692,7 @@ mod tests {
                 name: "20261120-091210-7f3e9c01.zip".to_string(),
                 reason: "远端拒绝删除".to_string(),
             }],
+            root_warnings: Vec::new(),
         };
         assert_eq!(
             serde_json::to_value(&view).unwrap(),
@@ -703,6 +704,7 @@ mod tests {
                     "name": "20261120-091210-7f3e9c01.zip",
                     "reason": "远端拒绝删除",
                 }],
+                "rootWarnings": [],
             })
         );
     }
