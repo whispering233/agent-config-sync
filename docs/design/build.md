@@ -31,6 +31,19 @@ cd src-tauri && cargo check
 npm run build          # tsc -b && vite build
 ```
 
+### WSL2
+
+WSLg 里 `npm run tauri -- dev` 能开窗口，但 GTK 会挑错后端、WebKit 走 DMA-BUF 合成，刷一串 `libEGL` / `MESA` / `GTK` 告警。压掉噪音：
+
+```bash
+GDK_BACKEND=x11 WEBKIT_DISABLE_DMABUF_RENDERER=1 LIBGL_ALWAYS_SOFTWARE=1 \
+  npm run tauri -- dev
+```
+
+- 与「发布前验证」的烟测同一组变量，只影响开发窗口的渲染路径，不进发布产物。
+- 代价：走 X11 + 软件渲染，动画会掉帧；仍黑屏或撕裂时再加 `WEBKIT_DISABLE_COMPOSITING_MODE=1`（关掉 WebKit 加速合成，滚动更卡）。
+- 别在 WSL2 里验证 Windows 行为：本应用不跨 WSL，Windows 版只管理 Windows 原生环境（路径大小写、链接、`cmd /d /s /c` 形态都在 Windows 上验）。
+
 ## 打包（Linux）
 
 ```bash
