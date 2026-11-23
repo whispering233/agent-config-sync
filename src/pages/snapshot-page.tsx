@@ -629,41 +629,45 @@ export function SnapshotPage() {
       <header>
         <h1 className="text-lg font-semibold text-foreground">快照</h1>
         <p className="mt-xs text-sm text-muted-foreground">
-          把当前 Pi 配置整理成一份可校验的快照，写进云盘同步文件夹；密钥会原样进入快照。
+          {isWebdav
+            ? '把当前 Pi 配置整理成一份可校验的快照，上传到 WebDAV；密钥会原样进入快照。'
+            : '把当前 Pi 配置整理成一份可校验的快照，写进云盘同步文件夹；密钥会原样进入快照。'}
         </p>
       </header>
 
-      <Card className="p-lg">
-        <h2 className="text-sm font-semibold text-foreground">同步文件夹</h2>
-        <div className="mt-md rounded-md bg-surface-muted px-md py-sm">
-          <p className="break-all font-mono text-sm text-foreground">
-            {syncRoot ?? '—'}
-          </p>
-          {config.kind === 'ready' && config.status !== 'ok' && (
-            <p className="mt-xs text-xs text-warning">
-              {statusText[config.status] ?? '未设置'}
-              ：先在设置页选择可写的同步文件夹，否则导出会失败。
+      {!isWebdav && (
+        <Card className="p-lg">
+          <h2 className="text-sm font-semibold text-foreground">同步文件夹</h2>
+          <div className="mt-md rounded-md bg-surface-muted px-md py-sm">
+            <p className="break-all font-mono text-sm text-foreground">
+              {syncRoot ?? '—'}
+            </p>
+            {config.kind === 'ready' && config.status !== 'ok' && (
+              <p className="mt-xs text-xs text-warning">
+                {statusText[config.status] ?? '未设置'}
+                ：先在设置页选择可写的同步文件夹，否则导出会失败。
+              </p>
+            )}
+          </div>
+
+          {config.kind === 'loading' && (
+            <p className="mt-sm text-sm text-muted-foreground">正在读取配置…</p>
+          )}
+          {config.kind === 'failed' && (
+            <p className="mt-sm text-sm text-danger">{config.message}</p>
+          )}
+          {config.kind === 'browser' && (
+            <p className="mt-sm text-sm text-muted-foreground">
+              浏览器预览里不读取本机配置，导出仅桌面版可用。
             </p>
           )}
-        </div>
-
-        {config.kind === 'loading' && (
-          <p className="mt-sm text-sm text-muted-foreground">正在读取配置…</p>
-        )}
-        {config.kind === 'failed' && (
-          <p className="mt-sm text-sm text-danger">{config.message}</p>
-        )}
-        {config.kind === 'browser' && (
-          <p className="mt-sm text-sm text-muted-foreground">
-            浏览器预览里不读取本机配置，导出仅桌面版可用。
-          </p>
-        )}
-        {config.kind === 'ready' && syncRoot === null && (
-          <p className="mt-sm text-sm text-muted-foreground">
-            还没有设置同步文件夹：请到「设置」页填写后回到这里导出。
-          </p>
-        )}
-      </Card>
+          {config.kind === 'ready' && syncRoot === null && (
+            <p className="mt-sm text-sm text-muted-foreground">
+              还没有设置同步文件夹：请到「设置」页填写后回到这里导出。
+            </p>
+          )}
+        </Card>
+      )}
 
       {isWebdav && (
         <Card className="p-lg">
