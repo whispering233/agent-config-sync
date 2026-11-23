@@ -54,8 +54,8 @@ npm run tauri -- build --bundles deb,appimage
 
 ```text
 src-tauri/target/release/bundle/
-├── deb/Agent Config Sync_0.0.3_amd64.deb          （约 3.1 MB）
-└── appimage/Agent Config Sync_0.0.3_amd64.AppImage（约 83 MB）
+├── deb/Agent Config Sync_0.0.4_amd64.deb          （约 3.1 MB）
+└── appimage/Agent Config Sync_0.0.4_amd64.AppImage（约 83 MB）
 ```
 
 release 配置：`strip = true`、`lto = "thin"`（`src-tauri/Cargo.toml`）。二进制已去符号。
@@ -77,7 +77,7 @@ TAURI_SIGNING_PRIVATE_KEY=… TAURI_SIGNING_PRIVATE_KEY_PASSWORD=… \
 
 ## Release 资产命名
 
-打包产物名带空格（`Agent Config Sync_0.0.3_amd64.AppImage`），GitHub 会把它归一化成 `%20`，而 `latest.json` 的 `url` 必须与资产名逐字一致。所以 CI 构建后先复制成无空格的名字，`latest.json` 只引用这些名字：
+打包产物名带空格（`Agent Config Sync_0.0.4_amd64.AppImage`），GitHub 会把它归一化成 `%20`，而 `latest.json` 的 `url` 必须与资产名逐字一致。所以 CI 构建后先复制成无空格的名字，`latest.json` 只引用这些名字：
 
 | 平台键 | Release 资产名 |
 | :--- | :--- |
@@ -158,7 +158,7 @@ gh secret list
 
 ```bash
 # 1. deb 依赖声明（应含 libwebkit2gtk-4.1-0）
-dpkg-deb -I "src-tauri/target/release/bundle/deb/Agent Config Sync_0.0.3_amd64.deb" | grep Depends
+dpkg-deb -I "src-tauri/target/release/bundle/deb/Agent Config Sync_0.0.4_amd64.deb" | grep Depends
 
 # 2. 已去符号（应显示 stripped / no symbols）
 file src-tauri/target/release/agent-config-sync

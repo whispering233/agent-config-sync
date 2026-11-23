@@ -75,6 +75,7 @@ npm run build
 - 涉及远端行为的改动，必须有「非 HTTPS 时一个请求都不发」「下载只发 PROPFIND + GET」这类断言，不能只靠代码审阅。
 - UI 验证交给子代理，条目数给定上限，只报不修；浏览器预览不是桌面版，桌面专属区块必须有明确降级提示，不能静默空白。
 - 应用更新需在 Linux AppImage、deb 与 Windows NSIS 上人工验证：签名/版本不符拒绝安装、失败不重试、快照操作进行中返回 `update_busy`。
+- 改动 `scripts/updater-manifest.mjs` 或发布流水线：`node --check scripts/updater-manifest.mjs`，并用假 `.sig` 夹具跑一遍（缺资产、缺 `.sig`、带空格的文件名都必须失败）。
 - 每个任务卡必须能独立验证、独立回滚。
 - 打包：`npm run tauri -- build --bundles deb,appimage`（AppImage 需要能访问 GitHub release 下载 runtime）；Windows 上 `npm run tauri -- build --bundles nsis`。CI 的 `windows-latest` job 会先跑 `cargo test` 再出包；PR 阶段另有 Windows `cargo test`。
 - 平台差异收在 `src-tauri/src/platform.rs`：权限位、链接判定与创建、`cmd /d /s /c` 命令行、`CREATE_NO_WINDOW`、进程树终止。调用点不直接写 `cfg(windows)`，命令形态由注入的宿主平台分支。
@@ -89,5 +90,7 @@ npm run build
 - `CHANGELOG.md` 先落 `## [vX.Y.Z] - <日期>`；tag 必须是 `vX.Y.Z`。
 - 推送前确认当前 `gh` 账号是仓库属主（`gh auth status`，必要时 `gh auth switch`），否则 tag 推不上去或 Release 建到别人名下。
 - 先推 `main`，再推 tag；`release.yml` 建 Release，`desktop.yml` 构建 Linux/Windows 资产、`.sig` 与 `latest.json` 并上传；`latest.json` 最后上传。
-- CI 必须有 `TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`；私钥丢失后已安装用户无法继续自动更新。
+- CI 必须有 `TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：`gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/agent-config-sync.key`、`gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD < ~/.tauri/agent-config-sync.key.password`，`gh secret list` 校验；两个文件权限 0600 并离线备份。
+- 私钥丢失后已安装用户无法继续自动更新；换私钥必须同时换公钥并发新版本。
+- 首个带更新能力的版本必须手动安装一次：旧版本里没有更新器。
 - 手动补包用 `workflow_dispatch`，目标 Release 必须已存在。

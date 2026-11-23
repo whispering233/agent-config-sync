@@ -19,6 +19,7 @@ Pi CLI 配置的换机交付工具：把配置打包成一个**可校验的快�
 | 密钥 | 只读扫描明文密钥与 `auth.json`，导出/应用时告警 |
 | 包对齐 | 比对 `settings.json` 声明与 `pi list` 实装，安装缺失项 |
 | 托盘常驻 | 关闭窗口隐藏；菜单打开/立即同步/暂停自动同步/退出；单实例；开机自启 |
+| 应用更新 | 启动时与设置页检查 GitHub Releases，展示版本与说明；确认后下载完整安装包、安装并重启；签名与版本绑定，失败不重试、不降级 |
 
 ## 安装
 
@@ -26,14 +27,16 @@ Linux：
 
 ```bash
 # deb（推荐）
-sudo dpkg -i "src-tauri/target/release/bundle/deb/Agent Config Sync_0.0.3_amd64.deb"
+sudo dpkg -i "src-tauri/target/release/bundle/deb/Agent Config Sync_0.0.4_amd64.deb"
 
 # AppImage（不安装）
-chmod +x "src-tauri/target/release/bundle/appimage/Agent Config Sync_0.0.3_amd64.AppImage"
-"./Agent Config Sync_0.0.3_amd64.AppImage"
+chmod +x "src-tauri/target/release/bundle/appimage/Agent Config Sync_0.0.4_amd64.AppImage"
+"./Agent Config Sync_0.0.4_amd64.AppImage"
 ```
 
 文件名含空格，命令需要引号。deb 依赖 `libwebkit2gtk-4.1-0` 与 `libgtk-3-0`。
+
+也可以直接下载 Releases 里的资产：`agent-config-sync-<版本>-linux-x86_64.AppImage`、`agent-config-sync-<版本>-linux-amd64.deb`、`agent-config-sync-<版本>-windows-x86_64-setup.exe`（旁边都带同名 `.sig`）。从 0.0.4 起应用可以自己检查并安装新版本；首次带更新能力的版本仍需手动装一次。
 
 Windows：运行 `src-tauri/target/release/bundle/nsis/Agent Config Sync_<版本>_x64-setup.exe`，按当前用户安装、不需要管理员。安装包未签名，首次运行会弹 SmartScreen：点「更多信息 → 仍要运行」。
 
@@ -60,6 +63,7 @@ Windows 上命令执行走 `cmd /d /s /c`，环境检测与包对齐按逐命令
 ## 价格与风险
 
 - 安装包未签名，只适合自己本机安装；转发前需补签名。
+- 应用更新的信任链是 minisign：公钥固定在应用里，私钥只在发布环境；换私钥必须同时换公钥并发新版本，否则已安装版本会拒绝新包。
 - Windows 的 NSIS 可在本机或 CI 构建；正式发布由 CI 的 `desktop.yml` 构建并挂到 Release。
 - 快照含明文密钥：云盘服务商、WebDAV 服务端及其版本历史/备份可见。OAuth 多机共享 refresh token 可能互相失效；自动上行默认不包含 `auth.json`。
 - WebDAV 凭据明文存于应用数据目录的 `webdav.json`，不进快照。Linux 为 `~/.local/share/dev.agentconfigsync.app/`（0600），Windows 为 `%APPDATA%\dev.agentconfigsync.app\`（继承 ACL）。
@@ -91,6 +95,7 @@ npm run tauri -- build --bundles nsis          # Windows（只能在 Windows 上
 - 环境检测与安装：`docs/design/20-env-doctor.md`
 - 密钥策略：`docs/design/30-secrets.md`
 - WebDAV 传输：`docs/design/40-webdav.md`
+- 应用自身更新：`docs/design/50-app-update.md`
 - 架构：`docs/design/architecture.md`
 - 构建与分发：`docs/design/build.md`
 - 遗留项：`docs/design/backlog.md`

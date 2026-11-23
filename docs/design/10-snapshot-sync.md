@@ -171,7 +171,7 @@ WSL 的 NTFS 互操作会把 Windows 的 `Zone.Identifier` 备用数据流暴露
   "createdAt": "2026-11-20T05:30:00Z",
   "fingerprint": "a1b2c3d4e5f6",
   "source": {
-    "app": "0.0.3",
+    "app": "0.0.4",
     "os": "linux",
     "arch": "x64",
     "pi": "1.5.2",

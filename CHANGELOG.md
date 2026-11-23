@@ -5,10 +5,16 @@
 
 ## [Unreleased]
 
+## [v0.0.4] - 2026-11-23
+
 ### Added
 
 - 应用自身更新：启动时与设置页可检查 GitHub Releases，展示版本与说明，确认后下载完整安装包并重启；签名与版本绑定，检查/下载/安装失败不自动重试。
-- 发布构建产出更新签名与 `latest.json`，CI 在安装包全部上传后最后发布 manifest。
+- 发布构建产出更新签名与 `latest.json`，CI 在安装包全部上传后最后发布 manifest；`latest.json` 的每个 URL 上传前逐个探测可下载。
+
+### Changed
+
+- 快照页按传输方式切换文案：WebDAV 模式不再展示「同步文件夹」卡片与「否则导出会失败」，页头改说上传到 WebDAV。
 
 ### Fixed
 
