@@ -47,7 +47,20 @@ src-tauri/target/release/bundle/
 
 release 配置：`strip = true`、`lto = "thin"`（`src-tauri/Cargo.toml`）。二进制已去符号。
 
-普通本地构建不开启更新产物，不需要签名私钥。发布构建额外使用 `src-tauri/tauri.updater.conf.json` 叠加 `bundle.createUpdaterArtifacts: true`，由 CI 注入 `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，在安装包旁生成 `.sig`。
+## 发布构建（带更新产物）
+
+普通本地构建不传 `--config`：不产出更新产物，也不需要签名私钥。发布构建叠加 `src-tauri/tauri.updater.conf.json`（只含 `bundle.createUpdaterArtifacts: true`）：
+
+```bash
+TAURI_SIGNING_PRIVATE_KEY=… TAURI_SIGNING_PRIVATE_KEY_PASSWORD=… \
+  npm run tauri -- build --bundles deb,appimage --config src-tauri/tauri.updater.conf.json
+```
+
+- `--config` 路径按执行目录解析（仓库根），内容按 JSON merge patch 深合并进 `tauri.conf.json`。
+- `createUpdaterArtifacts` 开启时 CLI 要求 `plugins.updater` 存在且带 `pubkey`；更新源与公钥常驻在 `tauri.conf.json`，与是否发布构建无关。
+- 两个 secret 只放 CI 与离线备份，不进仓库：`TAURI_SIGNING_PRIVATE_KEY`（私钥原文或指向私钥文件的路径）、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。缺私钥时发布构建直接失败，不会产出无签名包。
+- 每个安装包旁生成同名 `.sig`：`*.AppImage.sig`、`*.deb.sig`、`*-setup.exe.sig`。签名把版本写进 trusted comment，供 `requireSignedVersion` 拒绝版本不符与降级。
+- 上传顺序：安装包与 `.sig` 先，`latest.json` 最后；`latest.json` 出现即代表本次发布可更新。
 
 ## 打包（Windows）
 
