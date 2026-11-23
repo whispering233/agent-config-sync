@@ -20,6 +20,8 @@ use tauri::{AppHandle, Emitter, Manager};
 const STARTUP_DELAY: Duration = Duration::from_secs(60);
 /// 托盘菜单「暂停自动同步」只在本次进程内生效；持久开关在设置页。
 static PAUSED: AtomicBool = AtomicBool::new(false);
+/// 安装应用更新期间的暂停：叠加在托盘开关之上，安装结束自动恢复。
+static SUSPENDED: AtomicBool = AtomicBool::new(false);
 /// 「立即同步」即使自动同步关闭也执行一次。
 static FORCE_ONE: AtomicBool = AtomicBool::new(false);
 static WAKE: OnceLock<Sender<()>> = OnceLock::new();
@@ -76,6 +78,25 @@ pub fn toggle_paused() -> bool {
     paused
 }
 
+/// 安装应用更新期间暂停自动上行；drop 即恢复，不改动托盘开关的状态。
+pub struct InstallSuspend(());
+
+impl Drop for InstallSuspend {
+    fn drop(&mut self) {
+        SUSPENDED.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 更新安装前调用：安装会替换程序文件，期间不能有上行在写盘。
+pub fn suspend_for_install() -> InstallSuspend {
+    SUSPENDED.store(true, Ordering::SeqCst);
+    InstallSuspend(())
+}
+
+fn suspended() -> bool {
+    SUSPENDED.load(Ordering::SeqCst)
+}
+
 /// 启动后台线程。只应在应用 setup 里调用一次。
 pub fn start(app: AppHandle) {
     let (sender, receiver) = mpsc::channel();
@@ -98,6 +119,15 @@ pub fn start(app: AppHandle) {
             first = false;
 
             let force = FORCE_ONE.swap(false, Ordering::SeqCst);
+            if suspended() {
+                set_status(
+                    &app,
+                    "paused",
+                    Some("应用更新安装中，已暂停自动同步".to_string()),
+                    false,
+                );
+                continue;
+            }
             if PAUSED.load(Ordering::SeqCst) && !force {
                 set_status(&app, "paused", Some("自动同步已暂停".to_string()), false);
                 continue;
@@ -226,6 +256,18 @@ mod tests {
             root_warnings: Vec::new(),
             prune_failed: Vec::new(),
         }
+    }
+
+    #[test]
+    fn install_suspend_pauses_uploads_until_dropped() {
+        assert!(!suspended());
+
+        {
+            let _suspend = suspend_for_install();
+            assert!(suspended());
+        }
+
+        assert!(!suspended());
     }
 
     #[test]

@@ -21,6 +21,7 @@ mod skills;
 mod snapshot;
 mod store;
 mod tray;
+mod updater;
 mod upload;
 mod versions;
 mod webdav;
@@ -33,6 +34,7 @@ fn main() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             tray::setup(app)?;
             auto_sync::start(app.handle().clone());
@@ -66,6 +68,9 @@ fn main() {
             commands::compare_snapshot_packages,
             commands::cleanup_upload_leftovers,
             commands::upload_snapshot,
+            updater::check_app_update,
+            updater::install_app_update,
+            updater::app_update_status,
             doctor::run_check,
             installer::preview_install,
             installer::install_or_upgrade,
