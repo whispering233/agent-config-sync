@@ -1768,6 +1768,49 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn package_skips_windows_zone_identifier_metadata() {
+        let temp = TempDir::new("zone-identifier");
+        let agent = temp.path().join("agent");
+        let store_root = temp.path().join("cloud");
+        let app_data = temp.path().join("data");
+        fixture_agent(&agent);
+        let home = fixture_home(&temp, |skills| {
+            write_file(&skills.join("x-components/SKILL.md"), "# x-components\n");
+            write_file(
+                &skills.join("x-components/SKILL.md:Zone.Identifier"),
+                "[ZoneTransfer]\nZoneId=3\n",
+            );
+        });
+
+        let (report, _) = export(
+            &LocalStore::new(store_root.clone()),
+            &agent,
+            Some(&home),
+            &app_data,
+            SourceVersions::default(),
+        )
+        .expect("导出应成功");
+        assert!(report.skipped >= 1, "Zone.Identifier 应计入跳过条目");
+
+        let dest = temp.path().join("unpacked");
+        package::unpack(&store_root.join(&report.package_name), &dest)
+            .expect("含 WSL 元数据时导出的包必须能解包");
+        assert!(dest
+            .join("snapshot/external/agents-skills/x-components/SKILL.md")
+            .is_file());
+        assert!(!dest
+            .join("snapshot/external/agents-skills/x-components/SKILL.md:Zone.Identifier")
+            .exists());
+
+        let manifest = package_manifest(&store_root, &report.package_name);
+        assert!(!manifest
+            .files
+            .iter()
+            .any(|file| file.path.ends_with(":Zone.Identifier")));
+    }
+
     #[test]
     fn empty_agents_skills_dir_is_still_declared() {
         let temp = TempDir::new("external-empty");

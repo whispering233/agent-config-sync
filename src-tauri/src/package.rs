@@ -266,6 +266,13 @@ fn add_tree(writer: &mut ZipWriter<File>, dir: &Path, prefix: &str) -> Result<()
             )));
         };
         let name = format!("{prefix}{file_name}");
+        // 包里出现的条目名必须能被自己的解包闸门接受；否则会产出一个自己解不开的包。
+        if safe_relative(&name).is_none() {
+            return Err(PackageError::export_failed(format!(
+                "快照目录里有不能安全打包的条目名：{}",
+                path.display()
+            )));
+        }
         if file_type.is_dir() {
             add_tree(writer, &path, &format!("{name}/"))?;
         } else if file_type.is_file() {
@@ -922,6 +929,27 @@ mod tests {
             assert_eq!(error.code, "export_failed");
             assert!(!archive.exists(), "失败的包不留在 dest 上");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pack_rejects_windows_metadata_name() {
+        let temp = TempDir::new("unsafe-name");
+        let source = temp.path().join("snapshot");
+        write_file(
+            &source.join("skills/x-components/SKILL.md:Zone.Identifier"),
+            b"[ZoneTransfer]\nZoneId=3\n",
+        );
+
+        let archive = temp.path().join("package.zip");
+        let error = pack(&archive, b"{}", &source).expect_err("不安全条目名必须报错");
+        assert_eq!(error.code, "export_failed");
+        assert!(
+            error.message.contains("Zone.Identifier"),
+            "{}",
+            error.message
+        );
+        assert!(!archive.exists(), "失败的包不留在 dest 上");
     }
 
     #[test]

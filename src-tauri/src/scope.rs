@@ -253,6 +253,8 @@ pub enum SkipReason {
     Unreadable,
     /// socket / fifo / 设备等特殊文件。
     SpecialFile,
+    /// WSL 暴露的 Windows 元数据文件（`*:Zone.Identifier`），不是用户内容。
+    WindowsMetadata,
     /// 链接成环，重复进入同一物理目录。
     LinkLoop,
 }
@@ -484,6 +486,10 @@ impl Walker {
         if !is_managed_relative(self.root, &relative_path) {
             return Ok(());
         }
+        if is_windows_metadata_name(name) {
+            self.skip(&relative_path, SkipReason::WindowsMetadata);
+            return Ok(());
+        }
 
         let physical_path = physical.join(name);
 
@@ -549,6 +555,12 @@ impl Walker {
             reason,
         });
     }
+}
+
+/// WSL 的 NTFS 互操作会把 `Zone.Identifier` 备用数据流暴露成独立文件。
+/// 它不是用户内容，且名字含 `:`，打包后会被自己的解包闸门拒绝，所以在遍历时跳过。
+fn is_windows_metadata_name(name: &OsString) -> bool {
+    name.to_string_lossy().ends_with(":Zone.Identifier")
 }
 
 #[cfg(test)]
@@ -668,6 +680,46 @@ mod tests {
         );
         // 范围外条目不是"跳过"，不进 skipped。
         assert!(outcome.skipped.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_zone_identifier_metadata_is_skipped() {
+        let temp = TempDir::new("zone-identifier");
+        let agent = temp.path().join("agent");
+        write_file(
+            &agent.join("skills/x-components/SKILL.md"),
+            "# x-components\n",
+        );
+        write_file(
+            &agent.join("skills/x-components/SKILL.md:Zone.Identifier"),
+            "[ZoneTransfer]\nZoneId=3\n",
+        );
+
+        let outcome = scan(&agent).expect("扫描");
+        assert_eq!(
+            scan_paths(&outcome),
+            vec![
+                "skills",
+                "skills/x-components",
+                "skills/x-components/SKILL.md"
+            ]
+        );
+        assert_eq!(
+            skipped_paths(&outcome),
+            vec![(
+                "skills/x-components/SKILL.md:Zone.Identifier".to_string(),
+                SkipReason::WindowsMetadata
+            )]
+        );
+
+        let dest = temp.path().join("dest");
+        let materialized = materialize(&agent, &dest).expect("物化");
+        assert!(dest.join("skills/x-components/SKILL.md").is_file());
+        assert!(!dest
+            .join("skills/x-components/SKILL.md:Zone.Identifier")
+            .exists());
+        assert_eq!(materialized.skipped.len(), 1);
     }
 
     #[test]
