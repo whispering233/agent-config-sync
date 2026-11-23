@@ -16,6 +16,7 @@ Pi CLI 配置的换机交付工具（手动快照交付；可选托盘常驻与�
 - 快照包历史：远端包只增不改；"云端有更新" = 可解析包名集合变化，不用时钟或 ETag；保留最近 20 份自动老化，三类绝不删。
 - 符号链接：apply 时按 manifest 重建链接优先；目标缺失回退物化并告警；链接之下的写入/删除跳过；快照没声明的链接只按链接本身列为删除候选，不读目标。受管根自身的链接除外：根类型不进入快照，跟随根链接处理内容。
 - 技术栈：Tauri v2 + Rust + React + Tailwind，不引入 Node sidecar。
+- 应用更新：官方 `tauri-plugin-updater`（>= 2.14）+ GitHub Releases；v1 只发**全量安装包**，签名 + `requireSignedVersion` + 禁降级；启动/手动检查，用户确认后安装。增量更新见 `docs/design/backlog.md`，不为此切换桌面壳。
 - 配置套数：v1 单套，manifest 预留 `profileId`。
 - 平台顺序：Linux → Windows → macOS；Windows 安装宿主只走 npm。
 - 平台边界：不跨 WSL；Windows 版只管理 Windows 原生环境。
@@ -25,13 +26,14 @@ Pi CLI 配置的换机交付工具（手动快照交付；可选托盘常驻与�
 
 - 文件系统读写、子进程、哈希、遍历全部在 Rust 侧；前端不直接访问文件系统。
 - 无数据库、无文件监听；托盘常驻是可选能力。
-- 出站网络只有 WebDAV 与用户手动触发的 npm 版本查询；WebDAV 控制请求 30s、包传输 120s，版本查询 10s，均不自动重试。
+- 出站网络只有 WebDAV、用户手动触发的 npm 版本查询、应用更新检查/下载；WebDAV 控制请求 30s、包传输 120s，版本查询 10s，应用更新检查 10s、下载 120s，均不自动重试。
 - 子进程命令由核心层拼接，前端只能传枚举与受限参数。
 - 受管范围之外的文件永不读取内容、永不写入、永不删除。
 - 技能盘点是显式动作：点击后才启动 `pi` RPC；宿主可能在缺失时创建空 `auth.json`（`0600`）与 `models-store.json`（`{}`）。UI 必须先提示、执行后报告实际创建的文件；本应用不删除它们。
 - 应用前必须重算计划并按 fingerprint 比对（`plan_stale`）；删除项必须来自计划。
 - 快照包先写临时名再原子改名到正式名，正式名下出现即代表包完整；包按不可信输入解析（逐条目白名单/路径/体积上限），不用库的批量解压接口。
 - 失败停在原地：不自动重试、不自动降级、不静默修复。
+- 应用更新只替换程序文件，不碰配置、备份、凭据与快照；安装前取操作锁并暂停自动上行，拿不到锁返回 `update_busy`。
 - 安装/包对齐两段式：`preview` 只探测，`execute` 确认后重新探测并校验动作；安装命令超时整组终止。
 
 ## 密钥边界
@@ -42,6 +44,7 @@ Pi CLI 配置的换机交付工具（手动快照交付；可选托盘常驻与�
 - WebDAV 一律只接受 HTTPS（`localhost`/`127.0.0.1`/`::1` 例外），否则报告 `remote_insecure`；不按本次快照是否含 `auth.json` 区分。
 - 自动上行默认不包含 `auth.json`；设置里显式开启后才包含。
 - 不发明私有占位语法，不对快照整体加密，不自动写 shell 启动文件。
+- 更新公钥固定在 `tauri.conf.json`；私钥只在 CI secret 与离线备份中，不进仓库、日志、错误信息或快照。
 
 ## 代码与注释纪律
 
@@ -71,6 +74,7 @@ npm run build
 - 文件遍历、manifest、哈希、密钥扫描、快照包的打包/解包、应用/回滚、包/安装必须有单元测试与临时目录夹具。
 - 涉及远端行为的改动，必须有「非 HTTPS 时一个请求都不发」「下载只发 PROPFIND + GET」这类断言，不能只靠代码审阅。
 - UI 验证交给子代理，条目数给定上限，只报不修；浏览器预览不是桌面版，桌面专属区块必须有明确降级提示，不能静默空白。
+- 应用更新需在 Linux AppImage、deb 与 Windows NSIS 上人工验证：签名/版本不符拒绝安装、失败不重试、快照操作进行中返回 `update_busy`。
 - 每个任务卡必须能独立验证、独立回滚。
 - 打包：`npm run tauri -- build --bundles deb,appimage`（AppImage 需要能访问 GitHub release 下载 runtime）；Windows 上 `npm run tauri -- build --bundles nsis`。CI 的 `windows-latest` job 会先跑 `cargo test` 再出包；PR 阶段另有 Windows `cargo test`。
 - 平台差异收在 `src-tauri/src/platform.rs`：权限位、链接判定与创建、`cmd /d /s /c` 命令行、`CREATE_NO_WINDOW`、进程树终止。调用点不直接写 `cfg(windows)`，命令形态由注入的宿主平台分支。
@@ -84,5 +88,6 @@ npm run build
 - 版本号三处同步：`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`；`Cargo.lock` 与 `package-lock.json` 一并更新。
 - `CHANGELOG.md` 先落 `## [vX.Y.Z] - <日期>`；tag 必须是 `vX.Y.Z`。
 - 推送前确认当前 `gh` 账号是仓库属主（`gh auth status`，必要时 `gh auth switch`），否则 tag 推不上去或 Release 建到别人名下。
-- 先推 `main`，再推 tag；`release.yml` 建 Release，`desktop.yml` 构建 Linux/Windows 资产并上传。
+- 先推 `main`，再推 tag；`release.yml` 建 Release，`desktop.yml` 构建 Linux/Windows 资产、`.sig` 与 `latest.json` 并上传；`latest.json` 最后上传。
+- CI 必须有 `TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`；私钥丢失后已安装用户无法继续自动更新。
 - 手动补包用 `workflow_dispatch`，目标 Release 必须已存在。

@@ -7,7 +7,8 @@
 | [design/20-env-doctor.md](design/20-env-doctor.md) | 探测矩阵、报告结构、宿主安装与升级策略 |
 | [design/30-secrets.md](design/30-secrets.md) | 明文密钥策略、`auth.json`、扫描规则、权限与传输边界 |
 | [design/40-webdav.md](design/40-webdav.md) | WebDAV 传输：凭据、远端布局、协议、包上传/下载、状态判定、失败码 |
+| [design/50-app-update.md](design/50-app-update.md) | 应用自身更新：全量安装包、检查/安装流程、平台策略、签名与发布 |
 | [design/architecture.md](design/architecture.md) | 技术栈、进程边界、模块职责、数据存放、平台矩阵、依赖链、非功能与安全 |
 | [design/build.md](design/build.md) | 环境前提、开发命令、Linux 与 Windows 打包、发布前验证 |
 | [design/backlog.md](design/backlog.md) | P1/P2 遗留项与判断依据 |
-| [design/tasks.md](design/tasks.md) | 临时任务卡片（当前无未完成项） |
+| [design/tasks.md](design/tasks.md) | 临时任务卡片（当前含应用更新任务） |

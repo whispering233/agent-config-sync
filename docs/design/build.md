@@ -47,6 +47,8 @@ src-tauri/target/release/bundle/
 
 release 配置：`strip = true`、`lto = "thin"`（`src-tauri/Cargo.toml`）。二进制已去符号。
 
+普通本地构建不开启更新产物，不需要签名私钥。发布构建额外使用 `src-tauri/tauri.updater.conf.json` 叠加 `bundle.createUpdaterArtifacts: true`，由 CI 注入 `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，在安装包旁生成 `.sig`。
+
 ## 打包（Windows）
 
 只在 Windows 上构建（本地 Windows 或 CI 的 `windows-latest`）；不在 Linux 上交叉编译（官方定位为 last resort）。
@@ -79,7 +81,7 @@ npm run tauri -- build --bundles nsis
 | :--- | :--- | :--- |
 | `ci.yml` | push main / PR | Linux：`cargo test`、`cargo check`、`npm run build`；Windows：`cargo test`（含平台分支）；不打包 |
 | `release.yml` | push tag `v*` | 校验三处版本号一致 → 从 `CHANGELOG.md` 对应版本段建 GitHub Release |
-| `desktop.yml` | push tag `v*` / 手动 | 在 `ubuntu-22.04` 构建 deb 与 AppImage；在 `windows-latest` 跑 `cargo test` 并构建 NSIS；两者都挂到该 tag 的 Release。手动入口可补包到已有 Release |
+| `desktop.yml` | push tag `v*` / 手动 | 在 `ubuntu-22.04` 构建 deb 与 AppImage；在 `windows-latest` 跑 `cargo test` 并构建 NSIS；两者用 `tauri.updater.conf.json` 生成 `.sig`，挂到该 tag 的 Release。最后 `manifest` job 生成并上传 `latest.json`。手动入口可补包到已有 Release |
 
 约束：
 
@@ -89,6 +91,10 @@ npm run tauri -- build --bundles nsis
 - 打包依赖 GitHub release 资产（`appimagetool` 的 type2 runtime）；runner 无法出网时 AppImage 会失败，deb 不受影响。
 - Release 正文只由 `release.yml` 负责；资产上传不改正文。
 - Windows 的 PR 检查只编译并跑测试，不构建 NSIS；NSIS 仍由 `desktop.yml` 在 tag 或手动触发时构建。
+- 发布 job 必须配置 `TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`；缺失时构建失败，不发无签名包。
+- `tauri-plugin-updater` 不低于 2.14：`requireSignedVersion` 需要 2.12+，2.14 起安装前校验下载字节；`@tauri-apps/cli` 不低于 2.11.5 才能把版本写进签名 trusted comment。
+- `latest.json` 的 `url` 必须与 Release 上实际资产名逐字一致；生成脚本从构建产物文件名读取，不手写。上传顺序：安装包与 `.sig` 先，`latest.json` 最后。
+- `latest.json` 的 `version` 必须与三处版本号一致；`platforms` 至少覆盖 `linux-x86_64-appimage`、`linux-x86_64-deb`、`windows-x86_64-nsis`。
 
 ## 发布前验证
 
@@ -142,14 +148,16 @@ git push origin main
 git push origin vX.Y.Z
 ```
 
-- tag 触发 `release.yml`（校验三处版本一致、按 CHANGELOG 建 Release）与 `desktop.yml`（Linux deb/AppImage、Windows NSIS，上传到同一 Release）。
+- tag 触发 `release.yml`（校验三处版本一致、按 CHANGELOG 建 Release）与 `desktop.yml`（Linux deb/AppImage、Windows NSIS，上传安装包、`.sig` 与 `latest.json` 到同一 Release）。
 - 手动补包：`gh workflow run desktop.yml -f release_tag=vX.Y.Z`；目标 Release 必须已存在。
+- 更新公钥固定在 `src-tauri/tauri.conf.json`；私钥只在 CI secret 与离线备份中。私钥丢失后，已安装用户无法继续自动更新。
+- 首次带更新能力的版本必须手动安装一次：旧版本里没有更新器，无法自动升到它。
 - 本地 Windows 验证：`npm run tauri -- build --bundles nsis`，产物在 `src-tauri/target/release/bundle/nsis/`。
 
 ## 已知限制
 
-- 未签名：deb/AppImage 均无签名与公证；分发给他人前需补信任链。
-- 无自动更新：升级需重新下载安装包。
+- 未签名：deb/AppImage 均无平台代码签名与公证；分发给他人前需补信任链。应用更新自身使用 minisign，不依赖平台签名。
+- 应用更新为全量安装包；增量更新未做（见 `backlog.md`）。
 - macOS 尚未打包（见 `backlog.md`）；Windows 未签名、无卸载清理钩子。
 - AppImage 依赖目标机器可执行 AppImage（必要时用 `APPIMAGE_EXTRACT_AND_RUN=1` 在无 FUSE 环境运行）。
 - AppImage 打包时 `appimagetool` 会从 GitHub 下载 type2 runtime（`AppImage/type2-runtime` 的 `continuous` tag，x86_64 约 923 KB）；若网络拦截 release 资产，打包会失败（deb 不受影响）。可用官方 `--runtime-file` 指定本地 runtime 手工打包。

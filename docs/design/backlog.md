@@ -69,6 +69,18 @@
 - 要点：改文件名意味着远端 `MOVE` + 本地状态集合比对逻辑跟着变；带标签的份永不自动清理。
 - 判断：参考项目为此付出了一整套校验规则，并踩过一次「设备名/tag 恰好等于应用密码 → 密码写进云盘文件名」的事故。除非有明确需求，否则不做。
 
+### 应用更新增量（Delta）
+
+- 动机：AppImage 全量约 85 MB，频繁发版时下载体积大。
+- 现状：v1 采用全量安装包（见 `50-app-update.md`）；Windows NSIS 约 4.4 MB、deb 约 3–7 MB，增量收益很小，只有 AppImage 值得做。
+- 方案候选：
+  - AppImage 专用补丁（zstd/bsdiff）：客户端以当前 AppImage 为基线，下载补丁重建后用官方 updater 的 `Update::verify` 校验完整产物签名，再替换；失败回退全量。
+  - 第三方 delta 引擎（如 `tauri-delta-updater`）：当前 early、单维护者、Linux 实战不足，不进入 v1。
+  - `tauri-plugin-updater-delta`：不支持 Linux，排除。
+- 前置：全量更新稳定；CI 能保留上一版 AppImage；补丁格式、签名校验、回滚与“补丁损坏回退全量”有测试。
+- 触发条件：AppImage 更新频率或下载体积成为真实痛点，或出现用户反馈。
+- 不采用：为增量更新切换 Electron——安装包/内存/迁移成本大于收益，且 electron-updater 的 deb 仍无增量（理由见 `00-master-design.md` 与 `architecture.md`）。
+
 ### 分享包（导出/导入）
 
 - 动机：把配置分享给他人，而不是自己多机同步。
@@ -140,3 +152,4 @@
 - 同步会话、聊天记录、用量统计。
 - 本地路由/代理/模型聚合。
 - 云端账号体系（不引入服务端）。
+- 为增量更新更换桌面壳（Electron）：AppImage 的增量可以在 Tauri 侧做补丁；Electron 安装包约 150 MB+、内存与启动更高，更新信任从 minisign 降为 sha512，且 deb 仍无增量。
