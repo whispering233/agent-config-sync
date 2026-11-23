@@ -62,6 +62,20 @@ TAURI_SIGNING_PRIVATE_KEY=… TAURI_SIGNING_PRIVATE_KEY_PASSWORD=… \
 - 每个安装包旁生成同名 `.sig`：`*.AppImage.sig`、`*.deb.sig`、`*-setup.exe.sig`。签名把版本写进 trusted comment，供 `requireSignedVersion` 拒绝版本不符与降级。
 - 上传顺序：安装包与 `.sig` 先，`latest.json` 最后；`latest.json` 出现即代表本次发布可更新。
 
+## Release 资产命名
+
+打包产物名带空格（`Agent Config Sync_0.0.3_amd64.AppImage`），GitHub 会把它归一化成 `%20`，而 `latest.json` 的 `url` 必须与资产名逐字一致。所以 CI 构建后先复制成无空格的名字，`latest.json` 只引用这些名字：
+
+| 平台键 | Release 资产名 |
+| :--- | :--- |
+| `linux-x86_64-appimage` | `agent-config-sync-<version>-linux-x86_64.AppImage` |
+| `linux-x86_64-deb` | `agent-config-sync-<version>-linux-amd64.deb` |
+| `windows-x86_64-nsis` | `agent-config-sync-<version>-windows-x86_64-setup.exe` |
+
+- 每个资产旁有同名 `.sig`；本地 `bundle/` 目录里的原名不动，只在 `release-assets/` 里改名。
+- 命名只在两端各写一次：workflow 负责改名，`scripts/updater-manifest.mjs` 按后缀从 `release-assets/` 的实际文件名认领资产并取其 `.sig`。缺资产、缺 `.sig`、`.sig` 为空或文件名含空格都会让脚本直接失败。
+- `latest.json` 的 `url` 形如 `https://github.com/whispering233/agent-config-sync/releases/download/<tag>/<asset>`，`version` 取 tag 去掉 `v`，`pub_date` 用生成时的 UTC 时间。
+
 ## 打包（Windows）
 
 只在 Windows 上构建（本地 Windows 或 CI 的 `windows-latest`）；不在 Linux 上交叉编译（官方定位为 last resort）。
@@ -107,6 +121,7 @@ npm run tauri -- build --bundles nsis
 - 发布 job 必须配置 `TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`；缺失时构建失败，不发无签名包。
 - `tauri-plugin-updater` 不低于 2.14：`requireSignedVersion` 需要 2.12+，2.14 起安装前校验下载字节；`@tauri-apps/cli` 不低于 2.11.5 才能把版本写进签名 trusted comment。
 - `latest.json` 的 `url` 必须与 Release 上实际资产名逐字一致；生成脚本从构建产物文件名读取，不手写。上传顺序：安装包与 `.sig` 先，`latest.json` 最后。
+- `manifest` job 在两边安装包都上传后生成 `latest.json`，上传前逐个探测 `url` 可下载（HEAD 请求，刚上传的资产有 CDN 延迟，最多重试 10 次）；探测失败就不传 `latest.json`，本次发布不算可更新。
 - `latest.json` 的 `version` 必须与三处版本号一致；`platforms` 至少覆盖 `linux-x86_64-appimage`、`linux-x86_64-deb`、`windows-x86_64-nsis`。
 
 ## 发布前验证
