@@ -70,7 +70,6 @@ fn main() {
             commands::upload_snapshot,
             updater::check_app_update,
             updater::install_app_update,
-            updater::app_update_status,
             doctor::run_check,
             installer::preview_install,
             installer::install_or_upgrade,

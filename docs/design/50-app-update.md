@@ -70,7 +70,6 @@ Rust 侧新增 `updater` 模块，前端只经由类型化 command 调用，不�
 | :--- | :--- | :--- | :--- |
 | `check_app_update` | 无 | `AppUpdateInfo \| null` | 10s 超时；开发态/浏览器返回 `update_unsupported` |
 | `install_app_update` | `{ version }` | `AppUpdateResult` | 重新检查并校验版本；下载、取锁、安装、重启 |
-| `app_update_status` | 无 | `AppUpdateStatus` | 当前版本、最近检查结果、是否可用、失败码；不触发网络 |
 
 - `AppUpdateInfo`：当前版本、最新版本、发布说明、发布时间、目标平台、下载体积（能拿到时）。
 - `AppUpdateResult`：安装是否已发起、版本、是否需要重启；失败时返回失败码与可读信息。

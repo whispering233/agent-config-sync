@@ -5,11 +5,10 @@
 
 use crate::auto_sync;
 use crate::runtime;
-use crate::snapshot;
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, MutexGuard};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::MutexGuard;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_updater::{Error as UpdaterError, Update, UpdaterExt};
 
@@ -66,19 +65,6 @@ pub struct AppUpdateResult {
     pub restart_required: bool,
 }
 
-/// 状态查询的形状。不含路径、URL 与凭据。
-#[derive(Debug, Clone, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AppUpdateStatus {
-    pub current_version: String,
-    /// 最近一次检查发现的可用版本；没有更新或从未检查为 `null`。
-    pub available: Option<AppUpdateInfo>,
-    /// 最近一次检查的失败；成功或从未检查为 `null`。
-    pub failure: Option<AppUpdateFailure>,
-    /// 最近一次检查时间，RFC 3339 UTC；从未检查为 `null`。
-    pub checked_at: Option<String>,
-}
-
 /// 下载/安装进度。事件里只有阶段与字节数。
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,16 +75,10 @@ pub struct AppUpdateProgress {
     total: Option<u64>,
 }
 
-/// 进程内的最近检查结果。手动检查与设置页共用，不落盘。
-static STATUS: LazyLock<Mutex<AppUpdateStatus>> =
-    LazyLock::new(|| Mutex::new(AppUpdateStatus::default()));
-
 /// 检查更新。开发态与未分发平台返回 `update_unsupported`，不发请求。
 #[tauri::command]
 pub async fn check_app_update(app: AppHandle) -> Result<Option<AppUpdateInfo>, AppUpdateFailure> {
-    let outcome = check(&app).await;
-    record(&outcome);
-    outcome
+    check(&app).await
 }
 
 /// 下载并安装用户确认的版本。重新检查后版本变了返回 `update_stale`；
@@ -144,17 +124,6 @@ pub async fn install_app_update(
 
     #[cfg(not(target_os = "windows"))]
     app.restart()
-}
-
-/// 当前版本与最近一次检查结果。不触发网络。
-#[tauri::command]
-pub fn app_update_status(app: AppHandle) -> AppUpdateStatus {
-    let mut status = STATUS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
-    status.current_version = current_version(&app);
-    status
 }
 
 async fn check(app: &AppHandle) -> Result<Option<AppUpdateInfo>, AppUpdateFailure> {
@@ -215,27 +184,6 @@ fn info(update: &Update) -> AppUpdateInfo {
             .map(str::to_string),
         target: update.target.clone(),
         download_size: None,
-    }
-}
-
-fn current_version(app: &AppHandle) -> String {
-    app.package_info().version.to_string()
-}
-
-fn record(outcome: &Result<Option<AppUpdateInfo>, AppUpdateFailure>) {
-    let mut status = STATUS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    status.checked_at = Some(snapshot::format_timestamp(now_seconds()));
-    match outcome {
-        Ok(available) => {
-            status.available = available.clone();
-            status.failure = None;
-        }
-        Err(failure) => {
-            status.available = None;
-            status.failure = Some(failure.clone());
-        }
     }
 }
 
@@ -340,13 +288,6 @@ fn message_for(code: &'static str) -> &'static str {
         "update_install_failed" => "安装失败：可能取消了系统授权，或安装目录不可写",
         _ => "应用更新失败",
     }
-}
-
-fn now_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -469,31 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn records_the_latest_check_result() {
-        let failure = AppUpdateFailure::new("update_check_failed", "检查更新失败");
-        record(&Err(failure.clone()));
-        let failed = STATUS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        assert_eq!(
-            failed.failure.as_ref().map(|failure| failure.code),
-            Some("update_check_failed")
-        );
-        assert!(failed.available.is_none());
-        assert!(failed.checked_at.is_some());
-
-        record(&Ok(None));
-        let cleared = STATUS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        assert!(cleared.failure.is_none(), "重新检查成功后要清掉旧失败码");
-        assert!(cleared.available.is_none());
-    }
-
-    #[test]
-    fn status_types_serialize_with_camel_case() {
+    fn update_info_serializes_with_camel_case() {
         let info = AppUpdateInfo {
             current_version: "0.0.3".to_string(),
             version: "0.0.4".to_string(),
@@ -502,27 +419,16 @@ mod tests {
             target: "linux-x86_64-appimage".to_string(),
             download_size: None,
         };
-        let status = AppUpdateStatus {
-            current_version: "0.0.3".to_string(),
-            available: Some(info),
-            failure: None,
-            checked_at: Some("2026-12-01T00:00:00Z".to_string()),
-        };
 
         assert_eq!(
-            serde_json::to_value(&status).unwrap(),
+            serde_json::to_value(&info).unwrap(),
             serde_json::json!({
                 "currentVersion": "0.0.3",
-                "available": {
-                    "currentVersion": "0.0.3",
-                    "version": "0.0.4",
-                    "notes": "修复若干问题",
-                    "date": "2026-12-01T00:00:00Z",
-                    "target": "linux-x86_64-appimage",
-                    "downloadSize": null,
-                },
-                "failure": null,
-                "checkedAt": "2026-12-01T00:00:00Z",
+                "version": "0.0.4",
+                "notes": "修复若干问题",
+                "date": "2026-12-01T00:00:00Z",
+                "target": "linux-x86_64-appimage",
+                "downloadSize": null,
             })
         );
     }
