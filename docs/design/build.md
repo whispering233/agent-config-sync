@@ -124,6 +124,23 @@ npm run tauri -- build --bundles nsis
 - `manifest` job 在两边安装包都上传后生成 `latest.json`，上传前逐个探测 `url` 可下载（HEAD 请求，刚上传的资产有 CDN 延迟，最多重试 10 次）；探测失败就不传 `latest.json`，本次发布不算可更新。
 - `latest.json` 的 `version` 必须与三处版本号一致；`platforms` 至少覆盖 `linux-x86_64-appimage`、`linux-x86_64-deb`、`windows-x86_64-nsis`。
 
+## 更新签名密钥
+
+私钥与密码各存一份在仓库外（POSIX `0600`）：`~/.tauri/agent-config-sync.key`、`~/.tauri/agent-config-sync.key.password`。仓库里只有公钥（`src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey`）。
+
+配置到 GitHub Actions（`gh auth status` 确认是仓库属主后）：
+
+```bash
+gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/agent-config-sync.key
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD < ~/.tauri/agent-config-sync.key.password
+gh secret list
+```
+
+- 也可在仓库 Settings → Secrets and variables → Actions 手动添加；值同上，不写进任何被提交的文件。
+- 换私钥必须同时换公钥并重发版本：已发布版本的 `requireSignedVersion` 只认内置的那把公钥，旧公钥签出的包会被拒绝。
+- 私钥丢失后无法再用自动更新推包：已安装的旧版本只信任现有公钥，只能发新版本让用户手动下载，并随新包换公钥。
+- 备份放离线介质；不进快照、日志与错误信息。
+
 ## 发布前验证
 
 ```bash
