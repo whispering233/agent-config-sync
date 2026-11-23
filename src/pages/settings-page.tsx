@@ -19,6 +19,13 @@ import {
   type ValidationFinding,
 } from '../lib/app-config';
 import {
+  appUpdateSupported,
+  checkForAppUpdate,
+  dismissAppUpdate,
+  installAvailableUpdate,
+  useAppUpdate,
+} from '../lib/app-update';
+import {
   isDesktop,
   listenAutoSyncStatus,
   loadAutoSyncStatus,
@@ -27,6 +34,7 @@ import {
   saveWebdavCredentials,
   testWebdavConnection,
   triggerAutoSync,
+  type AppUpdateProgress,
   type AutoSyncStatus,
   type WebdavProbe,
   type WebdavSummary,
@@ -532,6 +540,8 @@ export function SettingsPage() {
         </>
       )}
 
+      <AppUpdateCard />
+
       <AboutCard />
     </div>
   );
@@ -750,6 +760,166 @@ function AutoSyncCard({
       {error !== null && <p className="mt-xs text-xs text-danger">{error}</p>}
     </Card>
   );
+}
+
+/**
+ * 应用更新：只替换程序文件，不碰配置、备份、凭据与快照。
+ * 状态来自 App 启动时的那次共享检查，这里只读不重复请求。
+ */
+function AppUpdateCard() {
+  const update = useAppUpdate();
+  const available = update.available;
+  const currentVersion = available?.currentVersion ?? update.currentVersion;
+  const upToDate = update.checked && available === null && update.failure === null;
+  const installingPhase =
+    update.installing && update.progress?.phase === 'installing';
+  const percent =
+    update.progress?.total != null && update.progress.total > 0
+      ? Math.min(
+          100,
+          Math.round((update.progress.downloaded / update.progress.total) * 100),
+        )
+      : null;
+
+  const status = update.checking
+    ? { text: '正在检查更新…', tone: 'text-muted-foreground' }
+    : update.failure !== null
+      ? { text: update.failure, tone: 'text-danger' }
+      : available !== null
+        ? { text: `有新版本 ${available.version} 可用`, tone: 'text-warning' }
+        : upToDate
+          ? { text: '已是最新版本', tone: 'text-success' }
+          : null;
+
+  return (
+    <Card className="p-lg">
+      <h2 className="text-sm font-semibold text-foreground">应用更新</h2>
+
+      {!appUpdateSupported ? (
+        <p className="mt-xs text-sm text-muted-foreground">
+          仅发布版可用：浏览器预览与开发版不检查更新，也不会发起请求。
+        </p>
+      ) : (
+        <>
+          <dl className="mt-md flex flex-col gap-sm">
+            <PathRow label="当前版本" value={currentVersion ?? '读取中…'} />
+            {available !== null && (
+              <>
+                <PathRow label="最新版本" value={available.version} />
+                <PathRow label="目标平台" value={available.target} />
+                {available.date !== null && (
+                  <PathRow label="发布时间" value={available.date} />
+                )}
+              </>
+            )}
+          </dl>
+
+          {available?.notes !== null &&
+            available?.notes !== undefined &&
+            available.notes.trim() !== '' && (
+            <div className="mt-md">
+              <p className="text-xs text-muted-foreground">发布说明</p>
+              <p className="mt-xs whitespace-pre-wrap break-words text-sm text-foreground">
+                {available.notes}
+              </p>
+            </div>
+          )}
+
+          {update.installing ? (
+            <div className="mt-md flex flex-col gap-sm" aria-live="polite">
+              {installingPhase ? (
+                <p className="text-sm text-muted-foreground">
+                  正在安装并重启…应用会自行退出，请稍候。
+                </p>
+              ) : (
+                <>
+                  <p className="text-sm text-muted-foreground">
+                    {downloadProgressText(update.progress)}
+                  </p>
+                  {percent !== null && (
+                    <div
+                      className="h-1 overflow-hidden rounded-full bg-surface-muted"
+                      role="progressbar"
+                      aria-valuenow={percent}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                    >
+                      <div
+                        className="h-full bg-accent transition-all"
+                        style={{ width: `${percent}%` }}
+                      />
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          ) : (
+            status !== null && (
+              <p
+                className={cn('mt-md text-sm', status.tone)}
+                aria-live="polite"
+              >
+                {status.text}
+              </p>
+            )
+          )}
+
+          {!update.installing && (
+            <div className="mt-lg flex flex-wrap items-center gap-md">
+              {available !== null && (
+                <Button
+                  onClick={() => installAvailableUpdate(available.version)}
+                  disabled={update.checking}
+                >
+                  下载并安装
+                </Button>
+              )}
+              <Button
+                variant={available === null ? 'primary' : 'secondary'}
+                onClick={checkForAppUpdate}
+                disabled={update.checking}
+              >
+                {update.checking ? '检查中…' : '检查更新'}
+              </Button>
+              {available !== null && !update.dismissed && (
+                <Button variant="ghost" onClick={dismissAppUpdate}>
+                  稍后
+                </Button>
+              )}
+            </div>
+          )}
+
+          <p className="mt-xs text-xs text-muted-foreground">
+            安装只替换程序文件，不动配置、备份、凭据与快照。Linux 的 deb 包会请求系统授权（等价于系统包安装）；AppImage 需要放在可写位置。
+          </p>
+        </>
+      )}
+    </Card>
+  );
+}
+
+/** 拿不到总量时只报已下载；总量为 0 同样按拿不到处理。 */
+function downloadProgressText(
+  progress: AppUpdateProgress | null,
+): string {
+  if (progress === null) {
+    return '正在下载安装包…';
+  }
+  const downloaded = formatBytes(progress.downloaded);
+  return progress.total === null || progress.total === 0
+    ? `已下载 ${downloaded}`
+    : `已下载 ${downloaded} / ${formatBytes(progress.total)}`;
+}
+
+/** 包体积按 KB / MB 显示：几十 KB 是常态，字节数读起来没意义。 */
+function formatBytes(size: number): string {
+  if (size >= 1024 * 1024) {
+    return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  if (size >= 1024) {
+    return `${(size / 1024).toFixed(1)} KB`;
+  }
+  return `${size} B`;
 }
 
 type VersionState =

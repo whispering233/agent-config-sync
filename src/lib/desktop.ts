@@ -278,3 +278,53 @@ export function listenAutoSyncStatus(
 ): Promise<UnlistenFn> {
   return listen<AutoSyncStatus>('auto-sync-status', (event) => handler(event.payload));
 }
+
+/** 与 Rust 侧 `AppUpdateInfo` 一一对应：一次检查发现的可用版本。 */
+export type AppUpdateInfo = {
+  currentVersion: string;
+  version: string;
+  notes: string | null;
+  /** `latest.json` 里的发布时间原文；没有填写时为 null。 */
+  date: string | null;
+  target: string;
+  /** 检查阶段拿不到体积，恒为 null；总量由进度事件给出。 */
+  downloadSize: number | null;
+};
+
+/** 与 Rust 侧 `AppUpdateResult` 一一对应：只描述已经发起的安装。 */
+export type AppUpdateResult = {
+  installStarted: boolean;
+  version: string;
+  restartRequired: boolean;
+};
+
+/** 与 Rust 侧 `AppUpdateProgress` 一一对应：事件里只有阶段与字节数。 */
+export type AppUpdateProgress = {
+  phase: 'downloading' | 'installing';
+  downloaded: number;
+  /** 拿不到 `Content-Length` 时为 null，此时界面只显示已下载。 */
+  total: number | null;
+};
+
+/** 检查一次更新。开发态与未分发平台返回 `update_unsupported`，不发请求。 */
+export function checkAppUpdate(): Promise<AppUpdateInfo | null> {
+  return invoke<AppUpdateInfo | null>('check_app_update');
+}
+
+/**
+ * 下载并安装用户确认的版本。
+ *
+ * Linux 安装成功后本进程重启，Promise 不会正常返回；Windows 由安装器退出进程。
+ * 因此正常返回也只代表安装已发起，不代表界面还能继续用。
+ */
+export function installAppUpdate(version: string): Promise<AppUpdateResult> {
+  return invoke<AppUpdateResult>('install_app_update', { version });
+}
+
+export function listenAppUpdateProgress(
+  handler: (progress: AppUpdateProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<AppUpdateProgress>('app-update://progress', (event) =>
+    handler(event.payload),
+  );
+}
